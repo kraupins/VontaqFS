@@ -697,6 +697,7 @@ impl StorageEngine {
             params![request_id, space_id, logical.as_str(), logical.collision_key(), relative_temp, etag, size as i64, version as i64, now, metadata.and_then(|value| value.content_type.as_deref()), metadata.and_then(|value| value.format_id.as_deref()), metadata.and_then(|value| value.opaque).map(bool_to_db)],
         )?;
         tx.commit()?;
+        drop(conn);
 
         ensure_no_symlink_escape(&data_root, &target)?;
         atomic_replace(temp, &target)?;
@@ -2115,7 +2116,7 @@ impl StorageEngine {
                     progress(items_done, Some(total_items), bytes_done, Some(total_bytes));
                 }
                 zip.finish()?;
-                File::open(&temp)?.sync_all()?;
+                sync_file_for_durability(&temp)?;
                 atomic_replace(&temp, &target)?;
                 sync_parent(target.parent());
                 return Ok(NativeExportReport {
@@ -2240,7 +2241,7 @@ impl StorageEngine {
             }))?;
             let manifest_temp = destination_root.join(".vontaqfs-export-manifest.json.tmp");
             fs::write(&manifest_temp, &manifest_bytes)?;
-            File::open(&manifest_temp)?.sync_all()?;
+            sync_file_for_durability(&manifest_temp)?;
             atomic_replace(&manifest_temp, &manifest_path)?;
             sync_parent(Some(&destination_root));
             Ok(NativeExportReport {
@@ -2845,7 +2846,7 @@ impl StorageEngine {
                 );
             }
             zip.finish()?;
-            File::open(&temp)?.sync_all()?;
+            sync_file_for_durability(&temp)?;
             Ok(())
         })();
         if let Err(error) = result {
@@ -3488,7 +3489,7 @@ impl StorageEngine {
                 progress(done, Some(total));
             }
             zip.finish()?;
-            File::open(&temp)?.sync_all()?;
+            sync_file_for_durability(&temp)?;
             Ok((scan.files.len() as u64, scan.logical_bytes))
         })();
         let (exported_files, exported_bytes) = match result {
@@ -3661,6 +3662,7 @@ impl StorageEngine {
             params![request_id, space_id, logical.as_str(), logical.collision_key(), relative_temp, etag, bytes.len() as i64, version as i64, now, metadata.and_then(|value| value.content_type.as_deref()), metadata.and_then(|value| value.format_id.as_deref()), metadata.and_then(|value| value.opaque).map(bool_to_db)],
         )?;
         tx.commit()?;
+        drop(conn);
         if fault == AtomicWriteFault::AfterJournal {
             return Err(StorageError::Internal("INJECTED_AFTER_JOURNAL".into()));
         }
@@ -4409,7 +4411,7 @@ fn write_native_export_journal(
         "spaceId":space_id, "mode":export_mode_db(mode), "sourcePaths":source_paths, "updatedAtMs":now_ms()
     }))?;
     fs::write(&temp, bytes)?;
-    File::open(&temp)?.sync_all()?;
+    sync_file_for_durability(&temp)?;
     atomic_replace(&temp, &journal)?;
     sync_parent(Some(destination_root));
     Ok(())
@@ -6118,6 +6120,12 @@ fn filesystem_capacity(_path: &Path) -> StorageResult<(u64, u64)> {
     Err(StorageError::StorageUnavailable(
         "free-disk capacity query is unsupported on this platform".into(),
     ))
+}
+
+fn sync_file_for_durability(path: &Path) -> StorageResult<()> {
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn sync_parent(parent: Option<&Path>) {

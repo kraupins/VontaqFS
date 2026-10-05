@@ -415,12 +415,28 @@ impl RuntimeHandle {
     pub fn revoke_pairing(&self, persisted_pairing_id: &str) -> Result<bool, RuntimeAdminError> {
         let revoked = self.state.storage.revoke_pairing(persisted_pairing_id)?;
         if revoked {
-            let mut sessions = self
-                .state
-                .sessions
-                .lock()
-                .map_err(|_| RuntimeAdminError::Internal("session mutex poisoned".into()))?;
-            sessions.retain(|_, session| session.pairing_id != persisted_pairing_id);
+            let revoked_tokens = {
+                let mut sessions =
+                    self.state.sessions.lock().map_err(|_| {
+                        RuntimeAdminError::Internal("session mutex poisoned".into())
+                    })?;
+                let mut revoked_tokens = Vec::new();
+                sessions.retain(|token, session| {
+                    if session.pairing_id == persisted_pairing_id {
+                        revoked_tokens.push((token.clone(), session.expires_at_ms));
+                        false
+                    } else {
+                        true
+                    }
+                });
+                revoked_tokens
+            };
+            if !revoked_tokens.is_empty() {
+                let mut tombstones = self.state.revoked_sessions.lock().map_err(|_| {
+                    RuntimeAdminError::Internal("revoked-session mutex poisoned".into())
+                })?;
+                tombstones.extend(revoked_tokens);
+            }
         }
         Ok(revoked)
     }
@@ -1654,6 +1670,7 @@ struct RuntimeState {
     storage: Arc<StorageEngine>,
     pending_pairings: Mutex<HashMap<String, PendingPairing>>,
     sessions: Mutex<HashMap<String, SessionState>>,
+    revoked_sessions: Mutex<HashMap<String, i64>>,
     pairing_rate: Mutex<HashMap<String, Vec<i64>>>,
     request_slots: Arc<Semaphore>,
     bulk_slots: Arc<Semaphore>,
@@ -1688,6 +1705,7 @@ impl RuntimeState {
             storage: Arc::new(storage),
             pending_pairings: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
+            revoked_sessions: Mutex::new(HashMap::new()),
             pairing_rate: Mutex::new(HashMap::new()),
             request_slots: Arc::new(Semaphore::new(MAX_ACTIVE_REQUESTS)),
             bulk_slots: Arc::new(Semaphore::new(MAX_ACTIVE_BULK_REQUESTS)),
@@ -1791,6 +1809,9 @@ impl RuntimeState {
     fn invalidate_sessions_and_streams(&self) {
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.clear();
+        }
+        if let Ok(mut revoked_sessions) = self.revoked_sessions.lock() {
+            revoked_sessions.clear();
         }
         let mut expired = Vec::new();
         if let Ok(mut writes) = self.write_streams.lock() {
@@ -2372,6 +2393,9 @@ impl RuntimeState {
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.retain(|_, session| session.expires_at_ms > now);
         }
+        if let Ok(mut revoked_sessions) = self.revoked_sessions.lock() {
+            revoked_sessions.retain(|_, expires_at_ms| *expires_at_ms > now);
+        }
         if let Ok(mut pending) = self.pending_pairings.lock() {
             pending.retain(|_, entry| entry.expires_at_ms > now);
         }
@@ -2537,6 +2561,18 @@ impl RuntimeState {
         if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(ApiError::auth_invalid());
         }
+        if self
+            .revoked_sessions
+            .lock()
+            .map_err(|_| ApiError::internal())?
+            .contains_key(token)
+        {
+            return Err(ApiError::new(
+                401,
+                ErrorCode::AuthRevoked,
+                "pairing access has been revoked",
+            ));
+        }
         let session = {
             let sessions = self.sessions.lock().map_err(|_| ApiError::internal())?;
             sessions
@@ -2554,6 +2590,9 @@ impl RuntimeState {
         if !matches!(pairing, Some(record) if record.revoked_at_ms.is_none()) {
             if let Ok(mut sessions) = self.sessions.lock() {
                 sessions.remove(token);
+            }
+            if let Ok(mut revoked_sessions) = self.revoked_sessions.lock() {
+                revoked_sessions.insert(token.to_owned(), session.expires_at_ms);
             }
             return Err(ApiError::new(
                 401,
@@ -6772,6 +6811,7 @@ mod tests {
         assert!(handle
             .revoke_pairing(&approved.persisted_pairing_id)
             .unwrap());
+        assert_eq!(handle.active_session_count(), 0);
         let mut after_revoke = request(
             "POST",
             "/v1/kv/get",
