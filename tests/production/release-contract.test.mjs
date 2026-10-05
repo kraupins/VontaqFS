@@ -141,6 +141,9 @@ test('free macOS mode uses Tauri ad-hoc signing without Apple certificate secret
   assert.match(releaseWorkflow, /codesign --verify --deep --strict/);
   const selfSignedBranch = releaseWorkflow.match(/self-signed\)([\s\S]*?);;[\s\S]*?developer-id\)/)?.[1] ?? '';
   assert.doesNotMatch(selfSignedBranch, /APPLE_CERTIFICATE_PASSWORD|base64 --decode|security import/);
+  const buildJobEnv = releaseWorkflow.match(/build-desktop:[\s\S]*?\n    env:\n([\s\S]*?)\n    steps:/)?.[1] ?? '';
+  assert.doesNotMatch(buildJobEnv, /APPLE_CERTIFICATE|APPLE_API_/);
+  assert.match(releaseWorkflow, /Configure macOS signing[\s\S]*env:[\s\S]*APPLE_CERTIFICATE:[\s\S]*developer-id\)/);
 });
 
 test('draft GitHub release lifecycle is keyed by release ID until publication', () => {

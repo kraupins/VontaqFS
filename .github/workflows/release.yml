@@ -156,11 +156,6 @@ jobs:
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_API_ISSUER: ${{ vars.APPLE_API_ISSUER }}
-      APPLE_API_KEY: ${{ vars.APPLE_API_KEY }}
-      APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -229,6 +224,12 @@ jobs:
       - name: Configure macOS signing
         if: matrix.os_family == 'macos'
         shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_ISSUER: ${{ vars.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ vars.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           case "$MACOS_SIGNING_MODE" in
@@ -261,6 +262,8 @@ jobs:
               API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
               printf '%s' "$APPLE_API_PRIVATE_KEY" > "$API_KEY_PATH"
               chmod 600 "$API_KEY_PATH"
+              echo "APPLE_API_ISSUER=$APPLE_API_ISSUER" >> "$GITHUB_ENV"
+              echo "APPLE_API_KEY=$APPLE_API_KEY" >> "$GITHUB_ENV"
               echo "APPLE_API_KEY_PATH=$API_KEY_PATH" >> "$GITHUB_ENV"
               echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
               rm -f "$CERTIFICATE_PATH"
