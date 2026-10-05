@@ -6090,9 +6090,18 @@ fn filesystem_capacity(path: &Path) -> StorageResult<(u64, u64)> {
     } else {
         stats.f_frsize
     };
+    #[cfg(target_os = "macos")]
+    let available_blocks = u64::from(stats.f_bavail);
+    #[cfg(not(target_os = "macos"))]
+    let available_blocks = stats.f_bavail;
+    #[cfg(target_os = "macos")]
+    let total_blocks = u64::from(stats.f_blocks);
+    #[cfg(not(target_os = "macos"))]
+    let total_blocks = stats.f_blocks;
+
     Ok((
-        stats.f_bavail.saturating_mul(block_size),
-        stats.f_blocks.saturating_mul(block_size),
+        available_blocks.saturating_mul(block_size),
+        total_blocks.saturating_mul(block_size),
     ))
 }
 
