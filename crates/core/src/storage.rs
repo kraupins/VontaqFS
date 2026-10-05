@@ -6087,10 +6087,10 @@ fn filesystem_capacity(path: &Path) -> StorageResult<(u64, u64)> {
         stats.f_bsize
     } else {
         stats.f_frsize
-    } as u64;
+    };
     Ok((
-        (stats.f_bavail as u64).saturating_mul(block_size),
-        (stats.f_blocks as u64).saturating_mul(block_size),
+        stats.f_bavail.saturating_mul(block_size),
+        stats.f_blocks.saturating_mul(block_size),
     ))
 }
 
