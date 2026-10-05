@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "@vontaq/fs": ["../../packages/sdk/src/index.ts"],
+      "@vontaq/fs/figma": ["../../packages/sdk/src/figma.ts"]
+    }
+  },
+  "include": ["src/**/*.ts"]
+}

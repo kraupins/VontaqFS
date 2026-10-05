@@ -1,0 +1,405 @@
+name: Production Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+concurrency:
+  group: production-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release-gate:
+    name: Release gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install Linux build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './ -> target'
+      - run: npm ci
+      - name: Verify immutable release contract
+        run: npm run release:verify -- --tag "$GITHUB_REF_NAME"
+      - run: npm run check
+      - name: Run full release test gate
+        run: npm run test:release
+        timeout-minutes: 20
+      - run: npm run build
+      - name: Run release-candidate filesystem stress fixture
+        run: npm run test:rc-stress
+        timeout-minutes: 20
+
+  create-release:
+    name: Create protected draft release
+    needs: release-gate
+    runs-on: ubuntu-24.04
+    environment: production-release
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.release.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: release
+        name: Create or resume draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            draft="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .draft)"
+            if [ "$draft" != "true" ]; then
+              echo "Release $GITHUB_REF_NAME already exists and is not a draft; refusing to mutate a published release." >&2
+              exit 1
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "VontaqFS $GITHUB_REF_NAME" --generate-notes
+          fi
+          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .id)"
+          test -n "$release_id"
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+
+  build-desktop:
+    name: ${{ matrix.label }}
+    needs: [release-gate, create-release]
+    environment: production-release
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows x64 signed installer
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            asset_key: windows-x86_64
+            os_family: windows
+            tauri_args: '--target x86_64-pc-windows-msvc --config src-tauri/tauri.release.updater.conf.json --config src-tauri/tauri.release.windows.conf.json'
+          - label: Windows ARM64 signed installer
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            asset_key: windows-aarch64
+            os_family: windows
+            tauri_args: '--target aarch64-pc-windows-msvc --config src-tauri/tauri.release.updater.conf.json --config src-tauri/tauri.release.windows.conf.json'
+          - label: macOS Apple Silicon signed installer
+            runner: macos-15
+            target: aarch64-apple-darwin
+            asset_key: darwin-aarch64
+            os_family: macos
+            tauri_args: '--target aarch64-apple-darwin --config src-tauri/tauri.release.updater.conf.json'
+          - label: macOS Intel signed installer
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset_key: darwin-x86_64
+            os_family: macos
+            tauri_args: '--target x86_64-apple-darwin --config src-tauri/tauri.release.updater.conf.json'
+    runs-on: ${{ matrix.runner }}
+    env:
+      TAURI_TARGET: ${{ matrix.target }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      VONTAQFS_UPDATE_ENDPOINT: https://github.com/${{ github.repository }}/releases/latest/download/latest.json
+      VONTAQFS_PUBLIC_REPOSITORY_URL: https://github.com/${{ github.repository }}
+      VONTAQFS_PUBLIC_REPOSITORY_REF: ${{ github.ref_name }}
+      VONTAQFS_UPDATER_PUBLIC_KEY: ${{ vars.VONTAQFS_UPDATER_PUBLIC_KEY }}
+      WINDOWS_SIGNING_MODE: ${{ vars.WINDOWS_SIGNING_MODE }}
+      MACOS_SIGNING_MODE: ${{ vars.MACOS_SIGNING_MODE }}
+      WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+      WINDOWS_SIGNING_ENDPOINT: ${{ vars.WINDOWS_SIGNING_ENDPOINT }}
+      WINDOWS_SIGNING_ACCOUNT: ${{ vars.WINDOWS_SIGNING_ACCOUNT }}
+      WINDOWS_SIGNING_CERT_PROFILE: ${{ vars.WINDOWS_SIGNING_CERT_PROFILE }}
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_API_ISSUER: ${{ vars.APPLE_API_ISSUER }}
+      APPLE_API_KEY: ${{ vars.APPLE_API_KEY }}
+      APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './ -> target'
+          key: ${{ matrix.target }}
+      - run: npm ci
+
+      - name: Require signed updater configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$TAURI_SIGNING_PRIVATE_KEY" || { echo "Missing TAURI_SIGNING_PRIVATE_KEY" >&2; exit 1; }
+          test -n "$VONTAQFS_UPDATER_PUBLIC_KEY" || { echo "Missing production-release variable VONTAQFS_UPDATER_PUBLIC_KEY" >&2; exit 1; }
+          case "$VONTAQFS_UPDATE_ENDPOINT" in https://*) ;; *) echo "Updater endpoint must be HTTPS" >&2; exit 1;; esac
+
+      - name: Generate production updater Tauri overlay
+        run: node scripts/release/prepare-updater-config.mjs src-tauri/tauri.release.updater.conf.json
+
+      - name: Prepare Windows PFX certificate
+        if: matrix.os_family == 'windows' && (env.WINDOWS_SIGNING_MODE == 'pfx' || env.WINDOWS_SIGNING_MODE == 'pfx-self-signed')
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE) -or [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) { throw 'PFX signing requires WINDOWS_CERTIFICATE and WINDOWS_CERTIFICATE_PASSWORD secrets.' }
+          if ($env:WINDOWS_SIGNING_MODE -eq 'pfx' -and [string]::IsNullOrWhiteSpace($env:WINDOWS_TIMESTAMP_URL)) { throw 'Trusted PFX signing requires WINDOWS_TIMESTAMP_URL variable.' }
+          $encoded = Join-Path $env:RUNNER_TEMP 'vontaqfs-certificate.txt'
+          $pfx = Join-Path $env:RUNNER_TEMP 'vontaqfs-certificate.pfx'
+          Set-Content -LiteralPath $encoded -Value $env:WINDOWS_CERTIFICATE -NoNewline
+          certutil -decode $encoded $pfx | Out-Null
+          $secure = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation 'Cert:\CurrentUser\My' -Password $secure
+          if (-not $cert -or [string]::IsNullOrWhiteSpace($cert.Thumbprint)) { throw 'Imported Windows certificate has no thumbprint.' }
+          "WINDOWS_CERTIFICATE_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Remove-Item -LiteralPath $encoded,$pfx -Force
+
+      - name: Require Azure Artifact Signing configuration
+        if: matrix.os_family == 'windows' && env.WINDOWS_SIGNING_MODE == 'azure-artifact-signing'
+        shell: pwsh
+        run: |
+          foreach ($name in @('WINDOWS_SIGNING_ENDPOINT','WINDOWS_SIGNING_ACCOUNT','WINDOWS_SIGNING_CERT_PROFILE','AZURE_CLIENT_ID','AZURE_CLIENT_SECRET','AZURE_TENANT_ID')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) { throw "Azure Artifact Signing requires $name." }
+          }
+
+      - name: Install Azure Artifact Signing CLI
+        if: matrix.os_family == 'windows' && env.WINDOWS_SIGNING_MODE == 'azure-artifact-signing'
+        run: cargo install artifact-signing-cli --locked
+
+      - name: Reject unconfigured Windows signing mode
+        if: matrix.os_family == 'windows' && env.WINDOWS_SIGNING_MODE != 'pfx' && env.WINDOWS_SIGNING_MODE != 'pfx-self-signed' && env.WINDOWS_SIGNING_MODE != 'azure-artifact-signing'
+        shell: pwsh
+        run: throw 'WINDOWS_SIGNING_MODE must be pfx, pfx-self-signed or azure-artifact-signing in the production-release environment.'
+
+      - name: Generate Windows-only Tauri signing overlay
+        if: matrix.os_family == 'windows'
+        run: node scripts/release/prepare-windows-signing-config.mjs src-tauri/tauri.release.windows.conf.json
+
+      - name: Import macOS signing certificate
+        if: matrix.os_family == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$MACOS_SIGNING_MODE" in
+            self-signed|developer-id) ;;
+            *) echo "MACOS_SIGNING_MODE must be self-signed or developer-id." >&2; exit 1;;
+          esac
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD; do
+            test -n "${!name:-}" || { echo "Missing macOS signing value: $name" >&2; exit 1; }
+          done
+          CERTIFICATE_PATH="$RUNNER_TEMP/vontaqfs-signing.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/vontaqfs-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          APPLE_SIGNING_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -n 1)"
+          test -n "$APPLE_SIGNING_IDENTITY" || { echo 'No code-signing identity was found in APPLE_CERTIFICATE.' >&2; exit 1; }
+          if [ "$MACOS_SIGNING_MODE" = "developer-id" ]; then
+            case "$APPLE_SIGNING_IDENTITY" in "Developer ID Application:"*) ;; *) echo 'developer-id mode requires a Developer ID Application identity.' >&2; exit 1;; esac
+            for name in APPLE_API_ISSUER APPLE_API_KEY APPLE_API_PRIVATE_KEY; do
+              test -n "${!name:-}" || { echo "Developer ID notarization requires $name" >&2; exit 1; }
+            done
+            API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+            printf '%s' "$APPLE_API_PRIVATE_KEY" > "$API_KEY_PATH"
+            chmod 600 "$API_KEY_PATH"
+            echo "APPLE_API_KEY_PATH=$API_KEY_PATH" >> "$GITHUB_ENV"
+          else
+            echo 'Self-signed macOS mode selected: CI verifies code signature integrity but does not claim Apple notarization or Gatekeeper trust.'
+          fi
+          echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+          rm -f "$CERTIFICATE_PATH"
+
+      - name: Build, sign and upload release artifacts
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          tagName: ${{ github.ref_name }}
+          releaseDraft: true
+          prerelease: false
+          retryAttempts: 2
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: true
+          releaseAssetNamePattern: VontaqFS_[version]_${{ matrix.asset_key }}[setup].[ext]
+          args: ${{ matrix.tauri_args }}
+
+      - name: Verify Windows Authenticode signatures
+        if: matrix.os_family == 'windows'
+        shell: pwsh
+        run: |
+          $bundle = Join-Path $PWD "target/$env:TAURI_TARGET/release/bundle"
+          $files = Get-ChildItem -Path $bundle -Recurse -File | Where-Object { $_.Extension -eq '.msi' -or $_.Extension -eq '.exe' }
+          if (-not $files) { throw "No Windows installer artifacts found under $bundle" }
+          foreach ($file in $files) {
+            $signature = Get-AuthenticodeSignature -FilePath $file.FullName
+            if (-not $signature.SignerCertificate) { throw "No Authenticode signer certificate found for $($file.FullName)." }
+            if ($env:WINDOWS_CERTIFICATE_THUMBPRINT -and $signature.SignerCertificate.Thumbprint -ne $env:WINDOWS_CERTIFICATE_THUMBPRINT) { throw "Unexpected Authenticode signer for $($file.FullName)." }
+            if ($env:WINDOWS_SIGNING_MODE -ne 'pfx-self-signed' -and $signature.Status -ne 'Valid') { throw "Trusted Authenticode verification failed for $($file.FullName): $($signature.Status)" }
+            if ($env:WINDOWS_SIGNING_MODE -eq 'pfx-self-signed' -and $signature.Status -in @('NotSigned','HashMismatch')) { throw "Self-signed Authenticode integrity verification failed for $($file.FullName): $($signature.Status)" }
+          }
+          $sigFiles = Get-ChildItem -Path $bundle -Recurse -File -Filter '*.sig'
+          if ($sigFiles.Count -lt 2) { throw 'Expected Tauri updater signatures for NSIS and MSI.' }
+
+      - name: Verify macOS code-signature integrity
+        if: matrix.os_family == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUNDLE="target/$TAURI_TARGET/release/bundle"
+          APP="$(find "$BUNDLE/macos" -maxdepth 1 -name '*.app' -print -quit)"
+          DMG="$(find "$BUNDLE/dmg" -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -n "$APP" && test -n "$DMG"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          if [ "$MACOS_SIGNING_MODE" = "developer-id" ]; then
+            spctl --assess --type execute --verbose=2 "$APP"
+            xcrun stapler validate "$DMG"
+          else
+            echo 'Self-signed macOS artifact: Apple notarization/Gatekeeper trust is intentionally not asserted.'
+          fi
+          SIG="$(find "$BUNDLE/macos" -maxdepth 1 -name '*.app.tar.gz.sig' -print -quit)"
+          test -s "$SIG"
+
+  publish-sdk:
+    name: Publish @vontaq/fs with npm OIDC (optional until provisioned)
+    needs: [release-gate, build-desktop]
+    runs-on: ubuntu-24.04
+    environment: production-release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+      - name: Use npm with Trusted Publishing support
+        run: npm install --global npm@11.21.0
+      - run: npm ci
+      - run: npm run build:sdk
+      - name: Verify npm package contents
+        run: npm pack --dry-run --workspace @vontaq/fs
+      - name: Report deferred npm publication
+        if: vars.PUBLISH_NPM != 'true'
+        run: echo 'PUBLISH_NPM is not true; GitHub release may proceed and npm publication remains owner-deferred.'
+      - name: Refuse an already-published immutable version
+        if: vars.PUBLISH_NPM == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./packages/sdk/package.json').version")"
+          if npm view "@vontaq/fs@$VERSION" version >/dev/null 2>&1; then
+            echo "@vontaq/fs@$VERSION already exists; refusing to republish an immutable package version." >&2
+            exit 1
+          fi
+      - name: Publish public SDK through npm Trusted Publishing/OIDC
+        if: vars.PUBLISH_NPM == 'true'
+        run: npm publish --workspace @vontaq/fs --access public
+
+  finalize-release:
+    name: Verify and publish GitHub Release
+    needs: [create-release, build-desktop, publish-sdk]
+    runs-on: ubuntu-24.04
+    environment: production-release
+    permissions:
+      contents: write
+    env:
+      WINDOWS_SIGNING_MODE: ${{ vars.WINDOWS_SIGNING_MODE }}
+      MACOS_SIGNING_MODE: ${{ vars.MACOS_SIGNING_MODE }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Download draft release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir release-assets
+          rm -f release-assets/latest.json release-assets/SHA256SUMS.txt
+      - name: Generate signing notice
+        run: |
+          set -euo pipefail
+          {
+            echo "VontaqFS release signing notice"
+            echo
+            if [ "$WINDOWS_SIGNING_MODE" = "pfx-self-signed" ]; then
+              echo "Windows installers are Authenticode-signed with the project owner's self-signed certificate. Windows will not treat that certificate as publicly trusted unless the user explicitly trusts it."
+            else
+              echo "Windows installers use the configured trusted signing mode: $WINDOWS_SIGNING_MODE."
+            fi
+            if [ "$MACOS_SIGNING_MODE" = "self-signed" ]; then
+              echo "macOS artifacts are code-signed with the project owner's self-signed identity. Apple notarization and Gatekeeper trust are intentionally not claimed for this distribution mode."
+            else
+              echo "macOS artifacts use Developer ID signing and notarization."
+            fi
+            echo "Tauri updater artifacts are independently signed with the configured updater keypair."
+          } > release-assets/SIGNING_NOTICE.txt
+      - name: Generate signed updater manifest and checksums
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          node scripts/release/generate-updater-json.mjs --dir release-assets --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" --version "$VERSION" --notes release-assets/SIGNING_NOTICE.txt
+          node scripts/release/generate-checksums.mjs release-assets
+          node scripts/release/verify-assets.mjs release-assets
+      - name: Upload release metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "$GITHUB_REF_NAME" release-assets/latest.json release-assets/SHA256SUMS.txt release-assets/SIGNING_NOTICE.txt --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Prepend signing notice to release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CURRENT_NOTES="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq '.body // ""')"
+          {
+            cat release-assets/SIGNING_NOTICE.txt
+            echo
+            echo "---"
+            echo
+            printf '%s\n' "$CURRENT_NOTES"
+          } > release-assets/RELEASE_NOTES.md
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes-file release-assets/RELEASE_NOTES.md
+      - name: Publish release only after all gates succeed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest

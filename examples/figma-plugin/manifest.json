@@ -1,0 +1,19 @@
+{
+  "name": "VontaqFS Example",
+  "id": "vontaqfs-example-local",
+  "api": "1.0.0",
+  "main": "dist/code.js",
+  "editorType": [
+    "figma"
+  ],
+  "documentAccess": "dynamic-page",
+  "networkAccess": {
+    "allowedDomains": [
+      "http://localhost:47833",
+      "http://localhost:47834",
+      "http://localhost:47835",
+      "http://localhost:47836"
+    ],
+    "reasoning": "Connects to the locally installed VontaqFS runtime for local persistent storage using the official fixed endpoint set."
+  }
+}

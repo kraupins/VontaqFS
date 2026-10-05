@@ -1,0 +1,38 @@
+{
+  "name": "vontaqfs",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/desktop",
+    "packages/sdk"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "npm run check:sdk && npm run check:desktop && npm run check:example && cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings",
+    "check:sdk": "npm --workspace @vontaq/fs run check",
+    "check:desktop": "npm --workspace @vontaqfs/desktop run check",
+    "test": "npm run build:sdk && npm --workspace @vontaq/fs test && cargo test --workspace --no-run",
+    "build": "npm run build:sdk && npm run build:desktop && cargo build --workspace",
+    "build:sdk": "npm --workspace @vontaq/fs run build",
+    "build:desktop": "npm --workspace @vontaqfs/desktop run build",
+    "dev": "npm --workspace @vontaqfs/desktop run dev",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "test:integration": "node --test tests/production/*.test.mjs",
+    "release:dev": "tauri build --debug",
+    "release:verify": "node scripts/release/verify-release.mjs",
+    "release:checksums": "node scripts/release/generate-checksums.mjs",
+    "release:verify-assets": "node scripts/release/verify-assets.mjs",
+    "check:example": "tsc --noEmit -p examples/figma-plugin/tsconfig.json",
+    "test:rc-stress": "node scripts/test-rust-release.mjs --stress",
+    "test:rust:release": "node scripts/test-rust-release.mjs",
+    "test:release": "npm test && npm run test:rust:release && npm run test:integration"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}

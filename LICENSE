@@ -1,0 +1,135 @@
+VontaqFS Source-Available License 1.0
+LicenseRef-VontaqFS-Source-Available-1.0
+
+ENGLISH TERMS
+
+Copyright (c) Vontaq. All rights reserved except as expressly granted below.
+
+1. Permission Grant
+Subject to this License, you are granted a worldwide, non-exclusive, royalty-free permission to:
+(a) use and run VontaqFS;
+(b) inspect and study the source code;
+(c) copy the source code and binaries;
+(d) modify the software and create derivative works;
+(e) compile and build the software;
+(f) redistribute the original or modified software free of charge; and
+(g) use the software internally, including inside a commercial organization, provided the software or access to it is not sold or otherwise monetized in a manner prohibited below.
+
+2. No Sale or Paid Redistribution
+You may not, without separate written permission from the copyright owner:
+(a) sell, offer for sale, rent, lease, or sublicense VontaqFS or a derivative work for a fee;
+(b) charge a fee for copies, downloads, licenses, activation, or access where the software or derivative work itself is a material part of what is being sold;
+(c) bundle VontaqFS or a derivative work as a separately valued or material paid component of a product or service; or
+(d) represent that you have the right to commercially license the VontaqFS code to third parties.
+
+Reasonable charges that are genuinely for independent services (for example consulting, integration, training, hosting of your own unrelated application, or hardware) are not prohibited solely because VontaqFS is used internally, provided no fee is charged for VontaqFS, a derivative copy, or access offered as a substitute for selling it.
+
+3. Security and Abuse Restrictions
+You may not use, modify, distribute, or create a derivative of VontaqFS primarily for:
+(a) unauthorized access to systems, accounts, files, credentials, tokens, sessions, or data;
+(b) bypassing authentication, authorization, privacy, sandboxing, platform security, or other access-control mechanisms without permission;
+(c) credential theft, malware, ransomware, destructive interference, persistence, covert surveillance, or exfiltration;
+(d) injecting into or tampering with third-party applications in order to obtain capabilities or data that the authorized public API does not provide; or
+(e) intentionally enabling another person to perform the prohibited conduct above.
+
+Good-faith security research, interoperability testing, debugging, reverse engineering of VontaqFS itself, and testing of systems that you own or are explicitly authorized to test are permitted, provided they are lawful and are not used to facilitate unauthorized access or harm.
+
+4. Notices and Modified Versions
+If you redistribute VontaqFS or a derivative work, you must:
+(a) include this License;
+(b) keep copyright and attribution notices that apply to VontaqFS;
+(c) clearly state that your version is modified if you changed it; and
+(d) not imply that Vontaq endorses, supports, certifies, or is responsible for your modified version unless you have written permission.
+
+5. Trademarks
+This License does not grant trademark rights in the names Vontaq, VontaqFS, logos, or other branding. Descriptive reference to the project name is allowed where reasonably necessary to identify compatibility or origin, but it must not imply endorsement.
+
+6. Third-Party Components
+Third-party dependencies and components remain subject to their own licenses and notices. This License applies only to original VontaqFS material to the extent owned or licensable by the VontaqFS copyright owner.
+
+7. No Warranty
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, SECURITY, AVAILABILITY, OR ERROR-FREE OPERATION. YOU USE THE SOFTWARE AT YOUR OWN RISK.
+
+8. Limitation of Liability
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE COPYRIGHT OWNER AND CONTRIBUTORS WILL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES, OR FOR LOSS OF DATA, PROFITS, REVENUE, BUSINESS, OR GOODWILL, ARISING FROM OR RELATED TO THE SOFTWARE OR THIS LICENSE.
+
+9. Termination
+Your permissions under this License terminate automatically if you materially violate Sections 2, 3, or 4 and do not cure the violation within 30 days after receiving written notice, where cure is possible. Termination does not limit any other rights or remedies available to the copyright owner.
+
+10. Separate Commercial License
+The copyright owner may offer separate written commercial licensing terms. A separate commercial license may grant rights that this License does not grant, including paid redistribution or sale.
+
+11. Entire License; Applicable Law
+This License is the complete copyright permission granted for original VontaqFS material unless a separate written agreement applies. Mandatory local law may provide rights or obligations that cannot be waived by contract.
+
+12. Language
+The Russian text below is provided as a faithful translation for convenience. If the English and Russian texts conflict, the English text controls to the extent permitted by applicable law.
+
+----------------------------------------------------------------
+
+РУССКАЯ ВЕРСИЯ
+
+VontaqFS Source-Available License 1.0
+LicenseRef-VontaqFS-Source-Available-1.0
+
+Copyright (c) Vontaq. Все права защищены, кроме прямо предоставленных ниже.
+
+1. Предоставляемые права
+При соблюдении этой Лицензии вам предоставляется всемирное, неисключительное и безвозмездное право:
+(a) использовать и запускать VontaqFS;
+(b) изучать исходный код;
+(c) копировать исходный код и бинарные файлы;
+(d) изменять программу и создавать производные работы;
+(e) компилировать и собирать программу;
+(f) бесплатно распространять оригинальную или изменённую программу; и
+(g) использовать программу внутри организации, включая коммерческую организацию, если сама программа или доступ к ней не продаются и не монетизируются способом, запрещённым ниже.
+
+2. Запрет продажи и платного распространения
+Без отдельного письменного разрешения правообладателя запрещено:
+(a) продавать, предлагать к продаже, сдавать в аренду или выдавать за плату sublicense на VontaqFS либо производную работу;
+(b) брать плату за копии, загрузку, лицензию, активацию или доступ, если VontaqFS или производная работа являются существенной частью того, за что взимается плата;
+(c) включать VontaqFS или производную работу как отдельно оцениваемый либо существенный платный компонент продукта или сервиса; или
+(d) заявлять, что вы имеете право коммерчески лицензировать код VontaqFS третьим лицам.
+
+Разумная плата за самостоятельные услуги (например, консалтинг, интеграцию, обучение, hosting вашего собственного независимого приложения или оборудование) сама по себе не запрещена только потому, что VontaqFS используется внутри такого процесса, если плата не взимается за VontaqFS, производную копию или доступ, заменяющий продажу программы.
+
+3. Ограничения безопасности и злоупотреблений
+Запрещено использовать, изменять, распространять VontaqFS или создавать его производные преимущественно с целью:
+(a) несанкционированного доступа к системам, аккаунтам, файлам, credentials, tokens, sessions или данным;
+(b) обхода authentication, authorization, privacy, sandboxing, platform security или других механизмов контроля доступа без разрешения;
+(c) кражи credentials, создания/распространения malware или ransomware, разрушительного вмешательства, скрытого persistence, covert surveillance или exfiltration;
+(d) внедрения в сторонние приложения или вмешательства в их работу для получения возможностей или данных, которые не предоставляет разрешённый публичный API; или
+(e) намеренного предоставления другим лицам средств для выполнения перечисленных выше запрещённых действий.
+
+Добросовестное security research, interoperability testing, debugging, reverse engineering самого VontaqFS и тестирование систем, которыми вы владеете или на тестирование которых имеете явное разрешение, допускаются, если такие действия законны и не используются для несанкционированного доступа или причинения вреда.
+
+4. Уведомления и изменённые версии
+При распространении VontaqFS или производной работы необходимо:
+(a) приложить эту Лицензию;
+(b) сохранить применимые copyright и attribution notices VontaqFS;
+(c) явно указать, что версия была изменена, если вы вносили изменения; и
+(d) не создавать впечатление, что Vontaq одобряет, поддерживает, сертифицирует или несёт ответственность за вашу изменённую версию без письменного разрешения.
+
+5. Товарные знаки
+Эта Лицензия не предоставляет прав на товарные знаки Vontaq, VontaqFS, логотипы или иные элементы бренда. Допускается описательное упоминание названия проекта, когда это разумно необходимо для указания совместимости или происхождения, но оно не должно создавать впечатление официального одобрения.
+
+6. Сторонние компоненты
+Сторонние зависимости и компоненты регулируются собственными лицензиями и notices. Эта Лицензия применяется только к оригинальным материалам VontaqFS в той мере, в которой правообладатель VontaqFS обладает соответствующими правами.
+
+7. Отсутствие гарантий
+ПРОГРАММА ПРЕДОСТАВЛЯЕТСЯ «КАК ЕСТЬ», БЕЗ КАКИХ-ЛИБО ЯВНЫХ ИЛИ ПОДРАЗУМЕВАЕМЫХ ГАРАНТИЙ, ВКЛЮЧАЯ ГАРАНТИИ КОММЕРЧЕСКОЙ ПРИГОДНОСТИ, ПРИГОДНОСТИ ДЛЯ КОНКРЕТНОЙ ЦЕЛИ, НЕНАРУШЕНИЯ ПРАВ, БЕЗОПАСНОСТИ, ДОСТУПНОСТИ ИЛИ БЕЗОШИБОЧНОЙ РАБОТЫ. ВЫ ИСПОЛЬЗУЕТЕ ПРОГРАММУ НА СВОЙ РИСК.
+
+8. Ограничение ответственности
+В МАКСИМАЛЬНО ДОПУСТИМОЙ ЗАКОНОМ СТЕПЕНИ ПРАВООБЛАДАТЕЛЬ И УЧАСТНИКИ НЕ НЕСУТ ОТВЕТСТВЕННОСТИ ЗА КОСВЕННЫЕ, СЛУЧАЙНЫЕ, СПЕЦИАЛЬНЫЕ, ПОСЛЕДУЮЩИЕ, ШТРАФНЫЕ ИЛИ ПРИМЕРНЫЕ УБЫТКИ, А ТАКЖЕ ЗА ПОТЕРЮ ДАННЫХ, ПРИБЫЛИ, ВЫРУЧКИ, БИЗНЕСА ИЛИ ДЕЛОВОЙ РЕПУТАЦИИ, СВЯЗАННЫЕ С ПРОГРАММОЙ ИЛИ ЭТОЙ ЛИЦЕНЗИЕЙ.
+
+9. Прекращение прав
+Права по этой Лицензии автоматически прекращаются при существенном нарушении разделов 2, 3 или 4, если нарушение не устранено в течение 30 дней после письменного уведомления, когда устранение возможно. Прекращение прав не ограничивает иные доступные правообладателю средства защиты.
+
+10. Отдельная коммерческая лицензия
+Правообладатель может предложить отдельные письменные коммерческие условия. Такая коммерческая лицензия может предоставлять права, отсутствующие здесь, включая платное распространение или продажу.
+
+11. Полнота условий и применимое право
+Эта Лицензия содержит полный объём copyright-разрешений для оригинальных материалов VontaqFS, если не действует отдельное письменное соглашение. Императивные нормы применимого права могут предоставлять права или обязанности, которые нельзя отменить договором.
+
+12. Язык
+Русский текст является переводом для удобства. При противоречии между английской и русской версиями преимущественную силу имеет английский текст в той мере, в которой это допускается применимым правом.

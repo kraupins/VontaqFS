@@ -1,0 +1,22 @@
+{
+  "description": "Application-neutral fixtures representing Bridge-class storage workloads without importing Bridge schemas or source code.",
+  "projectSpace": {
+    "key": "project:fixture-001",
+    "storageClass": "persistent"
+  },
+  "smallState": {
+    "kvKey": "analysis-resume",
+    "value": { "revision": 7, "phase": "resume-fixture" }
+  },
+  "largeJson": {
+    "path": "/analysis/canonical-like.json",
+    "generatedPayloadBytes": 700000
+  },
+  "report": {
+    "path": "/reports/analyzer-like.json"
+  },
+  "binaryAsset": {
+    "path": "/assets/image-like.bin",
+    "generatedBytes": 700000
+  }
+}

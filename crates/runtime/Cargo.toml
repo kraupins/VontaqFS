@@ -1,0 +1,15 @@
+[package]
+name = "vontaqfs-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vontaqfs-core = { path = "../core" }
+vontaqfs-protocol = { path = "../protocol" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
