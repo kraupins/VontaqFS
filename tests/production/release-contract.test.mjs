@@ -131,6 +131,18 @@ test('npm SDK package is public ESM with docs/license packaging and Figma subpat
   assert.match(releaseWorkflow, /Verify npm package contents[\s\S]*npm pack --dry-run --workspace @vontaq\/fs/);
 });
 
+
+
+test('free macOS mode uses Tauri ad-hoc signing without Apple certificate secrets', () => {
+  assert.match(releaseWorkflow, /MACOS_SIGNING_MODE[\s\S]*self-signed/);
+  assert.match(releaseWorkflow, /self-signed\)[\s\S]*APPLE_SIGNING_IDENTITY=-/);
+  assert.match(releaseWorkflow, /Free macOS ad-hoc signing selected/);
+  assert.match(releaseWorkflow, /developer-id\)[\s\S]*Developer ID signing requires \$name/);
+  assert.match(releaseWorkflow, /codesign --verify --deep --strict/);
+  const selfSignedBranch = releaseWorkflow.match(/self-signed\)([\s\S]*?);;[\s\S]*?developer-id\)/)?.[1] ?? '';
+  assert.doesNotMatch(selfSignedBranch, /APPLE_CERTIFICATE_PASSWORD|base64 --decode|security import/);
+});
+
 test('draft GitHub release lifecycle is keyed by release ID until publication', () => {
   assert.match(releaseWorkflow, /Create or resume draft GitHub Release by ID/);
   assert.match(releaseWorkflow, /release_id=\$release_id/);

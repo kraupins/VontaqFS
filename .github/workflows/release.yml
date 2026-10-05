@@ -226,44 +226,50 @@ jobs:
         if: matrix.os_family == 'windows'
         run: node scripts/release/prepare-windows-signing-config.mjs src-tauri/tauri.release.windows.conf.json
 
-      - name: Import macOS signing certificate
+      - name: Configure macOS signing
         if: matrix.os_family == 'macos'
         shell: bash
         run: |
           set -euo pipefail
           case "$MACOS_SIGNING_MODE" in
-            self-signed|developer-id) ;;
-            *) echo "MACOS_SIGNING_MODE must be self-signed or developer-id." >&2; exit 1;;
+            self-signed)
+              # Free macOS distribution mode: Tauri's supported ad-hoc pseudo-identity.
+              # No Apple certificate or notarization credentials are required.
+              echo 'APPLE_SIGNING_IDENTITY=-' >> "$GITHUB_ENV"
+              echo 'Free macOS ad-hoc signing selected. Apple notarization and Gatekeeper trust are intentionally not asserted.'
+              ;;
+            developer-id)
+              for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD; do
+                test -n "${!name:-}" || { echo "Developer ID signing requires $name" >&2; exit 1; }
+              done
+              CERTIFICATE_PATH="$RUNNER_TEMP/vontaqfs-signing.p12"
+              KEYCHAIN_PATH="$RUNNER_TEMP/vontaqfs-signing.keychain-db"
+              KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+              printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERTIFICATE_PATH"
+              security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+              security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+              security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+              security import "$CERTIFICATE_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+              security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
+              security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+              APPLE_SIGNING_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -n 1)"
+              test -n "$APPLE_SIGNING_IDENTITY" || { echo 'No code-signing identity was found in APPLE_CERTIFICATE.' >&2; exit 1; }
+              case "$APPLE_SIGNING_IDENTITY" in "Developer ID Application:"*) ;; *) echo 'developer-id mode requires a Developer ID Application identity.' >&2; exit 1;; esac
+              for name in APPLE_API_ISSUER APPLE_API_KEY APPLE_API_PRIVATE_KEY; do
+                test -n "${!name:-}" || { echo "Developer ID notarization requires $name" >&2; exit 1; }
+              done
+              API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+              printf '%s' "$APPLE_API_PRIVATE_KEY" > "$API_KEY_PATH"
+              chmod 600 "$API_KEY_PATH"
+              echo "APPLE_API_KEY_PATH=$API_KEY_PATH" >> "$GITHUB_ENV"
+              echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+              rm -f "$CERTIFICATE_PATH"
+              ;;
+            *)
+              echo "MACOS_SIGNING_MODE must be self-signed or developer-id." >&2
+              exit 1
+              ;;
           esac
-          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD; do
-            test -n "${!name:-}" || { echo "Missing macOS signing value: $name" >&2; exit 1; }
-          done
-          CERTIFICATE_PATH="$RUNNER_TEMP/vontaqfs-signing.p12"
-          KEYCHAIN_PATH="$RUNNER_TEMP/vontaqfs-signing.keychain-db"
-          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
-          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERTIFICATE_PATH"
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security import "$CERTIFICATE_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          APPLE_SIGNING_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -n 1)"
-          test -n "$APPLE_SIGNING_IDENTITY" || { echo 'No code-signing identity was found in APPLE_CERTIFICATE.' >&2; exit 1; }
-          if [ "$MACOS_SIGNING_MODE" = "developer-id" ]; then
-            case "$APPLE_SIGNING_IDENTITY" in "Developer ID Application:"*) ;; *) echo 'developer-id mode requires a Developer ID Application identity.' >&2; exit 1;; esac
-            for name in APPLE_API_ISSUER APPLE_API_KEY APPLE_API_PRIVATE_KEY; do
-              test -n "${!name:-}" || { echo "Developer ID notarization requires $name" >&2; exit 1; }
-            done
-            API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
-            printf '%s' "$APPLE_API_PRIVATE_KEY" > "$API_KEY_PATH"
-            chmod 600 "$API_KEY_PATH"
-            echo "APPLE_API_KEY_PATH=$API_KEY_PATH" >> "$GITHUB_ENV"
-          else
-            echo 'Self-signed macOS mode selected: CI verifies code signature integrity but does not claim Apple notarization or Gatekeeper trust.'
-          fi
-          echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
-          rm -f "$CERTIFICATE_PATH"
 
       - name: Build, sign and upload release artifacts
         uses: tauri-apps/tauri-action@v1
@@ -311,7 +317,7 @@ jobs:
             spctl --assess --type execute --verbose=2 "$APP"
             xcrun stapler validate "$DMG"
           else
-            echo 'Self-signed macOS artifact: Apple notarization/Gatekeeper trust is intentionally not asserted.'
+            echo 'Ad-hoc signed macOS artifact: Apple notarization/Gatekeeper trust is intentionally not asserted.'
           fi
           SIG="$(find "$BUNDLE/macos" -maxdepth 1 -name '*.app.tar.gz.sig' -print -quit)"
           test -s "$SIG"
@@ -394,7 +400,7 @@ jobs:
               echo "Windows installers use the configured trusted signing mode: $WINDOWS_SIGNING_MODE."
             fi
             if [ "$MACOS_SIGNING_MODE" = "self-signed" ]; then
-              echo "macOS artifacts are code-signed with the project owner's self-signed identity. Apple notarization and Gatekeeper trust are intentionally not claimed for this distribution mode."
+              echo "macOS artifacts use Tauri ad-hoc code signing (identity -). No Apple certificate or notarization is used; Gatekeeper trust is intentionally not claimed."
             else
               echo "macOS artifacts use Developer ID signing and notarization."
             fi
