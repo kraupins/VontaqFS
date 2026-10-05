@@ -77,21 +77,28 @@ jobs:
         with:
           fetch-depth: 0
       - id: release
-        name: Create or resume draft GitHub Release
+        name: Create or resume draft GitHub Release by ID
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            draft="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .draft)"
+          existing="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | [.id, .draft] | @tsv" | head -n 1)"
+          if [ -n "$existing" ]; then
+            IFS=$'\t' read -r release_id draft <<< "$existing"
             if [ "$draft" != "true" ]; then
               echo "Release $GITHUB_REF_NAME already exists and is not a draft; refusing to mutate a published release." >&2
               exit 1
             fi
           else
-            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "VontaqFS $GITHUB_REF_NAME" --generate-notes
+            release_id="$(gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
+              -f tag_name="$GITHUB_REF_NAME" \
+              -f target_commitish="$GITHUB_SHA" \
+              -f name="VontaqFS $GITHUB_REF_NAME" \
+              -F draft=true \
+              -F prerelease=false \
+              -F generate_release_notes=true \
+              --jq '.id')"
           fi
-          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .id)"
           test -n "$release_id"
           echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
 
@@ -357,20 +364,24 @@ jobs:
     env:
       WINDOWS_SIGNING_MODE: ${{ vars.WINDOWS_SIGNING_MODE }}
       MACOS_SIGNING_MODE: ${{ vars.MACOS_SIGNING_MODE }}
+      RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
           package-manager-cache: false
-      - name: Download draft release assets
+      - name: Download draft release assets by ID
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p release-assets
-          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir release-assets
-          rm -f release-assets/latest.json release-assets/SHA256SUMS.txt
+          while IFS=$'\t' read -r asset_id asset_name; do
+            [ -n "$asset_id" ] || continue
+            gh api -H 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "release-assets/$asset_name"
+          done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" --jq '.[] | [.id, .name] | @tsv')
+          rm -f release-assets/latest.json release-assets/SHA256SUMS.txt release-assets/SIGNING_NOTICE.txt
       - name: Generate signing notice
         run: |
           set -euo pipefail
@@ -396,18 +407,36 @@ jobs:
           node scripts/release/generate-updater-json.mjs --dir release-assets --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" --version "$VERSION" --notes release-assets/SIGNING_NOTICE.txt
           node scripts/release/generate-checksums.mjs release-assets
           node scripts/release/verify-assets.mjs release-assets
-      - name: Upload release metadata
+      - name: Upload release metadata by ID
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release upload "$GITHUB_REF_NAME" release-assets/latest.json release-assets/SHA256SUMS.txt release-assets/SIGNING_NOTICE.txt --repo "$GITHUB_REPOSITORY" --clobber
-      - name: Prepend signing notice to release notes
+          upload_asset() {
+            file="$1"
+            name="$(basename "$file")"
+            existing_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" --jq ".[] | select(.name == \"$name\") | .id" | head -n 1)"
+            if [ -n "$existing_id" ]; then
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$existing_id" >/dev/null
+            fi
+            curl --fail-with-body --location --silent --show-error \
+              --request POST \
+              --header 'Accept: application/vnd.github+json' \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'X-GitHub-Api-Version: 2026-03-10' \
+              --header 'Content-Type: application/octet-stream' \
+              --data-binary "@$file" \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$name" >/dev/null
+          }
+          upload_asset release-assets/latest.json
+          upload_asset release-assets/SHA256SUMS.txt
+          upload_asset release-assets/SIGNING_NOTICE.txt
+      - name: Prepend signing notice to release notes by ID
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          CURRENT_NOTES="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq '.body // ""')"
+          CURRENT_NOTES="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq '.body // ""')"
           {
             cat release-assets/SIGNING_NOTICE.txt
             echo
@@ -415,8 +444,11 @@ jobs:
             echo
             printf '%s\n' "$CURRENT_NOTES"
           } > release-assets/RELEASE_NOTES.md
-          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes-file release-assets/RELEASE_NOTES.md
+          jq -n --rawfile body release-assets/RELEASE_NOTES.md '{body: $body}' > release-assets/release-update.json
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --input release-assets/release-update.json >/dev/null
       - name: Publish release only after all gates succeed
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+        run: |
+          set -euo pipefail
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false -f make_latest=true >/dev/null

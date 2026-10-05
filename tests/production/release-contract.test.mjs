@@ -130,3 +130,13 @@ test('npm SDK package is public ESM with docs/license packaging and Figma subpat
   assert.match(sdkPkg.scripts.postpack, /prepare-sdk-package\.mjs cleanup/);
   assert.match(releaseWorkflow, /Verify npm package contents[\s\S]*npm pack --dry-run --workspace @vontaq\/fs/);
 });
+
+test('draft GitHub release lifecycle is keyed by release ID until publication', () => {
+  assert.match(releaseWorkflow, /Create or resume draft GitHub Release by ID/);
+  assert.match(releaseWorkflow, /release_id=\$release_id/);
+  assert.match(releaseWorkflow, /RELEASE_ID: \$\{\{ needs\.create-release\.outputs\.release_id \}\}/);
+  assert.match(releaseWorkflow, /releases\/\$RELEASE_ID\/assets/);
+  assert.match(releaseWorkflow, /releases\/\$RELEASE_ID"/);
+  assert.doesNotMatch(releaseWorkflow, /releases\/tags\/\$GITHUB_REF_NAME/);
+  assert.doesNotMatch(releaseWorkflow, /gh release (download|upload|edit) "\$GITHUB_REF_NAME"/);
+});
