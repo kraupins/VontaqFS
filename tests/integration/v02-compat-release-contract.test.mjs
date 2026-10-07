@@ -47,7 +47,7 @@ test('frozen 0.1 compatibility fixture contains required records and exact-byte 
 });
 
 test('fixture SHA256 manifest is frozen and complete', async () => {
-  const sums = (await readFile(new URL('SHA256SUMS.txt', fixtureBase), 'utf8')).trim().split('\n');
+  const sums = (await readFile(new URL('SHA256SUMS.txt', fixtureBase), 'utf8')).replace(/\r\n?/g, '\n').trim().split('\n');
   assert.ok(sums.length >= 8);
   for (const line of sums) {
     const match = /^([a-f0-9]{64})  (.+)$/.exec(line);

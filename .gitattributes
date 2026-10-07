@@ -1,0 +1,2 @@
+# Frozen 0.1 compatibility fixture must retain exact repository bytes on every platform.
+tests/fixtures/v01-storage/** -text
