@@ -2,11 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
-const core = fs.readFileSync(new URL('../../crates/core/src/storage.rs', import.meta.url), 'utf8');
-const runtime = fs.readFileSync(new URL('../../crates/runtime/src/lib.rs', import.meta.url), 'utf8');
-const protocol = fs.readFileSync(new URL('../../crates/protocol/src/lib.rs', import.meta.url), 'utf8');
-const tauri = fs.readFileSync(new URL('../../src-tauri/src/lib.rs', import.meta.url), 'utf8');
-const sdk = fs.readFileSync(new URL('../../packages/sdk/src/index.ts', import.meta.url), 'utf8');
+const readSource = url => fs.readFileSync(url, 'utf8').replace(/\r\n/g, '\n');
+
+const core = readSource(new URL('../../crates/core/src/storage.rs', import.meta.url));
+const runtime = readSource(new URL('../../crates/runtime/src/lib.rs', import.meta.url));
+const protocol = readSource(new URL('../../crates/protocol/src/lib.rs', import.meta.url));
+const tauri = readSource(new URL('../../src-tauri/src/lib.rs', import.meta.url));
+const sdk = readSource(new URL('../../packages/sdk/src/index.ts', import.meta.url));
 
 function section(source, start, end) {
   const a = source.indexOf(start);
@@ -33,7 +35,7 @@ test('0.2 internal export tracking is destination-clean and stable across transi
   const nativeExport = section(core, 'pub fn native_export', 'pub fn resolve_directory_grant_import_sources');
   assert.match(nativeExport, /ExportBookkeepingPolicy::Internal/);
   assert.match(nativeExport, /runtime\/native-export/);
-  assert.match(nativeExport, /native_export_tracking_scope\(application_id, &destination_identity, tracking_key\)/);
+  assert.match(nativeExport, /native_export_tracking_scope\(\s*application_id,\s*&destination_identity,\s*tracking_key,?\s*\)/);
   assert.match(nativeExport, /manifest_checksums_by_destination/);
   assert.match(nativeExport, /export_relative_destination/);
   assert.match(nativeExport, /DirectoryExportLayout::Contents/);

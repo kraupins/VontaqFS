@@ -23,6 +23,7 @@ coverage/
 latest.json
 *.sig
 SHA256SUMS.txt
+!tests/fixtures/v01-storage/SHA256SUMS.txt
 *.pfx
 *.p12
 *.pem
