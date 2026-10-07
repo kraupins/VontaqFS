@@ -59,6 +59,17 @@ On first connection, VontaqFS Desktop asks the user to approve the application. 
 
 `developmentEndpoint` exists only for development/test overrides. Published integrations should use normal discovery.
 
+If the saved pairing credential is no longer authorized or can no longer prove the expected runtime, recovery is explicit:
+
+```ts
+import { resetPairingState } from '@vontaq/fs';
+
+await resetPairingState(stateStore);
+const fs = await VontaqFS.connect({ /* same application + stateStore */ });
+```
+
+`resetPairingState()` removes only the SDK-owned pairing credential. It does not change the client instance identity, application identity, spaces, grants or application data. Do not call it automatically after a generic connection error.
+
 ### 3. Default Files API
 
 `fs.files` and the convenience methods on `VontaqFS` operate on the application's default persistent space.
@@ -76,6 +87,12 @@ const bytes = await fs.readFile('/binary/data.bin');
 const info = await fs.files.stat('/binary/data.bin');
 const exists = await fs.files.exists('/binary/data.bin');
 
+const many = await fs.files.readMany(['/settings.json', '/binary/data.bin']);
+for (const result of many.results) {
+  if (result.ok) console.log(result.path, result.file.etag, result.bytes);
+  else console.warn(result.path, result.error.code);
+}
+
 await fs.files.copy('/binary/data.bin', '/binary/copy.bin');
 await fs.files.move('/binary/copy.bin', '/archive/copy.bin');
 await fs.files.delete('/archive', { recursive: true });
@@ -86,13 +103,15 @@ Logical VontaqFS paths are absolute (`/folder/file.ext`) and are not OS paths.
 Available `FileAPI` methods:
 
 - `stat`, `exists`
-- `readFile`, `writeFile`
+- `readFile`, `readMany`, `writeFile`
 - `readText`, `writeText`
 - `readJSON`, `writeJSON`
 - `delete`, `copy`, `move`
 - `createReader`, `createWriter`
 
 Binary/custom files are byte-preserving. VontaqFS does not parse opaque payloads merely to store or preview them.
+
+`readMany()` is for exact, already-known small-file paths. It is bounded to `VONTAQ_FS_READ_MANY_MAX_ITEMS`, `VONTAQ_FS_READ_MANY_MAX_ITEM_BYTES` per item and `VONTAQ_FS_READ_MANY_MAX_RESPONSE_BYTES` in aggregate. Oversized items return a per-path failure so callers can use ordinary single-file/streaming APIs instead.
 
 ### 4. Key/value API
 
@@ -136,6 +155,14 @@ Storage categories:
 - `custom`
 
 `fs.listSpaces()` returns the application's visible spaces.
+
+Disposable spaces can be cleared as one managed operation:
+
+```ts
+await cache.clear();
+```
+
+`space.clear()` is available only for `cache` and `temporary` spaces. Calling it on a persistent space is rejected.
 
 ### 6. Workspace helper
 
@@ -268,6 +295,19 @@ const destination = await fs.destinations.create({
 });
 ```
 
+A previous opaque destination ID can be used only as the next picker location hint. Explicit reuse is allowed only when the user selects the same eligible canonical directory:
+
+```ts
+const destination = await fs.destinations.create({
+  label: 'Project exports',
+  capability: 'read-write',
+  initialDestinationId: previousDestinationId,
+  reuseInitialIfSame: true,
+});
+```
+
+Picker cancellation is reported as `USER_CANCELLED`; the SDK never exposes the physical directory path.
+
 Export from a space:
 
 ```ts
@@ -278,6 +318,22 @@ await fs.defaultSpace.export('/result.json', {
   progress: { presentation: 'vontaqfs' },
 });
 ```
+
+For repeated directory exports that need a clean user folder without VontaqFS sidecars, 0.2 adds explicit tracking options:
+
+```ts
+await fs.defaultSpace.export('/runs/current', {
+  mode: 'directory',
+  destinationId: destination.id,
+  conflict: 'update-changed',
+  bookkeeping: 'internal',
+  prune: 'tracked',
+  trackingKey: 'document-export',
+  directoryLayout: 'contents',
+});
+```
+
+`bookkeeping: 'internal'` keeps tracking metadata in runtime-managed state. `prune: 'tracked'` removes only stale paths previously written by VontaqFS whose current destination checksum still matches the previously written checksum; untracked or user-modified files are preserved. `directoryLayout: 'contents'` exports the selected source directory's children directly into the destination root.
 
 Omit `destinationId` when the runtime should ask the user to choose a destination for that operation.
 
@@ -336,7 +392,7 @@ if (capabilities.snapshots) {
 }
 ```
 
-Capability flags include files, KV, spaces, streams, events, formats, operations, native import/export, saved directories, export presets, backups, snapshots, batches, storage categories and the system progress window.
+Capability flags include files, KV, spaces, streams, events, formats, operations, native import/export, saved directories, export presets, backups, snapshots, batches, storage categories, the system progress window, `bulkRead`, `spaceClear`, `destinationPickerHints`, `internalExportBookkeeping`, `trackedExportPrune` and `directoryContentsExport`. New optional 0.2 calls must be feature-detected when older runtimes are supported.
 
 ### 15. Errors
 
@@ -354,7 +410,7 @@ try {
 }
 ```
 
-Common codes include `RUNTIME_UNREACHABLE`, `PAIRING_REQUIRED`, `AUTH_REVOKED`, `PERMISSION_DENIED`, `NOT_FOUND`, `CONFLICT`, `MATERIALIZATION_LIMIT`, `QUOTA_EXCEEDED`, `DISK_SPACE_LOW`, `DESTINATION_GRANT_REQUIRED`, `EXPORT_CANCELLED`, `IMPORT_CANCELLED`, `SNAPSHOT_NOT_FOUND` and `BATCH_CANCELLED`.
+Common codes include `RUNTIME_UNREACHABLE`, `PAIRING_REQUIRED`, `AUTH_REVOKED`, `PERMISSION_DENIED`, `NOT_FOUND`, `CONFLICT`, `MATERIALIZATION_LIMIT`, `QUOTA_EXCEEDED`, `DISK_SPACE_LOW`, `CAPABILITY_UNAVAILABLE`, `USER_CANCELLED`, `OPERATION_LOST`, `DESTINATION_GRANT_REQUIRED`, `DESTINATION_BUSY`, `EXPORT_CANCELLED`, `EXPORT_SOURCE_CHANGED`, `IMPORT_CANCELLED`, `SNAPSHOT_NOT_FOUND` and `BATCH_CANCELLED`.
 
 The complete exported list is `VONTAQ_FS_ERROR_CODES`.
 
@@ -474,6 +530,17 @@ const fs = await VontaqFS.connect({
 
 `developmentEndpoint` предназначен только для разработки и тестов. Публичные интеграции используют обычное обнаружение runtime.
 
+Если сохранённый pairing credential больше не авторизован или не может подтвердить ожидаемый runtime, восстановление выполняется явно:
+
+```ts
+import { resetPairingState } from '@vontaq/fs';
+
+await resetPairingState(stateStore);
+const fs = await VontaqFS.connect({ /* те же application + stateStore */ });
+```
+
+`resetPairingState()` удаляет только pairing credential, которым владеет SDK. Client instance identity, application identity, spaces, grants и данные приложения сохраняются. Не вызывайте reset автоматически после обычной ошибки соединения.
+
 ### 3. Files API по умолчанию
 
 `fs.files` и сокращённые методы класса `VontaqFS` работают с основным постоянным хранилищем приложения.
@@ -487,6 +554,12 @@ const settings = await fs.readJSON<{ theme: string }>('/settings.json');
 
 await fs.writeFile('/binary/data.bin', new Uint8Array([1, 2, 3]));
 const bytes = await fs.readFile('/binary/data.bin');
+
+const many = await fs.files.readMany(['/settings.json', '/binary/data.bin']);
+for (const result of many.results) {
+  if (result.ok) console.log(result.path, result.file.etag, result.bytes);
+  else console.warn(result.path, result.error.code);
+}
 ```
 
 Логические пути VontaqFS абсолютные (`/folder/file.ext`), но это не физические пути ОС.
@@ -494,13 +567,15 @@ const bytes = await fs.readFile('/binary/data.bin');
 Доступные методы `FileAPI`:
 
 - `stat`, `exists`
-- `readFile`, `writeFile`
+- `readFile`, `readMany`, `writeFile`
 - `readText`, `writeText`
 - `readJSON`, `writeJSON`
 - `delete`, `copy`, `move`
 - `createReader`, `createWriter`
 
 Бинарные и пользовательские форматы сохраняются побайтно. Opaque payload не разбирается VontaqFS только ради хранения или предпросмотра.
+
+`readMany()` предназначен для заранее известных путей к небольшим файлам. Ограничения: `VONTAQ_FS_READ_MANY_MAX_ITEMS`, `VONTAQ_FS_READ_MANY_MAX_ITEM_BYTES` на элемент и `VONTAQ_FS_READ_MANY_MAX_RESPONSE_BYTES` суммарно. Слишком большой элемент возвращает отдельную ошибку для своего path; его следует читать обычным single-file/streaming API.
 
 ### 4. Key/value API
 
@@ -535,6 +610,14 @@ const cache = await fs.openSpace({
 Категории: `user-data`, `generated`, `index`, `backup`, `snapshot`, `custom`.
 
 `fs.listSpaces()` возвращает доступные приложению spaces.
+
+Disposable space можно очистить одной managed-операцией:
+
+```ts
+await cache.clear();
+```
+
+`space.clear()` доступен только для `cache` и `temporary`; persistent space очищать этой операцией нельзя.
 
 ### 6. Workspace helper
 
@@ -659,6 +742,13 @@ const destination = await fs.destinations.create({
   capability: 'write',
 });
 
+const nextDestination = await fs.destinations.create({
+  label: 'Project exports',
+  capability: 'read-write',
+  initialDestinationId: destination.id,
+  reuseInitialIfSame: true,
+});
+
 await fs.defaultSpace.export('/result.json', {
   mode: 'file',
   destinationId: destination.id,
@@ -666,6 +756,24 @@ await fs.defaultSpace.export('/result.json', {
   progress: { presentation: 'vontaqfs' },
 });
 ```
+
+`initialDestinationId` — только opaque hint для стартовой папки picker. `reuseInitialIfSame` разрешает вернуть тот же grant лишь если пользователь снова выбрал ту же допустимую canonical directory. Физический path клиенту не раскрывается; отмена picker возвращается как `USER_CANCELLED`.
+
+Для повторного directory export в чистую пользовательскую папку доступны 0.2 tracking options:
+
+```ts
+await fs.defaultSpace.export('/runs/current', {
+  mode: 'directory',
+  destinationId: nextDestination.id,
+  conflict: 'update-changed',
+  bookkeeping: 'internal',
+  prune: 'tracked',
+  trackingKey: 'document-export',
+  directoryLayout: 'contents',
+});
+```
+
+`bookkeeping: 'internal'` держит tracking metadata внутри runtime. `prune: 'tracked'` удаляет только ранее записанные VontaqFS stale paths, которые пользователь после экспорта не изменил; untracked/user-modified файлы сохраняются. `directoryLayout: 'contents'` кладёт содержимое source directory прямо в корень выбранной destination.
 
 Если `destinationId` не указан, runtime может открыть системный выбор назначения для этой операции.
 
@@ -719,7 +827,7 @@ if (capabilities.snapshots) {
 }
 ```
 
-Флаги покрывают files, KV, spaces, streams, events, formats, operations, native import/export, saved directories, export presets, backups, snapshots, batch, storage categories и системное окно прогресса.
+Флаги покрывают files, KV, spaces, streams, events, formats, operations, native import/export, saved directories, export presets, backups, snapshots, batch, storage categories, системное окно прогресса, а также `bulkRead`, `spaceClear`, `destinationPickerHints`, `internalExportBookkeeping`, `trackedExportPrune` и `directoryContentsExport`. Если поддерживается старый runtime, новые 0.2 возможности нужно feature-detect через `capabilities()`.
 
 ### 15. Ошибки
 
@@ -737,7 +845,7 @@ try {
 }
 ```
 
-Частые коды: `RUNTIME_UNREACHABLE`, `PAIRING_REQUIRED`, `AUTH_REVOKED`, `PERMISSION_DENIED`, `NOT_FOUND`, `CONFLICT`, `MATERIALIZATION_LIMIT`, `QUOTA_EXCEEDED`, `DISK_SPACE_LOW`, `DESTINATION_GRANT_REQUIRED`, `EXPORT_CANCELLED`, `IMPORT_CANCELLED`, `SNAPSHOT_NOT_FOUND`, `BATCH_CANCELLED`.
+Частые коды: `RUNTIME_UNREACHABLE`, `PAIRING_REQUIRED`, `AUTH_REVOKED`, `PERMISSION_DENIED`, `NOT_FOUND`, `CONFLICT`, `MATERIALIZATION_LIMIT`, `QUOTA_EXCEEDED`, `DISK_SPACE_LOW`, `CAPABILITY_UNAVAILABLE`, `USER_CANCELLED`, `OPERATION_LOST`, `DESTINATION_GRANT_REQUIRED`, `DESTINATION_BUSY`, `EXPORT_CANCELLED`, `EXPORT_SOURCE_CHANGED`, `IMPORT_CANCELLED`, `SNAPSHOT_NOT_FOUND`, `BATCH_CANCELLED`.
 
 Полный список экспортируется как `VONTAQ_FS_ERROR_CODES`.
 
@@ -809,8 +917,10 @@ await fs.close();
 - module format: ESM
 - package Node engine metadata: Node.js 18+
 - production runtime endpoint pool: `localhost:47833`–`localhost:47836`
+- package/product version in this release: `0.2.0`
 - protocol range in this release: v1
-- package includes compiled JavaScript, TypeScript declarations, source maps, this guide and the VontaqFS license
+- storage/registry format in this release: v1
+- package includes compiled JavaScript, TypeScript declarations, source maps, this guide, `CHANGELOG.md` and the VontaqFS license
 
 For exact compile-time types and constants, the installed package declarations are the source of truth.
 

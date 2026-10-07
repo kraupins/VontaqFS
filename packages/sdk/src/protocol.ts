@@ -15,6 +15,36 @@ export const VONTAQ_FS_MAX_FILE_BYTES = 16 * 1024 * 1024 * 1024;
 export const VONTAQ_FS_EVENT_LONG_POLL_MAX_MS = 25_000;
 export const VONTAQ_FS_MAX_BATCH_OPERATIONS = 64;
 export const VONTAQ_FS_MAX_BATCH_PAYLOAD_BYTES = 512 * 1024;
+export const VONTAQ_FS_READ_MANY_MAX_ITEMS = 64;
+export const VONTAQ_FS_READ_MANY_MAX_ITEM_BYTES = VONTAQ_FS_DIRECT_PAYLOAD_TARGET_BYTES;
+export const VONTAQ_FS_READ_MANY_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+
+export const VONTAQ_FS_CAPABILITY_IDS = {
+  files: 'files',
+  kv: 'kv',
+  spaces: 'spaces',
+  streams: 'streams',
+  events: 'events',
+  formats: 'formats',
+  operations: 'operations',
+  nativeExport: 'native-export',
+  nativeImport: 'native-import',
+  savedDirectories: 'saved-directories',
+  exportPresets: 'export-presets',
+  backup: 'backup',
+  snapshots: 'snapshots',
+  batch: 'batch',
+  storageCategory: 'storage-category',
+  systemProgressWindow: 'system-progress-window',
+  bulkRead: 'bulk-read',
+  spaceClear: 'space-clear',
+  destinationPickerHints: 'destination-picker-hints',
+  internalExportBookkeeping: 'internal-export-bookkeeping',
+  trackedExportPrune: 'tracked-export-prune',
+  directoryContentsExport: 'directory-contents-export',
+} as const;
+
+export type VontaqFSCapabilityId = typeof VONTAQ_FS_CAPABILITY_IDS[keyof typeof VONTAQ_FS_CAPABILITY_IDS];
 
 export type ClientKind = 'figma-plugin' | 'figma-widget' | 'other-supported-client';
 export type StorageClass = 'persistent' | 'cache' | 'temporary';
@@ -68,6 +98,9 @@ export interface DestinationGrant {
 
 export type NativeExportMode = 'file' | 'files' | 'directory' | 'archive';
 export type ExportConflictPolicy = 'replace' | 'skip' | 'rename' | 'ask' | 'update-changed';
+export type ExportBookkeepingPolicy = 'destination' | 'internal';
+export type ExportPrunePolicy = 'none' | 'tracked';
+export type DirectoryExportLayout = 'preserve' | 'contents';
 export interface NativeExportReport {
   spaceId: string;
   destinationLabel: string;
@@ -278,12 +311,70 @@ export interface VontaqFSCapabilities {
   readonly batch: boolean;
   readonly storageCategory: boolean;
   readonly systemProgressWindow: boolean;
+  readonly bulkRead: boolean;
+  readonly spaceClear: boolean;
+  readonly destinationPickerHints: boolean;
+  readonly internalExportBookkeeping: boolean;
+  readonly trackedExportPrune: boolean;
+  readonly directoryContentsExport: boolean;
   readonly raw: readonly string[];
 }
 
 export interface SmallFileReadResponse {
   dataBase64: string;
   file: FileInfo;
+}
+
+export interface ReadManyRequestWire {
+  spaceId: string;
+  paths: readonly string[];
+  operation?: OperationRequestWire;
+}
+
+export interface ReadManyItemError {
+  code: string;
+  message: string;
+}
+
+export type ReadManyItemResult =
+  | { path: string; ok: true; bytes: Uint8Array; file: FileInfo }
+  | { path: string; ok: false; error: ReadManyItemError };
+
+export interface ReadManyItemWire {
+  path: string;
+  ok: boolean;
+  dataBase64?: string;
+  file?: FileInfo;
+  error?: ReadManyItemError;
+}
+
+export interface ReadManyReportWire {
+  results: readonly ReadManyItemWire[];
+  completedItems: number;
+  failedItems: number;
+  totalBytes: number;
+  cancelled: boolean;
+}
+
+export interface ReadManyReport {
+  results: readonly ReadManyItemResult[];
+  completedItems: number;
+  failedItems: number;
+  totalBytes: number;
+  cancelled: boolean;
+}
+
+export interface ClearSpaceRequestWire {
+  requestId: string;
+  spaceId: string;
+  operation?: OperationRequestWire;
+}
+
+export interface SpaceClearReport {
+  spaceId: string;
+  deletedFiles: number;
+  deletedKvEntries: number;
+  releasedBytes: number;
 }
 
 export interface RuntimeErrorResponse {

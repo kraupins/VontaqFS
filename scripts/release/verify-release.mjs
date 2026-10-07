@@ -45,7 +45,7 @@ for (const [label, actual] of [
 const tag = args.get('tag') || process.env.GITHUB_REF_NAME || '';
 if (tag && tag !== `v${version}`) throw new Error(`Release gate: tag ${tag} does not match v${version}.`);
 
-const requiredPublicDocs = ['README.md', 'README_DEVELOPER.md', 'PRIVACY.md', 'LICENSE'];
+const requiredPublicDocs = ['README.md', 'README_DEVELOPER.md', 'CHANGELOG.md', 'PRIVACY.md', 'LICENSE'];
 for (const file of requiredPublicDocs) {
   const body = fs.readFileSync(path.join(root, file), 'utf8');
   if (!body.trim()) throw new Error(`Release gate: ${file} is empty.`);
@@ -67,6 +67,14 @@ for (const internal of ['WINDOWS_SIGNING_MODE', 'TAURI_SIGNING_PRIVATE_KEY', 'pr
 if (!/npm install @vontaq\/fs/.test(developerReadme) || !/VontaqFS\.connect/.test(developerReadme)) {
   throw new Error('Release gate: Developer README must document public SDK installation and connection.');
 }
+const changelogText = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
+const escapedVersion = version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const changelogVersionHeading = new RegExp(`^## \\[${escapedVersion}\\](?:\\s+-\\s+[^\\n]+)?\\s*$`, 'm');
+if (!changelogVersionHeading.test(changelogText)) throw new Error(`Release gate: CHANGELOG.md has no ${version} section.`);
+for (const heading of ['Added', 'Changed', 'Fixed', 'Compatibility']) {
+  if (!new RegExp(`^### ${heading}\\s*$`, 'm').test(changelogText)) throw new Error(`Release gate: CHANGELOG.md is missing ${heading}.`);
+}
+
 
 
 if (tauri?.bundle?.createUpdaterArtifacts !== false) throw new Error('Release gate: default Tauri config must keep updater artifacts disabled for local/dev builds.');
@@ -79,7 +87,7 @@ if (sdkPackage?.name !== '@vontaq/fs') throw new Error('Release gate: SDK packag
 if (sdkPackage?.type !== 'module') throw new Error('Release gate: @vontaq/fs must remain ESM.');
 if (sdkPackage?.sideEffects !== false) throw new Error('Release gate: @vontaq/fs sideEffects must remain false.');
 if (!sdkPackage?.exports?.['.'] || !sdkPackage?.exports?.['./figma']) throw new Error('Release gate: @vontaq/fs root and ./figma exports are required.');
-if (JSON.stringify(sdkPackage?.files) !== JSON.stringify(['dist', 'README.md', 'LICENSE'])) throw new Error('Release gate: @vontaq/fs package files must be dist + README.md + LICENSE.');
+if (JSON.stringify(sdkPackage?.files) !== JSON.stringify(['dist', 'README.md', 'CHANGELOG.md', 'LICENSE'])) throw new Error('Release gate: @vontaq/fs package files must be dist + README.md + CHANGELOG.md + LICENSE.');
 if (!/prepare-sdk-package\.mjs prepare/.test(String(sdkPackage?.scripts?.prepack || '')) || !/prepare-sdk-package\.mjs cleanup/.test(String(sdkPackage?.scripts?.postpack || ''))) throw new Error('Release gate: @vontaq/fs prepack/postpack documentation packaging is missing.');
 const tauriMain = fs.readFileSync(path.join(root, 'src-tauri/main.rs'.replace('main.rs','src/main.rs')), 'utf8');
 if (!/windows_subsystem\s*=\s*"windows"/.test(tauriMain)) throw new Error('Release gate: Windows desktop must use the GUI subsystem without a console window.');

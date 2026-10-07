@@ -9,6 +9,7 @@ const sdkDir = path.join(root, 'packages', 'sdk');
 const action = process.argv[2];
 const generated = [
   [path.join(root, 'README_DEVELOPER.md'), path.join(sdkDir, 'README.md')],
+  [path.join(root, 'CHANGELOG.md'), path.join(sdkDir, 'CHANGELOG.md')],
   [path.join(root, 'LICENSE'), path.join(sdkDir, 'LICENSE')],
 ];
 

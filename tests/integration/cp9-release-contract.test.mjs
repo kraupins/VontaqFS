@@ -95,20 +95,20 @@ test('CP9 updater manifest and checksum scripts produce and verify four-platform
   const dir = await mkdtemp(path.join(tmpdir(), 'vontaqfs-cp9-'));
   try {
     const assets = [
-      'VontaqFS_0.1.0_windows-x86_64-setup.exe',
-      'VontaqFS_0.1.0_windows-x86_64.msi',
-      'VontaqFS_0.1.0_windows-aarch64-setup.exe',
-      'VontaqFS_0.1.0_windows-aarch64.msi',
-      'VontaqFS_0.1.0_darwin-aarch64.dmg',
-      'VontaqFS_0.1.0_darwin-aarch64.app.tar.gz',
-      'VontaqFS_0.1.0_darwin-x86_64.dmg',
-      'VontaqFS_0.1.0_darwin-x86_64.app.tar.gz',
+      'VontaqFS_0.2.0_windows-x86_64-setup.exe',
+      'VontaqFS_0.2.0_windows-x86_64.msi',
+      'VontaqFS_0.2.0_windows-aarch64-setup.exe',
+      'VontaqFS_0.2.0_windows-aarch64.msi',
+      'VontaqFS_0.2.0_darwin-aarch64.dmg',
+      'VontaqFS_0.2.0_darwin-aarch64.app.tar.gz',
+      'VontaqFS_0.2.0_darwin-x86_64.dmg',
+      'VontaqFS_0.2.0_darwin-x86_64.app.tar.gz',
     ];
     for (const name of assets) await writeFile(path.join(dir, name), `fixture:${name}`);
     for (const name of assets.filter((name) => name.endsWith('-setup.exe') || name.endsWith('.app.tar.gz'))) {
       await writeFile(path.join(dir, `${name}.sig`), `signature:${name}`);
     }
-    let result = run(updaterPath, ['--dir', dir, '--repo', 'kraupins/VontaqFS', '--tag', 'v0.1.0', '--version', '0.1.0']);
+    let result = run(updaterPath, ['--dir', dir, '--repo', 'kraupins/VontaqFS', '--tag', 'v0.2.0', '--version', '0.2.0']);
     assert.equal(result.status, 0, result.stderr);
     result = run(checksumsPath, [dir]);
     assert.equal(result.status, 0, result.stderr);
@@ -123,7 +123,7 @@ test('CP9 updater manifest and checksum scripts produce and verify four-platform
 });
 
 test('CP9 immutable release gate accepts the current coherent version/tag contract', () => {
-  const result = run(releaseGatePath, ['--tag', 'v0.1.0'], { cwd: path.resolve(new URL('../..', import.meta.url).pathname) });
+  const result = run(releaseGatePath, ['--tag', 'v0.2.0'], { cwd: path.resolve(new URL('../..', import.meta.url).pathname) });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /\"ok\": true/);
 });

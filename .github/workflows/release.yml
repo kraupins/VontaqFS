@@ -76,6 +76,15 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Build release notes from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          node scripts/release/extract-changelog-section.mjs "$VERSION" release-notes.md
       - id: release
         name: Create or resume draft GitHub Release by ID
         env:
@@ -96,10 +105,12 @@ jobs:
               -f name="VontaqFS $GITHUB_REF_NAME" \
               -F draft=true \
               -F prerelease=false \
-              -F generate_release_notes=true \
+              --raw-field body="$(cat release-notes.md)" \
               --jq '.id')"
           fi
           test -n "$release_id"
+          jq -n --rawfile body release-notes.md '{body: $body}' > release-notes-update.json
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" --input release-notes-update.json >/dev/null
           echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
 
   build-desktop:

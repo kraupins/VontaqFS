@@ -35,8 +35,8 @@ function collectMarkdown(dir, base = dir) {
   return out.sort();
 }
 
-test('production documentation set is intentionally minimal and bilingual', () => {
-  assert.deepEqual(collectMarkdown(root), ['PRIVACY.md', 'README.md', 'README_DEVELOPER.md']);
+test('production documentation set includes release history and Wiki handoff while core public docs stay bilingual', () => {
+  assert.deepEqual(collectMarkdown(root), ['CHANGELOG.md', 'PRIVACY.md', 'README.md', 'README_DEVELOPER.md', 'WIKI_UPDATE_0.2.0.md']);
   for (const body of [clientReadme, developerReadme, privacy]) {
     assert.match(body, /## English/);
     assert.match(body, /## Русский/);
@@ -125,7 +125,7 @@ test('npm SDK package is public ESM with docs/license packaging and Figma subpat
   assert.equal(sdkPkg.sideEffects, false);
   assert.ok(sdkPkg.exports['.']);
   assert.ok(sdkPkg.exports['./figma']);
-  assert.deepEqual(sdkPkg.files, ['dist', 'README.md', 'LICENSE']);
+  assert.deepEqual(sdkPkg.files, ['dist', 'README.md', 'CHANGELOG.md', 'LICENSE']);
   assert.match(sdkPkg.scripts.prepack, /prepare-sdk-package\.mjs prepare/);
   assert.match(sdkPkg.scripts.postpack, /prepare-sdk-package\.mjs cleanup/);
   assert.match(releaseWorkflow, /Verify npm package contents[\s\S]*npm pack --dry-run --workspace @vontaq\/fs/);

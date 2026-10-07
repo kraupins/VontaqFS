@@ -15,6 +15,8 @@ import {
   VONTAQ_FS_MAX_FILE_BYTES,
   VONTAQ_FS_PROTOCOL_MAX,
   VONTAQ_FS_PROTOCOL_MIN,
+  VONTAQ_FS_READ_MANY_MAX_ITEMS,
+  VONTAQ_FS_READ_MANY_MAX_RESPONSE_BYTES,
   VONTAQ_FS_STREAM_CHUNK_BYTES,
   VONTAQ_FS_STREAM_CHUNK_MAX_BYTES,
   type BatchOperation,
@@ -22,7 +24,10 @@ import {
   type ClientIdentity,
   type DestinationGrant,
   type DirectoryGrantCapability,
+  type DirectoryExportLayout,
+  type ExportBookkeepingPolicy,
   type ExportConflictPolicy,
+  type ExportPrunePolicy,
   type ExportPreset,
   type ImportConflictPolicy,
   type NativeExportMode,
@@ -40,6 +45,8 @@ import {
   type ProgressPresentation,
   type PairingPollResponse,
   type PairingRequestResponse,
+  type ReadManyReport,
+  type ReadManyReportWire,
   type RuntimeErrorResponse,
   type RuntimeEvent,
   type RuntimeIdentityChallengeResponse,
@@ -48,10 +55,12 @@ import {
   type SmallFileReadResponse,
   type SnapshotInfo,
   type SnapshotRestoreReport,
+  type SpaceClearReport,
   type SpaceInfo,
   type StorageCategory,
   type StorageClass,
   type StreamChunkAck,
+  VONTAQ_FS_CAPABILITY_IDS,
   type VontaqFSCapabilities,
   type WriteTreeEntry,
   type WriteTreeReport,
@@ -72,6 +81,15 @@ export interface ClientStateStore {
   get(key: string): Promise<string | null>;
   set(key: string, value: string): Promise<void>;
   delete?(key: string): Promise<void>;
+}
+
+/** Explicitly forget only the saved pairing credential. Client/application identity and VFS data are preserved. */
+export async function resetPairingState(stateStore: ClientStateStore): Promise<void> {
+  if (!stateStore || typeof stateStore.get !== 'function' || typeof stateStore.set !== 'function') {
+    throw new TypeError('resetPairingState() requires a ClientStateStore.');
+  }
+  if (typeof stateStore.delete === 'function') await stateStore.delete(PAIRING_CREDENTIAL_KEY);
+  else await stateStore.set(PAIRING_CREDENTIAL_KEY, '');
 }
 
 export interface VontaqFSHttpRequest {
@@ -142,6 +160,10 @@ export interface WorkspaceOptions {
 export interface CreateDestinationOptions {
   label?: string;
   capability?: DirectoryGrantCapability;
+  /** Opaque prior grant used only as a native picker initial-location hint when supported. */
+  initialDestinationId?: string;
+  /** Allows reuse only when the user selects the same canonical directory and the prior grant remains sufficient. */
+  reuseInitialIfSame?: boolean;
 }
 
 export interface NativeExportOptions extends OperationOptions {
@@ -150,6 +172,14 @@ export interface NativeExportOptions extends OperationOptions {
   conflict?: ExportConflictPolicy;
   format?: 'zip';
   archiveName?: string;
+  /** Defaults to destination for 0.1 compatibility. */
+  bookkeeping?: ExportBookkeepingPolicy;
+  /** Defaults to none. tracked only removes paths proven safe by the prior authoritative tracking manifest. */
+  prune?: ExportPrunePolicy;
+  /** Opaque application-owned tracking scope. */
+  trackingKey?: string;
+  /** Defaults to preserve. contents exports a directory's children directly into the destination root. */
+  directoryLayout?: DirectoryExportLayout;
 }
 
 export interface NativeImportOptions extends OperationOptions {
@@ -246,6 +276,7 @@ export interface FileAPI {
   stat(path: string): Promise<FileInfo | null>;
   exists(path: string): Promise<boolean>;
   readFile(path: string, options?: FileReadOptions): Promise<Uint8Array>;
+  readMany(paths: readonly string[], options?: FileReadOptions): Promise<ReadManyReport>;
   writeFile(path: string, bytes: Uint8Array, options?: FileWriteOptions): Promise<FileInfo>;
   readText(path: string, options?: FileReadOptions): Promise<string>;
   writeText(path: string, value: string, options?: FileWriteOptions): Promise<FileInfo>;
@@ -356,6 +387,12 @@ class RuntimeConnection {
   get materializationLimitBytes(): number { return this.settings.materializationLimitBytes; }
   get requestTimeoutMs(): number { return this.settings.requestTimeoutMs; }
   get sessionCapabilityIds(): readonly string[] { return this.session.capabilities; }
+
+  requireCapability(capability: string): void {
+    if (!this.session.capabilities.includes(capability)) {
+      throw new VontaqFSError('CAPABILITY_UNAVAILABLE', `The connected VontaqFS runtime does not support ${capability}.`, { capability });
+    }
+  }
 
   async health(): Promise<RuntimeStatus> {
     this.ensureOpen();
@@ -473,7 +510,14 @@ class OperationObserver {
         }
         if (snapshot.status === 'cancelled') throw new VontaqFSError(cancelledCode, `VontaqFS ${cancelledLabel} was cancelled.`);
         await sleep(75);
-        snapshot = await this.connection.operationStatus(this.request.id);
+        try {
+          snapshot = await this.connection.operationStatus(this.request.id);
+        } catch (error) {
+          if (isVontaqFSError(error) && error.code === 'OPERATION_NOT_FOUND') {
+            throw new VontaqFSError('OPERATION_LOST', 'The VontaqFS runtime lost the tracked operation before its outcome was known.', { operationId: this.request.id });
+          }
+          throw error;
+        }
         await this.emit(snapshot);
       }
     } finally {
@@ -674,27 +718,46 @@ class SpaceFiles implements FileAPI {
 
   async readFile(path: string, options: FileReadOptions = {}): Promise<Uint8Array> {
     const info = await this.requireFile(path);
-    this.assertMaterializable(info);
-    if (info.size <= VONTAQ_FS_DIRECT_PAYLOAD_TARGET_BYTES) {
-      const observer = new OperationObserver(this.connection, options);
-      const response = await observer.run(operation => this.connection.post<SmallFileReadResponse>('/v1/fs/read-small', { spaceId: this.spaceId, path, operation }, 'read'));
-      return decodeBase64(response.dataBase64);
+    return this.readFileWithInfo(path, info, options);
+  }
+
+  async readMany(paths: readonly string[], options: FileReadOptions = {}): Promise<ReadManyReport> {
+    if (!Array.isArray(paths) || paths.length === 0 || paths.length > VONTAQ_FS_READ_MANY_MAX_ITEMS) {
+      throw new RangeError(`files.readMany() requires 1-${VONTAQ_FS_READ_MANY_MAX_ITEMS} paths.`);
     }
-    const reader = await this.createReader(path, options);
-    const output = new Uint8Array(info.size);
-    let offset = 0;
-    try {
-      for (;;) {
-        const chunk = await reader.read();
-        if (!chunk) break;
-        output.set(chunk, offset);
-        offset += chunk.byteLength;
-      }
-    } finally {
-      await reader.close();
+    for (const path of paths) {
+      if (typeof path !== 'string') throw new TypeError('files.readMany() paths must be strings.');
     }
-    if (offset !== info.size) throw new VontaqFSError('STORAGE_CORRUPT', 'Materialized file size did not match runtime metadata.');
-    return output;
+    this.connection.requireCapability(VONTAQ_FS_CAPABILITY_IDS.bulkRead);
+    const observer = new OperationObserver(this.connection, options);
+    const wire = await observer.run(operation => this.connection.post<ReadManyReportWire>('/v1/fs/read-many', {
+      spaceId: this.spaceId, paths: [...paths], operation,
+    }, 'read'));
+    if (wire.cancelled) {
+      if (options.signal?.aborted) throw abortError();
+      throw new VontaqFSError('CONFLICT', 'VontaqFS readMany() was cancelled before all requested paths were processed.');
+    }
+    if (!Number.isSafeInteger(wire.totalBytes) || wire.totalBytes < 0 || wire.totalBytes > VONTAQ_FS_READ_MANY_MAX_RESPONSE_BYTES) {
+      throw new VontaqFSError('STORAGE_CORRUPT', 'VontaqFS returned an invalid readMany() aggregate byte count.');
+    }
+    return {
+      completedItems: wire.completedItems,
+      failedItems: wire.failedItems,
+      totalBytes: wire.totalBytes,
+      cancelled: false,
+      results: wire.results.map((item) => {
+        if (item.ok) {
+          if (typeof item.dataBase64 !== 'string' || !item.file) {
+            throw new VontaqFSError('STORAGE_CORRUPT', `VontaqFS returned an incomplete readMany() success result for ${item.path}.`);
+          }
+          return { path: item.path, ok: true as const, bytes: decodeBase64(item.dataBase64), file: item.file };
+        }
+        if (!item.error || typeof item.error.code !== 'string' || typeof item.error.message !== 'string') {
+          throw new VontaqFSError('STORAGE_CORRUPT', `VontaqFS returned an incomplete readMany() failure result for ${item.path}.`);
+        }
+        return { path: item.path, ok: false as const, error: item.error };
+      }),
+    };
   }
 
   async writeFile(path: string, bytes: Uint8Array, options: FileWriteOptions = {}): Promise<FileInfo> {
@@ -724,7 +787,7 @@ class SpaceFiles implements FileAPI {
     const info = await this.requireFile(path);
     this.assertMaterializable(info);
     if (info.size <= VONTAQ_FS_DIRECT_PAYLOAD_TARGET_BYTES) {
-      return new TextDecoder('utf-8', { fatal: true }).decode(await this.readFile(path, options));
+      return new TextDecoder('utf-8', { fatal: true }).decode(await this.readFileWithInfo(path, info, options));
     }
     const reader = await this.createReader(path, options);
     const decoder = new TextDecoder('utf-8', { fatal: true });
@@ -844,6 +907,30 @@ class SpaceFiles implements FileAPI {
     }
   }
 
+  private async readFileWithInfo(path: string, info: FileInfo, options: FileReadOptions): Promise<Uint8Array> {
+    this.assertMaterializable(info);
+    if (info.size <= VONTAQ_FS_DIRECT_PAYLOAD_TARGET_BYTES) {
+      const observer = new OperationObserver(this.connection, options);
+      const response = await observer.run(operation => this.connection.post<SmallFileReadResponse>('/v1/fs/read-small', { spaceId: this.spaceId, path, operation }, 'read'));
+      return decodeBase64(response.dataBase64);
+    }
+    const reader = await this.createReader(path, options);
+    const output = new Uint8Array(info.size);
+    let offset = 0;
+    try {
+      for (;;) {
+        const chunk = await reader.read();
+        if (!chunk) break;
+        output.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+    } finally {
+      await reader.close();
+    }
+    if (offset !== info.size) throw new VontaqFSError('STORAGE_CORRUPT', 'Materialized file size did not match runtime metadata.');
+    return output;
+  }
+
   private async requireFile(path: string): Promise<FileInfo> {
     const info = await this.stat(path);
     if (!info) throw new VontaqFSError('NOT_FOUND', `File not found: ${path}`);
@@ -901,8 +988,15 @@ class ApplicationDestinations implements DestinationAPI {
     const capability = options.capability ?? 'write';
     if (!['read', 'write', 'read-write'].includes(capability)) throw new TypeError('destination capability is invalid.');
     if (options.label !== undefined && (!options.label.trim() || options.label.length > 128)) throw new TypeError('destination label must be 1-128 characters.');
+    if (options.initialDestinationId !== undefined && !/^dst_[a-f0-9]{32}$/i.test(options.initialDestinationId)) throw new TypeError('initialDestinationId is invalid.');
+    if (options.reuseInitialIfSame && !options.initialDestinationId) throw new TypeError('reuseInitialIfSame requires initialDestinationId.');
+    if (options.initialDestinationId !== undefined || options.reuseInitialIfSame !== undefined) {
+      this.connection.requireCapability(VONTAQ_FS_CAPABILITY_IDS.destinationPickerHints);
+    }
     return this.connection.postNonRetryingMutation('/v1/destinations/create', {
       requestId: secureId('request'), label: options.label ?? null, capability,
+      initialDestinationId: options.initialDestinationId ?? null,
+      reuseInitialIfSame: options.reuseInitialIfSame ?? false,
     });
   }
   async list(): Promise<readonly DestinationGrant[]> {
@@ -995,6 +1089,17 @@ export class VontaqFSSpace {
   get key(): string { return this.info.key; }
   get storageClass(): StorageClass { return this.info.storageClass; }
   get storageCategory(): StorageCategory { return this.info.storageCategory ?? 'user-data'; }
+
+  async clear(options: OperationOptions = {}): Promise<SpaceClearReport> {
+    if (this.storageClass === 'persistent') {
+      throw new VontaqFSError('REQUEST_INVALID', 'Persistent spaces cannot be cleared with space.clear().');
+    }
+    this.connection.requireCapability(VONTAQ_FS_CAPABILITY_IDS.spaceClear);
+    const observer = new OperationObserver(this.connection, options);
+    return observer.run(operation => this.connection.postNonRetryingMutation<SpaceClearReport>('/v1/spaces/clear', {
+      requestId: secureId('request'), spaceId: this.id, operation,
+    }));
+  }
 
   async batch(operations: readonly BatchOperation[], options: BatchOptions = {}): Promise<BatchReport> {
     if (!Array.isArray(operations) || operations.length === 0 || operations.length > VONTAQ_FS_MAX_BATCH_OPERATIONS) {
@@ -1121,11 +1226,26 @@ export class VontaqFSSpace {
     if (options.destinationId && !/^dst_[a-f0-9]{32}$/i.test(options.destinationId)) throw new TypeError('destinationId is invalid.');
     if (options.format && options.format !== 'zip') throw new VontaqFSError('ARCHIVE_UNSUPPORTED', 'Only ZIP archive export is supported.');
     if ((options.format || options.archiveName) && options.mode !== 'archive') throw new TypeError('archive options require mode=archive.');
+    const bookkeeping = options.bookkeeping ?? 'destination';
+    const prune = options.prune ?? 'none';
+    const directoryLayout = options.directoryLayout ?? 'preserve';
+    if (!['destination', 'internal'].includes(bookkeeping)) throw new TypeError('bookkeeping is invalid.');
+    if (!['none', 'tracked'].includes(prune)) throw new TypeError('prune is invalid.');
+    if (!['preserve', 'contents'].includes(directoryLayout)) throw new TypeError('directoryLayout is invalid.');
+    if (directoryLayout === 'contents' && options.mode !== 'directory') throw new TypeError('directoryLayout=contents requires mode=directory.');
+    if (directoryLayout === 'contents' && sourcePaths.length !== 1) throw new TypeError('directoryLayout=contents requires exactly one directory source.');
+    if (options.trackingKey !== undefined && (!options.trackingKey.trim() || options.trackingKey.length > 256 || /[\u0000-\u001F\u007F]/.test(options.trackingKey))) {
+      throw new TypeError('trackingKey must be 1-256 characters without control characters.');
+    }
+    if (bookkeeping === 'internal') this.connection.requireCapability(VONTAQ_FS_CAPABILITY_IDS.internalExportBookkeeping);
+    if (prune === 'tracked' || options.trackingKey !== undefined) this.connection.requireCapability(VONTAQ_FS_CAPABILITY_IDS.trackedExportPrune);
+    if (directoryLayout === 'contents') this.connection.requireCapability(VONTAQ_FS_CAPABILITY_IDS.directoryContentsExport);
     const observer = new OperationObserver(this.connection, options);
     return observer.runTracked<NativeExportReport>(operation => this.connection.postNonRetryingMutation<OperationProgress>('/v1/exports/start', {
       requestId: secureId('request'), spaceId: this.id, sourcePaths, mode: options.mode,
       destinationId: options.destinationId ?? null, conflict: options.conflict ?? 'ask',
-      archiveName: options.archiveName ?? null, operation,
+      archiveName: options.archiveName ?? null, bookkeeping, prune,
+      trackingKey: options.trackingKey ?? null, directoryLayout, operation,
     }));
   }
 
@@ -1380,7 +1500,10 @@ function capabilityMap(rawCapabilities: readonly string[]): VontaqFSCapabilities
   return {
     files: has('files'), kv: has('kv'), spaces: has('spaces'), streams: has('streams'), events: has('events'), formats: has('formats'), operations: has('operations'),
     nativeExport: has('native-export'), nativeImport: has('native-import'), savedDirectories: has('saved-directories'), exportPresets: has('export-presets'),
-    backup: has('backup'), snapshots: has('snapshots'), batch: has('batch'), storageCategory: has('storage-category'), systemProgressWindow: has('system-progress-window'), raw,
+    backup: has('backup'), snapshots: has('snapshots'), batch: has('batch'), storageCategory: has('storage-category'), systemProgressWindow: has('system-progress-window'),
+    bulkRead: has(VONTAQ_FS_CAPABILITY_IDS.bulkRead), spaceClear: has(VONTAQ_FS_CAPABILITY_IDS.spaceClear),
+    destinationPickerHints: has(VONTAQ_FS_CAPABILITY_IDS.destinationPickerHints), internalExportBookkeeping: has(VONTAQ_FS_CAPABILITY_IDS.internalExportBookkeeping),
+    trackedExportPrune: has(VONTAQ_FS_CAPABILITY_IDS.trackedExportPrune), directoryContentsExport: has(VONTAQ_FS_CAPABILITY_IDS.directoryContentsExport), raw,
   };
 }
 

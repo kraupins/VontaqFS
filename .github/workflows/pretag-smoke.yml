@@ -1,0 +1,49 @@
+name: Pre-tag platform smoke
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pretag-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  filesystem-smoke:
+    name: ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows x64 filesystem smoke
+            runner: windows-2025
+          - label: macOS ARM64 filesystem smoke
+            runner: macos-15
+          - label: macOS Intel filesystem smoke
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './ -> target'
+      - run: npm ci
+      - name: Validate public SDK contracts
+        run: |
+          npm run build:sdk
+          npm --workspace @vontaq/fs test
+          node --test tests/integration/v02-native-export-contract.test.mjs tests/integration/v02-compat-release-contract.test.mjs
+      - name: Run filesystem/runtime smoke
+        run: |
+          cargo test -p vontaqfs-core --lib
+          cargo test -p vontaqfs-runtime --lib

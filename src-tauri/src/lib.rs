@@ -40,12 +40,14 @@ impl RuntimeHostServices for TauriHostServices {
         &self,
         application_name: &str,
         purpose: &str,
+        initial_directory: Option<&Path>,
     ) -> Result<Option<PathBuf>, String> {
         let title = format!("VontaqFS — {purpose} for {application_name}");
-        self.app
-            .dialog()
-            .file()
-            .set_title(title)
+        let mut dialog = self.app.dialog().file().set_title(title);
+        if let Some(initial_directory) = initial_directory {
+            dialog = dialog.set_directory(initial_directory);
+        }
+        dialog
             .blocking_pick_folder()
             .map(|selected| {
                 selected

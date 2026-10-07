@@ -39,6 +39,7 @@ Automatic update checks can be disabled in Settings. When enabled, VontaqFS cont
 - Privacy Policy: [`PRIVACY.md`](PRIVACY.md)
 - License: [`LICENSE`](LICENSE)
 - Developer documentation: [`README_DEVELOPER.md`](README_DEVELOPER.md)
+- Release history: [`CHANGELOG.md`](CHANGELOG.md)
 
 VontaqFS source may be used, copied, modified and redistributed under the VontaqFS Source-Available License. Selling the software or derivative copies, paid redistribution, and malicious/unauthorized security circumvention are not permitted. Read `LICENSE` for the complete terms.
 
@@ -83,5 +84,6 @@ Production Runtime использует официальный loopback-пул `
 - Privacy Policy: [`PRIVACY.md`](PRIVACY.md)
 - Лицензия: [`LICENSE`](LICENSE)
 - Документация разработчика: [`README_DEVELOPER.md`](README_DEVELOPER.md)
+- История релизов: [`CHANGELOG.md`](CHANGELOG.md)
 
 Исходный код VontaqFS разрешено использовать, копировать, изменять и бесплатно распространять на условиях VontaqFS Source-Available License. Продажа программы или производных копий, платное распространение и вредоносный/несанкционированный обход защиты запрещены. Полные условия находятся в `LICENSE`.

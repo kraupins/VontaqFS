@@ -24,6 +24,8 @@ pub enum StorageError {
     Internal(String),
     #[error("OPERATION_CANCELLED: operation cancelled")]
     OperationCancelled,
+    #[error("EXPORT_SOURCE_CHANGED: export source changed while it was being copied")]
+    ExportSourceChanged,
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]

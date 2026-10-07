@@ -1,0 +1,45 @@
+{
+  "format": "vontaqfs-snapshot",
+  "formatVersion": 1,
+  "snapshot": {
+    "id": "snp_66666666666646668666666666666666",
+    "spaceId": "33333333-3333-4333-8333-333333333333",
+    "createdAtMs": 1700000007000,
+    "label": "Fixture snapshot",
+    "logicalBytes": 307235,
+    "fileCount": 2,
+    "sourceGeneration": 1
+  },
+  "files": [
+    {
+      "path": "/small.txt",
+      "version": 1,
+      "etag": "a4da1e12af6e4ff4d28ea9fa4ae3cfee46ebcc3eb2baf38a47b930507fee1566",
+      "size": 35,
+      "updatedAtMs": 1700000003000,
+      "contentType": "text/plain",
+      "opaque": false
+    },
+    {
+      "path": "/stream.bin",
+      "version": 1,
+      "etag": "df434bc1eb4f4512546b008634d9baef5bc274a90e6198723b8bc5bd60f02b00",
+      "size": 307200,
+      "updatedAtMs": 1700000003000,
+      "contentType": "application/octet-stream",
+      "opaque": false
+    }
+  ],
+  "kv": [
+    {
+      "key": "fixture:kv",
+      "value": {
+        "fixture": "v0.1",
+        "count": 1
+      },
+      "version": 1,
+      "etag": "35bd8fe9686277be57629eb87579038c28c8ee3c5b1556fc47ba36770b1b049b",
+      "updatedAtMs": 1700000004000
+    }
+  ]
+}

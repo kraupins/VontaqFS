@@ -235,6 +235,15 @@ pub struct SpaceExportReport {
     pub archive_sha256: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SpaceClearReport {
+    pub space_id: String,
+    pub deleted_files: u64,
+    pub deleted_kv_entries: u64,
+    pub released_bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DirectoryGrantCapability {
@@ -299,6 +308,30 @@ pub enum ExportConflictPolicy {
     Rename,
     Ask,
     UpdateChanged,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExportBookkeepingPolicy {
+    #[default]
+    Destination,
+    Internal,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExportPrunePolicy {
+    #[default]
+    None,
+    Tracked,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DirectoryExportLayout {
+    #[default]
+    Preserve,
+    Contents,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

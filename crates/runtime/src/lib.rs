@@ -23,29 +23,31 @@ use tokio::{
 use uuid::Uuid;
 pub use vontaqfs_core::SnapshotRecord;
 use vontaqfs_core::{
-    ApplicationFormatDescriptor, ApplicationKind, ApplicationRecord, DirectoryGrantCapability,
-    DirectoryGrantRecord, ExportConflictPolicy, ExportPresetRecord, FileMetadata, FileRecord,
-    ImportConflictPolicy, KvRecord, LogicalPath, NativeExportMode, NativeImportMode,
-    RestoreConflictPolicy, SpaceRecord, StorageCategory, StorageClass, StorageDiagnostics,
-    StorageEngine, StorageError, StorageResult,
+    ApplicationFormatDescriptor, ApplicationKind, ApplicationRecord, DirectoryExportLayout,
+    DirectoryGrantCapability, DirectoryGrantRecord, ExportBookkeepingPolicy, ExportConflictPolicy,
+    ExportPresetRecord, ExportPrunePolicy, FileMetadata, FileRecord, ImportConflictPolicy,
+    KvRecord, LogicalPath, NativeExportMode, NativeImportMode, RestoreConflictPolicy, SpaceRecord,
+    StorageCategory, StorageClass, StorageDiagnostics, StorageEngine, StorageError, StorageResult,
 };
 use vontaqfs_protocol::{
     BatchItemErrorWire, BatchItemResultWire, BatchOperationWire, BatchRequest, BatchResponse,
-    ClientIdentity, ClientKind, CreateDestinationGrantRequest, CreateSnapshotRequest,
-    DeleteExportPresetRequest, DeleteFormatRequest, DeleteSnapshotRequest, DestinationGrantWire,
+    ClearSpaceRequest, ClearSpaceResponse, ClientIdentity, ClientKind,
+    CreateDestinationGrantRequest, CreateSnapshotRequest, DeleteExportPresetRequest,
+    DeleteFormatRequest, DeleteSnapshotRequest, DestinationGrantWire, DirectoryExportLayoutWire,
     DirectoryGrantCapabilityWire, ErrorBody, ErrorCode, ErrorResponse, EventKindWire,
-    EventPollRequest, EventPollResponse, ExportConflictPolicyWire, ExportPresetWire,
-    FileMetadataWire, FileStatRequest, FileStatResponse, FileWire, FormatDescriptorWire,
-    FsCopyRequest, FsDeleteRequest, FsMoveRequest, HealthResponse, ImportConflictPolicyWire,
-    KvGetRequest, KvGetResponse, KvSetRequest, KvWire, ListDestinationGrantsResponse,
-    ListExportPresetsResponse, ListFormatsResponse, ListSnapshotsRequest, ListSnapshotsResponse,
-    ListSpacesResponse, NativeExportModeWire, NativeImportModeWire, OpenSpaceRequest,
-    OperationCancelRequest, OperationPresentationWire, OperationRequestWire,
-    OperationStatusRequest, PairingPollRequest, PairingPollResponse, PairingRequest,
-    PairingRequestResponse, PairingStatus, RegisterFormatRequest, RestoreSnapshotRequest,
-    RevokeDestinationGrantRequest, RuntimeEventWire, RuntimeIdentityChallengeRequest,
-    RuntimeIdentityChallengeResponse, SaveExportPresetRequest, SessionRequest, SessionResponse,
-    SmallFileReadRequest, SmallFileReadResponse, SmallFileWriteRequest, SnapshotWire, SpaceWire,
+    EventPollRequest, EventPollResponse, ExportBookkeepingPolicyWire, ExportConflictPolicyWire,
+    ExportPresetWire, ExportPrunePolicyWire, FileMetadataWire, FileStatRequest, FileStatResponse,
+    FileWire, FormatDescriptorWire, FsCopyRequest, FsDeleteRequest, FsMoveRequest, HealthResponse,
+    ImportConflictPolicyWire, KvGetRequest, KvGetResponse, KvSetRequest, KvWire,
+    ListDestinationGrantsResponse, ListExportPresetsResponse, ListFormatsResponse,
+    ListSnapshotsRequest, ListSnapshotsResponse, ListSpacesResponse, NativeExportModeWire,
+    NativeImportModeWire, OpenSpaceRequest, OperationCancelRequest, OperationPresentationWire,
+    OperationRequestWire, OperationStatusRequest, PairingPollRequest, PairingPollResponse,
+    PairingRequest, PairingRequestResponse, PairingStatus, ReadManyItemResultWire, ReadManyRequest,
+    ReadManyResponse, RegisterFormatRequest, RestoreSnapshotRequest, RevokeDestinationGrantRequest,
+    RuntimeEventWire, RuntimeIdentityChallengeRequest, RuntimeIdentityChallengeResponse,
+    SaveExportPresetRequest, SessionRequest, SessionResponse, SmallFileReadRequest,
+    SmallFileReadResponse, SmallFileWriteRequest, SnapshotWire, SpaceWire,
     StartNativeExportRequest, StartNativeImportRequest, StorageCategoryWire, StorageClassWire,
     StreamChunkAck, StreamReadBeginRequest, StreamReadBeginResponse, StreamWriteBeginRequest,
     StreamWriteBeginResponse, StreamWriteCommitRequest, CONTROL_CONTENT_TYPE,
@@ -54,7 +56,8 @@ use vontaqfs_protocol::{
     MAX_BATCH_OPERATIONS, MAX_BATCH_PAYLOAD_BYTES, MAX_BULK_REQUESTS_PER_SESSION,
     MAX_CONTROL_BODY_BYTES, MAX_HEADER_BYTES, MAX_MANAGED_FILE_BYTES, MAX_PENDING_PAIRINGS,
     MAX_STREAM_CHUNK_BYTES, MAX_STREAM_WRITES_PER_SESSION, PAIRING_TTL_MS, PROTOCOL_MAX,
-    PROTOCOL_MIN, RUNTIME_ENDPOINT_PORTS, RUNTIME_IDENTITY_DOMAIN_SEPARATOR, SESSION_TTL_MS,
+    PROTOCOL_MIN, READ_MANY_MAX_ITEMS, READ_MANY_MAX_ITEM_BYTES, READ_MANY_MAX_RESPONSE_BYTES,
+    RUNTIME_ENDPOINT_PORTS, RUNTIME_IDENTITY_DOMAIN_SEPARATOR, SESSION_TTL_MS,
     STREAM_IDLE_TIMEOUT_MS,
 };
 
@@ -1412,6 +1415,7 @@ pub trait RuntimeHostServices: Send + Sync {
         &self,
         application_name: &str,
         purpose: &str,
+        initial_directory: Option<&Path>,
     ) -> Result<Option<PathBuf>, String>;
     fn choose_files(
         &self,
@@ -1438,6 +1442,7 @@ impl RuntimeHostServices for HeadlessHostServices {
         &self,
         _application_name: &str,
         _purpose: &str,
+        _initial_directory: Option<&Path>,
     ) -> Result<Option<PathBuf>, String> {
         Err(
             "DESTINATION_GRANT_REQUIRED: native directory picker is unavailable in this host"
@@ -1689,6 +1694,7 @@ struct RuntimeState {
     log_path: PathBuf,
     operations: Mutex<HashMap<String, LongOperationEntry>>,
     exclusive_spaces: Mutex<HashMap<String, String>>,
+    active_destinations: Mutex<HashMap<String, String>>,
     global_maintenance: Mutex<Option<String>>,
     endpoint_status: RuntimeEndpointStatus,
     host_services: Arc<dyn RuntimeHostServices>,
@@ -1726,6 +1732,7 @@ impl RuntimeState {
             log_path: root.join("runtime/logs/runtime.log"),
             operations: Mutex::new(HashMap::new()),
             exclusive_spaces: Mutex::new(HashMap::new()),
+            active_destinations: Mutex::new(HashMap::new()),
             global_maintenance: Mutex::new(None),
             endpoint_status,
             host_services,
@@ -2344,6 +2351,51 @@ impl RuntimeState {
             }
         }
     }
+
+    fn lock_space_exclusive_api(&self, space_id: &str, operation_id: &str) -> Result<(), ApiError> {
+        let mut locks = self
+            .exclusive_spaces
+            .lock()
+            .map_err(|_| ApiError::internal())?;
+        if locks.contains_key(space_id) {
+            return Err(ApiError::new(
+                409,
+                ErrorCode::Conflict,
+                "space already has an exclusive operation",
+            ));
+        }
+        locks.insert(space_id.to_owned(), operation_id.to_owned());
+        Ok(())
+    }
+    fn lock_destination_api(
+        &self,
+        destination_key: &str,
+        operation_id: &str,
+    ) -> Result<(), ApiError> {
+        let mut locks = self
+            .active_destinations
+            .lock()
+            .map_err(|_| ApiError::internal())?;
+        if locks.contains_key(destination_key) {
+            return Err(ApiError::new(
+                409,
+                ErrorCode::DestinationBusy,
+                "destination is already being exported by another operation",
+            ));
+        }
+        locks.insert(destination_key.to_owned(), operation_id.to_owned());
+        Ok(())
+    }
+    fn unlock_destination(&self, destination_key: &str, operation_id: &str) {
+        if let Ok(mut locks) = self.active_destinations.lock() {
+            if locks
+                .get(destination_key)
+                .is_some_and(|value| value == operation_id)
+            {
+                locks.remove(destination_key);
+            }
+        }
+    }
     fn lock_global_maintenance(&self, owner: &str) -> Result<(), RuntimeAdminError> {
         let mut lock = self
             .global_maintenance
@@ -2895,6 +2947,7 @@ fn storage_error_code(error: &StorageError) -> &'static str {
         StorageError::StorageCorrupt(_) | StorageError::SchemaUnsupported(_) => "STORAGE_CORRUPT",
         StorageError::RequestInvalid(_) => "REQUEST_INVALID",
         StorageError::OperationCancelled => "OPERATION_CANCELLED",
+        StorageError::ExportSourceChanged => "EXPORT_SOURCE_CHANGED",
         StorageError::Internal(_)
         | StorageError::Io(_)
         | StorageError::Sqlite(_)
@@ -2905,6 +2958,7 @@ fn storage_error_code(error: &StorageError) -> &'static str {
 fn native_export_error_code(error: &StorageError) -> &'static str {
     match error {
         StorageError::OperationCancelled => "EXPORT_CANCELLED",
+        StorageError::ExportSourceChanged => "EXPORT_SOURCE_CHANGED",
         StorageError::PathInvalid(_)
         | StorageError::PathConflict(_)
         | StorageError::Conflict(_) => "EXPORT_CONFLICT",
@@ -2926,6 +2980,7 @@ fn native_export_error_code(error: &StorageError) -> &'static str {
 fn native_import_error_code(error: &StorageError) -> &'static str {
     match error {
         StorageError::OperationCancelled => "IMPORT_CANCELLED",
+        StorageError::ExportSourceChanged => "STORAGE_UNAVAILABLE",
         StorageError::PathInvalid(_)
         | StorageError::PathConflict(_)
         | StorageError::Conflict(_) => "CONFLICT",
@@ -2996,6 +3051,11 @@ impl ApiError {
             StorageError::OperationCancelled => {
                 Self::new(409, ErrorCode::Conflict, "operation was cancelled")
             }
+            StorageError::ExportSourceChanged => Self::new(
+                409,
+                ErrorCode::ExportSourceChanged,
+                "export source changed while it was being copied",
+            ),
             StorageError::Internal(_)
             | StorageError::Io(_)
             | StorageError::Sqlite(_)
@@ -3346,6 +3406,12 @@ async fn handle_request(
                         "batch".into(),
                         "storage-category".into(),
                         "system-progress-window".into(),
+                        "bulk-read".into(),
+                        "space-clear".into(),
+                        "destination-picker-hints".into(),
+                        "internal-export-bookkeeping".into(),
+                        "tracked-export-prune".into(),
+                        "directory-contents-export".into(),
                     ],
                 },
             )
@@ -3380,6 +3446,144 @@ async fn handle_request(
                 200,
                 &ListSpacesResponse {
                     spaces: spaces.into_iter().map(space_wire).collect(),
+                },
+            )
+        }
+        ("POST", "/v1/spaces/clear") => {
+            require_control_content_type(&request)?;
+            let session = state.authenticate(&request)?;
+            let input: ClearSpaceRequest = parse_json(&request.body)?;
+            validate_request_id(&input.request_id)?;
+            let space = state.authorize_space(&session, &input.space_id)?;
+            if !matches!(
+                space.storage_class,
+                StorageClass::Cache | StorageClass::Temporary
+            ) {
+                return Err(ApiError::new(
+                    400,
+                    ErrorCode::RequestInvalid,
+                    "whole-space clear is only valid for cache or temporary spaces",
+                ));
+            }
+
+            let operation = if let Some(requested) = input.operation.as_ref() {
+                Some(state.begin_application_operation(
+                    &session.application_id,
+                    requested,
+                    "space-clear",
+                    "waiting-for-exclusive-access",
+                    true,
+                    Some(space.logical_bytes),
+                    Some(space.file_count),
+                )?)
+            } else {
+                None
+            };
+            let operation_id = operation
+                .as_ref()
+                .map(|(snapshot, _)| snapshot.id.clone())
+                .unwrap_or_else(|| format!("space-clear-{}", Uuid::new_v4()));
+
+            if let Err(error) = state.lock_space_exclusive_api(&input.space_id, &operation_id) {
+                if let Some((snapshot, _)) = &operation {
+                    state.fail_operation_code(&snapshot.id, "CONFLICT", error.message.clone());
+                }
+                return Err(error);
+            }
+            if state.has_active_stream_for_space(&input.space_id) {
+                state.unlock_space_exclusive(&input.space_id, &operation_id);
+                if let Some((snapshot, _)) = &operation {
+                    state.fail_operation_code(
+                        &snapshot.id,
+                        "CONFLICT",
+                        "space has active streams".into(),
+                    );
+                }
+                return Err(ApiError::new(
+                    409,
+                    ErrorCode::Conflict,
+                    "space has active streams",
+                ));
+            }
+            if let Some((snapshot, cancel)) = &operation {
+                if cancel.load(Ordering::SeqCst) {
+                    state.cancelled_operation(&snapshot.id);
+                    state.unlock_space_exclusive(&input.space_id, &operation_id);
+                    return Err(ApiError::new(
+                        409,
+                        ErrorCode::Conflict,
+                        "operation was cancelled",
+                    ));
+                }
+                state.set_operation_cancellable(&snapshot.id, false);
+                state.update_operation_metrics(
+                    &snapshot.id,
+                    "clearing",
+                    0,
+                    Some(space.file_count),
+                    0,
+                    Some(space.logical_bytes),
+                );
+            }
+
+            let storage = Arc::clone(&state.storage);
+            let work_space_id = input.space_id.clone();
+            let result =
+                tokio::task::spawn_blocking(move || storage.clear_disposable_space(&work_space_id))
+                    .await;
+            state.unlock_space_exclusive(&input.space_id, &operation_id);
+
+            let report = match result {
+                Ok(Ok(report)) => report,
+                Ok(Err(error)) => {
+                    if let Some((snapshot, _)) = &operation {
+                        state.fail_operation_code(
+                            &snapshot.id,
+                            storage_error_code(&error),
+                            error.to_string(),
+                        );
+                    }
+                    return Err(ApiError::from_storage(error));
+                }
+                Err(error) => {
+                    if let Some((snapshot, _)) = &operation {
+                        state.fail_operation_code(
+                            &snapshot.id,
+                            "INTERNAL_ERROR",
+                            format!("space clear worker failed: {error}"),
+                        );
+                    }
+                    return Err(ApiError::internal());
+                }
+            };
+
+            if let Some((snapshot, _)) = &operation {
+                state.update_operation_metrics(
+                    &snapshot.id,
+                    "complete",
+                    report.deleted_files,
+                    Some(report.deleted_files),
+                    report.released_bytes,
+                    Some(report.released_bytes),
+                );
+                state.complete_operation(&snapshot.id, "complete", None);
+            }
+            state.emit_event(
+                &session.application_id,
+                EventKindWire::OverflowResyncRequired,
+                Some(&input.space_id),
+                None,
+                None,
+                None,
+                None,
+            );
+            HttpResponse::json(
+                200,
+                &ClearSpaceResponse {
+                    space_id: report.space_id,
+                    deleted_files: report.deleted_files,
+                    deleted_kv_entries: report.deleted_kv_entries,
+                    released_bytes: report.released_bytes,
                 },
             )
         }
@@ -4435,6 +4639,21 @@ async fn handle_request(
                 .get_application(&session.application_id)
                 .map_err(ApiError::from_storage)?
                 .ok_or_else(ApiError::internal)?;
+            let requested_capability = grant_capability_from_wire(input.capability);
+            let initial_grant = if let Some(id) = input.initial_destination_id.as_deref() {
+                state
+                    .storage
+                    .get_directory_grant(&session.application_id, id)
+                    .map_err(ApiError::from_storage)?
+                    .filter(|grant| grant.revoked_at_ms.is_none())
+            } else {
+                None
+            };
+            let initial_directory = initial_grant
+                .as_ref()
+                .and_then(|grant| std::fs::canonicalize(&grant.physical_path).ok())
+                .filter(|path| path.is_dir());
+            let picker_initial_directory = initial_directory.clone();
             let host = Arc::clone(&state.host_services);
             let app_name = application.display_name.clone();
             let capability_label = match input.capability {
@@ -4443,7 +4662,11 @@ async fn handle_request(
                 DirectoryGrantCapabilityWire::ReadWrite => "saved read-write directory",
             };
             let selected = tokio::task::spawn_blocking(move || {
-                host.choose_directory(&app_name, capability_label)
+                host.choose_directory(
+                    &app_name,
+                    capability_label,
+                    picker_initial_directory.as_deref(),
+                )
             })
             .await
             .map_err(|_| ApiError::internal())?
@@ -4451,17 +4674,44 @@ async fn handle_request(
             let path = selected.ok_or_else(|| {
                 ApiError::new(
                     409,
-                    ErrorCode::DestinationGrantRequired,
-                    "no destination directory was selected",
+                    ErrorCode::UserCancelled,
+                    "directory selection was cancelled",
                 )
             })?;
+            if input.reuse_initial_if_same.unwrap_or(false) {
+                if let Some(initial) = initial_grant.as_ref() {
+                    if grant_capability_satisfies(initial.capability, requested_capability) {
+                        let selected_canonical = std::fs::canonicalize(&path).map_err(|error| {
+                            ApiError::new(409, ErrorCode::DestinationUnavailable, error.to_string())
+                        })?;
+                        let Some(initial_canonical) = initial_directory.as_ref() else {
+                            let grant = state
+                                .storage
+                                .create_directory_grant(
+                                    &session.application_id,
+                                    &path,
+                                    input.label.as_deref(),
+                                    requested_capability,
+                                )
+                                .map_err(ApiError::from_storage)?;
+                            return HttpResponse::json(200, &destination_grant_wire(&grant));
+                        };
+                        if selected_canonical == *initial_canonical {
+                            let _ = state
+                                .storage
+                                .touch_directory_grant(&session.application_id, &initial.id);
+                            return HttpResponse::json(200, &destination_grant_wire(initial));
+                        }
+                    }
+                }
+            }
             let grant = state
                 .storage
                 .create_directory_grant(
                     &session.application_id,
                     &path,
                     input.label.as_deref(),
-                    grant_capability_from_wire(input.capability),
+                    requested_capability,
                 )
                 .map_err(ApiError::from_storage)?;
             HttpResponse::json(200, &destination_grant_wire(&grant))
@@ -4539,79 +4789,116 @@ async fn handle_request(
             let session = state.authenticate(&request)?;
             let input: StartNativeExportRequest = parse_json(&request.body)?;
             validate_request_id(&input.request_id)?;
+            validate_operation_id(&input.operation.id)?;
             state.authorize_space(&session, &input.space_id)?;
             let application = state
                 .storage
                 .get_application(&session.application_id)
                 .map_err(ApiError::from_storage)?
                 .ok_or_else(ApiError::internal)?;
-            let (destination_path, destination_label, grant_id) =
-                if let Some(id) = input.destination_id.as_deref() {
-                    let grant = state
-                        .storage
-                        .get_directory_grant(&session.application_id, id)
-                        .map_err(ApiError::from_storage)?
-                        .ok_or_else(|| {
-                            ApiError::new(
-                                404,
-                                ErrorCode::DestinationGrantRequired,
-                                "saved destination does not exist",
-                            )
-                        })?;
-                    if grant.revoked_at_ms.is_some() {
-                        return Err(ApiError::new(
-                            409,
-                            ErrorCode::DestinationGrantRevoked,
-                            "saved destination has been revoked",
-                        ));
-                    }
-                    if !grant.capability.can_write() {
-                        return Err(ApiError::new(
-                            403,
-                            ErrorCode::DestinationReadOnly,
-                            "saved destination does not allow writes",
-                        ));
-                    }
-                    if matches!(input.conflict, ExportConflictPolicyWire::UpdateChanged)
-                        && !grant.capability.can_read()
-                    {
-                        return Err(ApiError::new(
-                            403,
-                            ErrorCode::PermissionDenied,
-                            "update-changed requires a read-write destination grant",
-                        ));
-                    }
-                    (
-                        PathBuf::from(&grant.physical_path),
-                        grant.label,
-                        Some(grant.id),
-                    )
-                } else {
-                    let host = Arc::clone(&state.host_services);
-                    let app_name = application.display_name.clone();
-                    let selected = tokio::task::spawn_blocking(move || {
-                        host.choose_directory(&app_name, "one-off export destination")
-                    })
-                    .await
-                    .map_err(|_| ApiError::internal())?
-                    .map_err(|message| {
-                        ApiError::new(409, ErrorCode::DestinationGrantRequired, message)
-                    })?;
-                    let path = selected.ok_or_else(|| {
+            let bookkeeping = export_bookkeeping_from_wire(
+                input
+                    .bookkeeping
+                    .unwrap_or(ExportBookkeepingPolicyWire::Destination),
+            );
+            let prune = export_prune_from_wire(input.prune.unwrap_or(ExportPrunePolicyWire::None));
+            let directory_layout = directory_layout_from_wire(
+                input
+                    .directory_layout
+                    .unwrap_or(DirectoryExportLayoutWire::Preserve),
+            );
+            if let Some(key) = input.tracking_key.as_deref() {
+                if key.trim().is_empty() || key.len() > 256 || key.chars().any(|ch| ch.is_control())
+                {
+                    return Err(ApiError::bad_request(
+                        "trackingKey must be 1-256 characters without control characters",
+                    ));
+                }
+            }
+            if matches!(directory_layout, DirectoryExportLayout::Contents)
+                && (!matches!(input.mode, NativeExportModeWire::Directory)
+                    || input.source_paths.len() != 1)
+            {
+                return Err(ApiError::bad_request(
+                    "directoryLayout=contents requires exactly one directory source",
+                ));
+            }
+            let destination_selection = if let Some(id) = input.destination_id.as_deref() {
+                let grant = state
+                    .storage
+                    .get_directory_grant(&session.application_id, id)
+                    .map_err(ApiError::from_storage)?
+                    .ok_or_else(|| {
                         ApiError::new(
-                            409,
+                            404,
                             ErrorCode::DestinationGrantRequired,
-                            "no export destination was selected",
+                            "saved destination does not exist",
                         )
                     })?;
-                    let label = path
-                        .file_name()
-                        .and_then(|v| v.to_str())
-                        .unwrap_or("Selected folder")
-                        .to_owned();
-                    (path, label, None)
-                };
-            let (snapshot, cancel) = state.begin_application_operation(
+                if grant.revoked_at_ms.is_some() {
+                    return Err(ApiError::new(
+                        409,
+                        ErrorCode::DestinationGrantRevoked,
+                        "saved destination has been revoked",
+                    ));
+                }
+                if !grant.capability.can_write() {
+                    return Err(ApiError::new(
+                        403,
+                        ErrorCode::DestinationReadOnly,
+                        "saved destination does not allow writes",
+                    ));
+                }
+                if (matches!(input.conflict, ExportConflictPolicyWire::UpdateChanged)
+                    || matches!(prune, ExportPrunePolicy::Tracked))
+                    && !grant.capability.can_read()
+                {
+                    return Err(ApiError::new(
+                        403,
+                        ErrorCode::PermissionDenied,
+                        "update-changed and tracked prune require a read-write destination grant",
+                    ));
+                }
+                (
+                    PathBuf::from(&grant.physical_path),
+                    grant.label,
+                    Some(grant.id),
+                )
+            } else {
+                let host = Arc::clone(&state.host_services);
+                let app_name = application.display_name.clone();
+                let selected = tokio::task::spawn_blocking(move || {
+                    host.choose_directory(&app_name, "one-off export destination", None)
+                })
+                .await
+                .map_err(|_| ApiError::internal())?
+                .map_err(|message| {
+                    ApiError::new(409, ErrorCode::DestinationGrantRequired, message)
+                })?;
+                let path = selected.ok_or_else(|| {
+                    ApiError::new(
+                        409,
+                        ErrorCode::UserCancelled,
+                        "export destination selection was cancelled",
+                    )
+                })?;
+                let label = path
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .unwrap_or("Selected folder")
+                    .to_owned();
+                (path, label, None)
+            };
+            let (destination_path, destination_label, grant_id) = destination_selection;
+            let destination_path = std::fs::canonicalize(&destination_path).map_err(|error| {
+                ApiError::new(409, ErrorCode::DestinationUnavailable, error.to_string())
+            })?;
+            let mut destination_key = destination_path.to_string_lossy().to_string();
+            if cfg!(windows) {
+                destination_key = destination_key.to_ascii_lowercase();
+            }
+            state.lock_destination_api(&destination_key, &input.operation.id)?;
+            let begin = state.begin_application_operation(
                 &session.application_id,
                 &input.operation,
                 "native-export",
@@ -4619,10 +4906,18 @@ async fn handle_request(
                 true,
                 None,
                 None,
-            )?;
+            );
+            let (snapshot, cancel) = match begin {
+                Ok(value) => value,
+                Err(error) => {
+                    state.unlock_destination(&destination_key, &input.operation.id);
+                    return Err(error);
+                }
+            };
             let operation_id = snapshot.id.clone();
             let state2 = Arc::clone(state);
             let storage = Arc::clone(&state.storage);
+            let application_id = session.application_id.clone();
             let space_id = input.space_id.clone();
             let app_name = application.display_name.clone();
             let host = Arc::clone(&state.host_services);
@@ -4630,11 +4925,14 @@ async fn handle_request(
             let mode = export_mode_from_wire(input.mode);
             let conflict = export_conflict_from_wire(input.conflict);
             let archive_name = input.archive_name.clone();
+            let tracking_key = input.tracking_key.clone();
             tokio::spawn(async move {
                 let state_progress = Arc::clone(&state2);
                 let op_progress = operation_id.clone();
+                let worker_application_id = application_id.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     storage.native_export(
+                        &worker_application_id,
                         &space_id,
                         &source_paths,
                         &destination_path,
@@ -4642,6 +4940,10 @@ async fn handle_request(
                         mode,
                         conflict,
                         archive_name.as_deref(),
+                        bookkeeping,
+                        prune,
+                        tracking_key.as_deref(),
+                        directory_layout,
                         || cancel.load(Ordering::SeqCst),
                         |items, total_items, bytes, total_bytes| {
                             state_progress.update_operation_metrics(
@@ -4663,9 +4965,7 @@ async fn handle_request(
                 match result {
                     Ok(Ok(report)) => {
                         if let Some(id) = grant_id.as_deref() {
-                            let _ = state2
-                                .storage
-                                .touch_directory_grant(&session.application_id, id);
+                            let _ = state2.storage.touch_directory_grant(&application_id, id);
                         }
                         state2.complete_operation(
                             &operation_id,
@@ -4684,6 +4984,7 @@ async fn handle_request(
                     Err(error) => state2
                         .fail_operation(&operation_id, format!("operation worker failed: {error}")),
                 }
+                state2.unlock_destination(&destination_key, &operation_id);
             });
             HttpResponse::json(202, &snapshot)
         }
@@ -4745,7 +5046,7 @@ async fn handle_request(
                 let picked = match input.mode {
                     NativeImportModeWire::Directory => {
                         let selected = tokio::task::spawn_blocking(move || {
-                            host.choose_directory(&app_name, "one-off import source")
+                            host.choose_directory(&app_name, "one-off import source", None)
                         })
                         .await
                         .map_err(|_| ApiError::internal())?
@@ -5196,6 +5497,204 @@ async fn handle_request(
                 &SmallFileReadResponse {
                     data_base64: base64_encode(&bytes),
                     file: file_wire(metadata),
+                },
+            )
+        }
+        ("POST", "/v1/fs/read-many") => {
+            require_control_content_type(&request)?;
+            let session = state.authenticate(&request)?;
+            let input: ReadManyRequest = parse_json(&request.body)?;
+            if input.paths.is_empty() || input.paths.len() > READ_MANY_MAX_ITEMS {
+                return Err(ApiError::new(
+                    400,
+                    ErrorCode::RequestInvalid,
+                    format!("read-many requires 1-{READ_MANY_MAX_ITEMS} paths"),
+                ));
+            }
+            state.authorize_space(&session, &input.space_id)?;
+            let requested_items = input.paths.len() as u64;
+
+            let operation = if let Some(requested) = input.operation.as_ref() {
+                Some(state.begin_application_operation(
+                    &session.application_id,
+                    requested,
+                    "read-many",
+                    "reading",
+                    true,
+                    None,
+                    Some(requested_items),
+                )?)
+            } else {
+                None
+            };
+            let _bulk = state.acquire_bulk(&session.pairing_id).await?;
+
+            let is_cancelled = || {
+                operation
+                    .as_ref()
+                    .is_some_and(|(_, cancel)| cancel.load(Ordering::SeqCst))
+            };
+            let mut prepared: Vec<(String, Result<FileRecord, BatchItemErrorWire>)> =
+                Vec::with_capacity(input.paths.len());
+            let mut candidate_bytes = 0u64;
+            let mut cancelled = false;
+
+            for path in input.paths {
+                if is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
+                match state.storage.stat_file(&input.space_id, &path) {
+                    Ok(Some(file)) if file.size <= READ_MANY_MAX_ITEM_BYTES as u64 => {
+                        candidate_bytes = candidate_bytes.saturating_add(file.size);
+                        if candidate_bytes > READ_MANY_MAX_RESPONSE_BYTES as u64 {
+                            if let Some((snapshot, _)) = &operation {
+                                state.fail_operation_code(
+                                    &snapshot.id,
+                                    "REQUEST_TOO_LARGE",
+                                    "read-many aggregate response exceeds the bounded response limit".into(),
+                                );
+                            }
+                            return Err(ApiError::new(
+                                413,
+                                ErrorCode::RequestTooLarge,
+                                "read-many aggregate response exceeds the bounded response limit",
+                            ));
+                        }
+                        prepared.push((path, Ok(file)));
+                    }
+                    Ok(Some(_)) => prepared.push((
+                        path,
+                        Err(BatchItemErrorWire {
+                            code: "REQUEST_TOO_LARGE".into(),
+                            message: "file exceeds the readMany direct-small-file limit; use readFile()/createReader()".into(),
+                        }),
+                    )),
+                    Ok(None) => prepared.push((
+                        path,
+                        Err(BatchItemErrorWire {
+                            code: "NOT_FOUND".into(),
+                            message: "file not found".into(),
+                        }),
+                    )),
+                    Err(error) => prepared.push((
+                        path,
+                        Err(BatchItemErrorWire {
+                            code: storage_error_code(&error).into(),
+                            message: error.to_string(),
+                        }),
+                    )),
+                }
+            }
+
+            let mut results = Vec::with_capacity(prepared.len());
+            let mut completed_items = 0u64;
+            let mut failed_items = 0u64;
+            let mut total_bytes = 0u64;
+
+            if !cancelled {
+                for (path, prepared_item) in prepared {
+                    if is_cancelled() {
+                        cancelled = true;
+                        break;
+                    }
+                    let result = match prepared_item {
+                        Err(error) => {
+                            failed_items = failed_items.saturating_add(1);
+                            ReadManyItemResultWire {
+                                path,
+                                ok: false,
+                                data_base64: None,
+                                file: None,
+                                error: Some(error),
+                            }
+                        }
+                        Ok(file) => match state.storage.read_file(&input.space_id, &path) {
+                            Ok(bytes)
+                                if bytes.len() <= READ_MANY_MAX_ITEM_BYTES
+                                    && bytes.len() as u64 == file.size
+                                    && sha256_hex(&bytes) == file.etag.to_ascii_lowercase() =>
+                            {
+                                total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+                                ReadManyItemResultWire {
+                                    path,
+                                    ok: true,
+                                    data_base64: Some(base64_encode(&bytes)),
+                                    file: Some(file_wire(file)),
+                                    error: None,
+                                }
+                            }
+                            Ok(bytes) if bytes.len() > READ_MANY_MAX_ITEM_BYTES => {
+                                failed_items = failed_items.saturating_add(1);
+                                ReadManyItemResultWire {
+                                    path,
+                                    ok: false,
+                                    data_base64: None,
+                                    file: None,
+                                    error: Some(BatchItemErrorWire {
+                                        code: "REQUEST_TOO_LARGE".into(),
+                                        message: "file changed beyond the readMany direct-small-file limit; use readFile()/createReader()".into(),
+                                    }),
+                                }
+                            }
+                            Ok(_) => {
+                                failed_items = failed_items.saturating_add(1);
+                                ReadManyItemResultWire {
+                                    path,
+                                    ok: false,
+                                    data_base64: None,
+                                    file: None,
+                                    error: Some(BatchItemErrorWire {
+                                        code: "CONFLICT".into(),
+                                        message: "file changed while readMany was materializing it; retry the read".into(),
+                                    }),
+                                }
+                            }
+                            Err(error) => {
+                                failed_items = failed_items.saturating_add(1);
+                                ReadManyItemResultWire {
+                                    path,
+                                    ok: false,
+                                    data_base64: None,
+                                    file: None,
+                                    error: Some(BatchItemErrorWire {
+                                        code: storage_error_code(&error).into(),
+                                        message: error.to_string(),
+                                    }),
+                                }
+                            }
+                        },
+                    };
+                    completed_items = completed_items.saturating_add(1);
+                    results.push(result);
+                    if let Some((snapshot, _)) = &operation {
+                        state.update_operation_metrics(
+                            &snapshot.id,
+                            "reading",
+                            completed_items,
+                            Some(requested_items),
+                            total_bytes,
+                            Some(candidate_bytes),
+                        );
+                    }
+                }
+            }
+
+            if let Some((snapshot, _)) = &operation {
+                if cancelled {
+                    state.cancelled_operation(&snapshot.id);
+                } else {
+                    state.complete_operation(&snapshot.id, "complete", None);
+                }
+            }
+            HttpResponse::json(
+                200,
+                &ReadManyResponse {
+                    results,
+                    completed_items,
+                    failed_items,
+                    total_bytes,
+                    cancelled,
                 },
             )
         }
@@ -5845,6 +6344,34 @@ fn export_conflict_from_wire(value: ExportConflictPolicyWire) -> ExportConflictP
         ExportConflictPolicyWire::Rename => ExportConflictPolicy::Rename,
         ExportConflictPolicyWire::Ask => ExportConflictPolicy::Ask,
         ExportConflictPolicyWire::UpdateChanged => ExportConflictPolicy::UpdateChanged,
+    }
+}
+fn export_bookkeeping_from_wire(value: ExportBookkeepingPolicyWire) -> ExportBookkeepingPolicy {
+    match value {
+        ExportBookkeepingPolicyWire::Destination => ExportBookkeepingPolicy::Destination,
+        ExportBookkeepingPolicyWire::Internal => ExportBookkeepingPolicy::Internal,
+    }
+}
+fn export_prune_from_wire(value: ExportPrunePolicyWire) -> ExportPrunePolicy {
+    match value {
+        ExportPrunePolicyWire::None => ExportPrunePolicy::None,
+        ExportPrunePolicyWire::Tracked => ExportPrunePolicy::Tracked,
+    }
+}
+fn directory_layout_from_wire(value: DirectoryExportLayoutWire) -> DirectoryExportLayout {
+    match value {
+        DirectoryExportLayoutWire::Preserve => DirectoryExportLayout::Preserve,
+        DirectoryExportLayoutWire::Contents => DirectoryExportLayout::Contents,
+    }
+}
+fn grant_capability_satisfies(
+    existing: DirectoryGrantCapability,
+    requested: DirectoryGrantCapability,
+) -> bool {
+    match requested {
+        DirectoryGrantCapability::Read => existing.can_read(),
+        DirectoryGrantCapability::Write => existing.can_write(),
+        DirectoryGrantCapability::ReadWrite => existing.can_read() && existing.can_write(),
     }
 }
 fn export_conflict_wire(value: ExportConflictPolicy) -> ExportConflictPolicyWire {
@@ -6766,6 +7293,8 @@ mod tests {
                 .await
                 .unwrap();
         let session: SessionResponse = serde_json::from_slice(&session_response.body).unwrap();
+        assert!(session.capabilities.contains(&"bulk-read".to_owned()));
+        assert!(session.capabilities.contains(&"space-clear".to_owned()));
 
         let mut authed = request(
             "POST",

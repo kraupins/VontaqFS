@@ -1,0 +1,14 @@
+{
+  "format": "vontaqfs-space",
+  "formatVersion": 1,
+  "spaceId": "33333333-3333-4333-8333-333333333333",
+  "ownerApplicationId": "11111111-1111-4111-8111-111111111111",
+  "applicationKind": "other-supported-client",
+  "applicationExternalId": "fixture.vontaqfs.v01",
+  "applicationDisplayName": "VontaqFS 0.1 Fixture",
+  "key": "fixture-persistent",
+  "displayName": "Fixture Persistent",
+  "storageClass": "persistent",
+  "storageCategory": "user-data",
+  "createdAtMs": 1700000000000
+}

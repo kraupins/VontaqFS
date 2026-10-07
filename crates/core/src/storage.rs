@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{BufWriter, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
@@ -15,13 +15,14 @@ use uuid::Uuid;
 
 use crate::{
     path::{ensure_no_symlink_escape, is_link_like, LogicalPath},
-    ApplicationFormatDescriptor, ApplicationKind, ApplicationRecord, DirectoryGrantCapability,
-    DirectoryGrantRecord, ExportConflictPolicy, ExportPresetRecord, FileMetadata, FileRecord,
-    ImportConflictPolicy, KvRecord, NativeExportMode, NativeExportReport, NativeImportMode,
-    NativeImportReport, PairingRecord, PortableBackupReport, PortableRestoreReport, RepairOutcome,
-    RepairReport, RestoreConflictPolicy, SnapshotRecord, SnapshotRestoreReport, SpaceExportReport,
-    SpaceManifest, SpaceRecord, StorageCategory, StorageClass, StorageDiagnostics, StorageError,
-    StorageResult,
+    ApplicationFormatDescriptor, ApplicationKind, ApplicationRecord, DirectoryExportLayout,
+    DirectoryGrantCapability, DirectoryGrantRecord, ExportBookkeepingPolicy, ExportConflictPolicy,
+    ExportPresetRecord, ExportPrunePolicy, FileMetadata, FileRecord, ImportConflictPolicy,
+    KvRecord, NativeExportMode, NativeExportReport, NativeImportMode, NativeImportReport,
+    PairingRecord, PortableBackupReport, PortableRestoreReport, RepairOutcome, RepairReport,
+    RestoreConflictPolicy, SnapshotRecord, SnapshotRestoreReport, SpaceClearReport,
+    SpaceExportReport, SpaceManifest, SpaceRecord, StorageCategory, StorageClass,
+    StorageDiagnostics, StorageError, StorageResult,
 };
 
 const SCHEMA_VERSION: i64 = 1;
@@ -75,6 +76,31 @@ struct SnapshotDiskManifest {
     snapshot: SnapshotRecord,
     files: Vec<FileRecord>,
     kv: Vec<KvRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeExportTrackingEntry {
+    path: String,
+    size: u64,
+    checksum: String,
+    relative_destination: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeExportTrackingManifest {
+    format: String,
+    format_version: u32,
+    #[serde(default)]
+    application_id: Option<String>,
+    #[serde(default)]
+    destination_identity: Option<String>,
+    #[serde(default)]
+    tracking_key: Option<String>,
+    space_id: String,
+    created_at_ms: i64,
+    files: Vec<NativeExportTrackingEntry>,
 }
 
 #[derive(Debug)]
@@ -1565,18 +1591,43 @@ impl StorageEngine {
             .ok_or_else(|| StorageError::NotFound("space".into()))
     }
 
-    pub fn clear_cache_space(&self, space_id: &str) -> StorageResult<(u64, u64)> {
+    pub fn clear_disposable_space(&self, space_id: &str) -> StorageResult<SpaceClearReport> {
         let space = self
             .get_space(space_id)?
             .ok_or_else(|| StorageError::NotFound("space".into()))?;
-        if space.storage_class != StorageClass::Cache {
+        if !matches!(
+            space.storage_class,
+            StorageClass::Cache | StorageClass::Temporary
+        ) {
             return Err(StorageError::RequestInvalid(
-                "clear cache is only valid for cache spaces".into(),
+                "whole-space clear is only valid for cache or temporary spaces".into(),
             ));
         }
+
+        let deleted_kv_entries = {
+            let conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            conn.query_row(
+                "SELECT COUNT(*) FROM kv_entries WHERE space_id=?1",
+                params![space_id],
+                |row| row.get::<_, i64>(0),
+            )?
+            .max(0) as u64
+        };
+
         let data_root = self.space_data_root(space_id)?;
-        let (bytes, files) = scan_usage(&data_root)?;
         clear_directory_contents_preserving_root(&data_root)?;
+
+        // With runtime stream/exclusive guards in place there must be no live temp writer.
+        // Remove abandoned stream temps together with their pending registry state so the
+        // disposable space is actually empty without touching snapshots or other internal data.
+        let tmp_root = self.space_internal_root(space_id)?.join("tmp");
+        if tmp_root.exists() {
+            clear_directory_contents_preserving_root(&tmp_root)?;
+        }
+
         let mut conn = self
             .connection
             .lock()
@@ -1598,9 +1649,31 @@ impl StorageEngine {
             "DELETE FROM mutation_receipts WHERE space_id=?1",
             params![space_id],
         )?;
-        tx.execute("UPDATE spaces SET logical_bytes=0,file_count=0,state='healthy',last_used_at_ms=?1 WHERE id=?2", params![now_ms(), space_id])?;
+        tx.execute(
+            "UPDATE spaces SET logical_bytes=0,file_count=0,state='healthy',last_used_at_ms=?1 WHERE id=?2",
+            params![now_ms(), space_id],
+        )?;
         tx.commit()?;
-        Ok((bytes, files))
+
+        Ok(SpaceClearReport {
+            space_id: space_id.to_owned(),
+            deleted_files: space.file_count,
+            deleted_kv_entries,
+            released_bytes: space.logical_bytes,
+        })
+    }
+
+    pub fn clear_cache_space(&self, space_id: &str) -> StorageResult<(u64, u64)> {
+        let space = self
+            .get_space(space_id)?
+            .ok_or_else(|| StorageError::NotFound("space".into()))?;
+        if space.storage_class != StorageClass::Cache {
+            return Err(StorageError::RequestInvalid(
+                "clear cache is only valid for cache spaces".into(),
+            ));
+        }
+        let report = self.clear_disposable_space(space_id)?;
+        Ok((report.released_bytes, report.deleted_files))
     }
 
     pub fn diagnostics_summary(&self) -> StorageResult<StorageDiagnostics> {
@@ -1980,6 +2053,7 @@ impl StorageEngine {
     #[allow(clippy::too_many_arguments)]
     pub fn native_export<F, P, A>(
         &self,
+        application_id: &str,
         space_id: &str,
         source_paths: &[String],
         destination_root: &Path,
@@ -1987,6 +2061,10 @@ impl StorageEngine {
         mode: NativeExportMode,
         conflict: ExportConflictPolicy,
         archive_name: Option<&str>,
+        bookkeeping: ExportBookkeepingPolicy,
+        prune: ExportPrunePolicy,
+        tracking_key: Option<&str>,
+        directory_layout: DirectoryExportLayout,
         is_cancelled: F,
         mut progress: P,
         mut ask: A,
@@ -2001,6 +2079,24 @@ impl StorageEngine {
                 "export requires at least one source path".into(),
             ));
         }
+        let tracking_key = tracking_key.unwrap_or("");
+        validate_export_tracking_key(tracking_key)?;
+        if matches!(directory_layout, DirectoryExportLayout::Contents)
+            && (!matches!(mode, NativeExportMode::Directory) || source_paths.len() != 1)
+        {
+            return Err(StorageError::RequestInvalid(
+                "directory contents layout requires exactly one directory source".into(),
+            ));
+        }
+        if matches!(mode, NativeExportMode::Archive)
+            && (!matches!(prune, ExportPrunePolicy::None)
+                || !matches!(directory_layout, DirectoryExportLayout::Preserve))
+        {
+            return Err(StorageError::RequestInvalid(
+                "archive export does not support tracked prune or directory contents layout".into(),
+            ));
+        }
+
         let data_root = self.space_data_root(space_id)?;
         let scan = scan_file_index(&data_root, &is_cancelled, |_| {})?;
         if !scan.unsafe_items.is_empty() {
@@ -2012,6 +2108,15 @@ impl StorageEngine {
             .iter()
             .map(|value| LogicalPath::parse(value))
             .collect::<StorageResult<Vec<_>>>()?;
+        if matches!(directory_layout, DirectoryExportLayout::Contents) {
+            let source_root = data_root.join(logical_sources[0].relative());
+            ensure_no_symlink_escape(&data_root, &source_root)?;
+            if !source_root.is_dir() {
+                return Err(StorageError::RequestInvalid(
+                    "directory contents layout source must be a directory".into(),
+                ));
+            }
+        }
         let mut selected = Vec::new();
         for item in &scan.files {
             let matched = logical_sources.iter().any(|source| {
@@ -2053,10 +2158,63 @@ impl StorageEngine {
                 "export destination is not a directory".into(),
             ));
         }
+        let destination_identity = sha256_hex(destination_root.to_string_lossy().as_bytes());
+        let (manifest_path, journal_path, mut legacy_sidecar_seeded) = match bookkeeping {
+            ExportBookkeepingPolicy::Destination => (
+                destination_root.join(".vontaqfs-export-manifest.json"),
+                destination_root.join(".vontaqfs-export-journal.json"),
+                false,
+            ),
+            ExportBookkeepingPolicy::Internal => {
+                let scope = native_export_tracking_scope(
+                    application_id,
+                    &destination_identity,
+                    tracking_key,
+                );
+                let directory = self.root.join("runtime/native-export");
+                fs::create_dir_all(&directory)?;
+                (
+                    directory.join(format!("{scope}.manifest.json")),
+                    directory.join(format!("{scope}.journal.json")),
+                    false,
+                )
+            }
+        };
+
+        let mut previous_manifest = load_native_export_tracking_manifest(
+            &manifest_path,
+            application_id,
+            &destination_identity,
+            tracking_key,
+            matches!(bookkeeping, ExportBookkeepingPolicy::Destination) && tracking_key.is_empty(),
+        );
+        if previous_manifest.is_none() && matches!(bookkeeping, ExportBookkeepingPolicy::Internal) {
+            let legacy_path = destination_root.join(".vontaqfs-export-manifest.json");
+            previous_manifest = load_native_export_tracking_manifest(
+                &legacy_path,
+                application_id,
+                &destination_identity,
+                tracking_key,
+                true,
+            );
+            legacy_sidecar_seeded = previous_manifest.is_some();
+        }
+        let previous_checksums = previous_manifest
+            .as_ref()
+            .map(manifest_checksums_by_destination)
+            .unwrap_or_default();
+
         let total_bytes = selected.iter().map(|item| item.size).sum::<u64>();
         let total_items = selected.len() as u64;
-        let previous_manifest = load_native_export_manifest_checksums(&destination_root);
-        prepare_native_export_journal(&destination_root, space_id, mode, source_paths)?;
+        let journal_context = NativeExportJournalContext {
+            application_id,
+            destination_identity: &destination_identity,
+            tracking_key,
+            space_id,
+            mode: export_mode_db(mode),
+            source_paths,
+        };
+        prepare_native_export_journal_at(&journal_path, &journal_context)?;
 
         let result = (|| -> StorageResult<NativeExportReport> {
             progress(0, Some(total_items), 0, Some(total_bytes));
@@ -2102,21 +2260,27 @@ impl StorageEngine {
                     }
                     let logical = LogicalPath::parse(&item.path)?;
                     let source = data_root.join(logical.relative());
-                    zip.add_file_cancellable(
-                        logical
-                            .relative()
-                            .to_string_lossy()
-                            .replace('\\', "/")
-                            .as_str(),
+                    ensure_no_symlink_escape(&data_root, &source)?;
+                    let entry_name = logical.relative().to_string_lossy().replace('\\', "/");
+                    if let Err(error) = zip.add_file_verified_cancellable(
+                        &entry_name,
                         &source,
+                        &item.etag,
                         &is_cancelled,
-                    )?;
+                    ) {
+                        let _ = fs::remove_file(&temp);
+                        return Err(error);
+                    }
                     items_done += 1;
                     bytes_done = bytes_done.saturating_add(item.size);
                     progress(items_done, Some(total_items), bytes_done, Some(total_bytes));
                 }
                 zip.finish()?;
                 sync_file_for_durability(&temp)?;
+                if is_cancelled() {
+                    let _ = fs::remove_file(&temp);
+                    return Err(StorageError::OperationCancelled);
+                }
                 atomic_replace(&temp, &target)?;
                 sync_parent(target.parent());
                 return Ok(NativeExportReport {
@@ -2139,9 +2303,11 @@ impl StorageEngine {
             let mut skipped = 0_u64;
             let mut unchanged = 0_u64;
             let mut conflicts = 0_u64;
+            let mut deleted = 0_u64;
             let mut bytes_done = 0_u64;
             let mut items_done = 0_u64;
             let mut manifest_files = Vec::new();
+            let mut current_export_paths = HashSet::new();
             for item in selected {
                 if is_cancelled() {
                     return Err(StorageError::OperationCancelled);
@@ -2149,18 +2315,20 @@ impl StorageEngine {
                 let logical = LogicalPath::parse(&item.path)?;
                 let source = data_root.join(logical.relative());
                 ensure_no_symlink_escape(&data_root, &source)?;
-                let relative =
-                    if matches!(mode, NativeExportMode::File) {
-                        PathBuf::from(logical.relative().file_name().ok_or_else(|| {
-                            StorageError::PathInvalid("file has no basename".into())
-                        })?)
-                    } else {
-                        logical.relative().to_path_buf()
-                    };
+                let relative = export_relative_destination(
+                    &logical,
+                    mode,
+                    directory_layout,
+                    logical_sources.first(),
+                )?;
                 let target0 = destination_root.join(&relative);
                 if let Some(parent) = target0.parent() {
                     fs::create_dir_all(parent)?;
                 }
+                let relative_key = portable_relative_text(&relative).ok_or_else(|| {
+                    StorageError::PathInvalid("export destination path is not portable".into())
+                })?;
+                current_export_paths.insert(relative_key.clone());
                 let existing_hash = if matches!(conflict, ExportConflictPolicy::UpdateChanged)
                     && target0.is_file()
                 {
@@ -2168,28 +2336,39 @@ impl StorageEngine {
                 } else {
                     None
                 };
-                let previous_checksum = previous_manifest.get(&item.path);
+                let previous_checksum = previous_checksums.get(&relative_key);
                 if matches!(conflict, ExportConflictPolicy::UpdateChanged)
                     && previous_checksum == Some(&item.etag)
                     && existing_hash.as_deref() == Some(item.etag.as_str())
                 {
+                    verify_selected_export_source(&source, &item.etag, &is_cancelled)?;
                     unchanged += 1;
                     items_done += 1;
                     bytes_done = bytes_done.saturating_add(item.size);
                     progress(items_done, Some(total_items), bytes_done, Some(total_bytes));
-                    manifest_files.push(json!({"path":item.path,"size":item.size,"checksum":item.etag,"relativeDestination":portable_relative_text(&relative)}));
+                    manifest_files.push(NativeExportTrackingEntry {
+                        path: item.path.clone(),
+                        size: item.size,
+                        checksum: item.etag.clone(),
+                        relative_destination: relative_key,
+                    });
                     continue;
                 }
-                // If a prior manifest is absent, exact destination bytes still allow a safe unchanged decision.
                 if matches!(conflict, ExportConflictPolicy::UpdateChanged)
                     && previous_checksum.is_none()
                     && existing_hash.as_deref() == Some(item.etag.as_str())
                 {
+                    verify_selected_export_source(&source, &item.etag, &is_cancelled)?;
                     unchanged += 1;
                     items_done += 1;
                     bytes_done = bytes_done.saturating_add(item.size);
                     progress(items_done, Some(total_items), bytes_done, Some(total_bytes));
-                    manifest_files.push(json!({"path":item.path,"size":item.size,"checksum":item.etag,"relativeDestination":portable_relative_text(&relative)}));
+                    manifest_files.push(NativeExportTrackingEntry {
+                        path: item.path.clone(),
+                        size: item.size,
+                        checksum: item.etag.clone(),
+                        relative_destination: relative_key,
+                    });
                     continue;
                 }
                 let had_target = target0.exists();
@@ -2213,15 +2392,22 @@ impl StorageEngine {
                         .unwrap_or_default()
                 ));
                 let mut copied_for_file = 0_u64;
-                copy_file_atomic_stage(&source, &temp, &target, &is_cancelled, |delta| {
-                    copied_for_file = copied_for_file.saturating_add(delta);
-                    progress(
-                        items_done,
-                        Some(total_items),
-                        bytes_done.saturating_add(copied_for_file),
-                        Some(total_bytes),
-                    );
-                })?;
+                copy_file_atomic_stage(
+                    &source,
+                    &temp,
+                    &target,
+                    &item.etag,
+                    &is_cancelled,
+                    |delta| {
+                        copied_for_file = copied_for_file.saturating_add(delta);
+                        progress(
+                            items_done,
+                            Some(total_items),
+                            bytes_done.saturating_add(copied_for_file),
+                            Some(total_bytes),
+                        );
+                    },
+                )?;
                 if had_target {
                     changed += 1;
                 } else {
@@ -2230,20 +2416,85 @@ impl StorageEngine {
                 bytes_done = bytes_done.saturating_add(copied_for_file);
                 items_done += 1;
                 progress(items_done, Some(total_items), bytes_done, Some(total_bytes));
-                manifest_files.push(json!({
-                    "path":item.path,"size":item.size,"checksum":item.etag,
-                    "relativeDestination":target.strip_prefix(&destination_root).ok().and_then(portable_relative_text)
-                }));
+                let actual_relative = target
+                    .strip_prefix(&destination_root)
+                    .ok()
+                    .and_then(portable_relative_text)
+                    .ok_or_else(|| {
+                        StorageError::PathInvalid("export destination escaped root".into())
+                    })?;
+                manifest_files.push(NativeExportTrackingEntry {
+                    path: item.path.clone(),
+                    size: item.size,
+                    checksum: item.etag.clone(),
+                    relative_destination: actual_relative,
+                });
             }
-            let manifest_path = destination_root.join(".vontaqfs-export-manifest.json");
-            let manifest_bytes = serde_json::to_vec_pretty(&json!({
-                "format":"vontaqfs-native-export", "formatVersion":1, "spaceId":space_id, "createdAtMs":now_ms(), "files":manifest_files
-            }))?;
-            let manifest_temp = destination_root.join(".vontaqfs-export-manifest.json.tmp");
-            fs::write(&manifest_temp, &manifest_bytes)?;
-            sync_file_for_durability(&manifest_temp)?;
-            atomic_replace(&manifest_temp, &manifest_path)?;
-            sync_parent(Some(&destination_root));
+
+            if is_cancelled() {
+                return Err(StorageError::OperationCancelled);
+            }
+            if matches!(prune, ExportPrunePolicy::Tracked) {
+                for entry in &manifest_files {
+                    current_export_paths.insert(entry.relative_destination.clone());
+                }
+                if let Some(previous) = previous_manifest.as_ref() {
+                    for previous_entry in &previous.files {
+                        if current_export_paths
+                            .contains(previous_entry.relative_destination.as_str())
+                        {
+                            continue;
+                        }
+                        if is_cancelled() {
+                            return Err(StorageError::OperationCancelled);
+                        }
+                        let Some(relative) =
+                            parse_portable_relative_path(&previous_entry.relative_destination)
+                        else {
+                            continue;
+                        };
+                        let target = destination_root.join(relative);
+                        let Ok(metadata) = fs::symlink_metadata(&target) else {
+                            continue;
+                        };
+                        if is_link_like(&metadata) || !metadata.is_file() {
+                            continue;
+                        }
+                        if ensure_no_symlink_escape(&destination_root, &target).is_err() {
+                            continue;
+                        }
+                        let Ok(current_hash) = sha256_file(&target) else {
+                            continue;
+                        };
+                        if current_hash == previous_entry.checksum {
+                            fs::remove_file(&target)?;
+                            deleted += 1;
+                        }
+                    }
+                }
+            }
+
+            if is_cancelled() {
+                return Err(StorageError::OperationCancelled);
+            }
+            let manifest = NativeExportTrackingManifest {
+                format: "vontaqfs-native-export".into(),
+                format_version: 1,
+                application_id: Some(application_id.into()),
+                destination_identity: Some(destination_identity.clone()),
+                tracking_key: Some(tracking_key.into()),
+                space_id: space_id.into(),
+                created_at_ms: now_ms(),
+                files: manifest_files,
+            };
+            write_native_export_tracking_manifest(&manifest_path, &manifest)?;
+            if legacy_sidecar_seeded && matches!(bookkeeping, ExportBookkeepingPolicy::Internal) {
+                let legacy_path = destination_root.join(".vontaqfs-export-manifest.json");
+                if legacy_path.exists() {
+                    let _ = fs::remove_file(&legacy_path);
+                    sync_parent(Some(&destination_root));
+                }
+            }
             Ok(NativeExportReport {
                 space_id: space_id.into(),
                 destination_label: destination_label.into(),
@@ -2253,7 +2504,7 @@ impl StorageEngine {
                 skipped,
                 unchanged,
                 conflicts,
-                deleted: 0,
+                deleted,
                 exported_bytes: bytes_done,
                 manifest_written: true,
             })
@@ -2261,27 +2512,16 @@ impl StorageEngine {
 
         match result {
             Ok(report) => {
-                clear_native_export_journal(&destination_root);
+                clear_native_export_journal_at(&journal_path);
                 Ok(report)
             }
             Err(StorageError::OperationCancelled) => {
-                let _ = write_native_export_journal(
-                    &destination_root,
-                    "cancelled",
-                    space_id,
-                    mode,
-                    source_paths,
-                );
+                let _ =
+                    write_native_export_journal_at(&journal_path, "cancelled", &journal_context);
                 Err(StorageError::OperationCancelled)
             }
             Err(error) => {
-                let _ = write_native_export_journal(
-                    &destination_root,
-                    "failed",
-                    space_id,
-                    mode,
-                    source_paths,
-                );
+                let _ = write_native_export_journal_at(&journal_path, "failed", &journal_context);
                 Err(error)
             }
         }
@@ -4358,70 +4598,214 @@ fn row_export_preset(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExportPresetRe
         updated_at_ms: row.get(9)?,
     })
 }
-fn load_native_export_manifest_checksums(destination_root: &Path) -> HashMap<String, String> {
-    let path = destination_root.join(".vontaqfs-export-manifest.json");
-    let Ok(bytes) = fs::read(path) else {
-        return HashMap::new();
-    };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return HashMap::new();
-    };
-    if value.get("format").and_then(serde_json::Value::as_str) != Some("vontaqfs-native-export") {
-        return HashMap::new();
+fn validate_export_tracking_key(value: &str) -> StorageResult<()> {
+    if value.len() > 256 || value.chars().any(|ch| ch.is_control()) {
+        return Err(StorageError::RequestInvalid(
+            "tracking key is too long or contains control characters".into(),
+        ));
     }
-    value
-        .get("files")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.get("path")?.as_str()?.to_owned();
-            let checksum = entry.get("checksum")?.as_str()?.to_owned();
-            Some((path, checksum))
-        })
-        .collect()
-}
-
-fn prepare_native_export_journal(
-    destination_root: &Path,
-    space_id: &str,
-    mode: NativeExportMode,
-    source_paths: &[String],
-) -> StorageResult<()> {
-    let journal = destination_root.join(".vontaqfs-export-journal.json");
-    if journal.exists() {
-        let previous =
-            destination_root.join(format!(".vontaqfs-export-interrupted-{}.json", now_ms()));
-        let _ = fs::rename(&journal, previous);
-    }
-    write_native_export_journal(destination_root, "running", space_id, mode, source_paths)
-}
-
-fn write_native_export_journal(
-    destination_root: &Path,
-    status: &str,
-    space_id: &str,
-    mode: NativeExportMode,
-    source_paths: &[String],
-) -> StorageResult<()> {
-    let journal = destination_root.join(".vontaqfs-export-journal.json");
-    let temp = destination_root.join(".vontaqfs-export-journal.json.tmp");
-    let bytes = serde_json::to_vec_pretty(&json!({
-        "format":"vontaqfs-native-export-journal", "formatVersion":1, "status":status,
-        "spaceId":space_id, "mode":export_mode_db(mode), "sourcePaths":source_paths, "updatedAtMs":now_ms()
-    }))?;
-    fs::write(&temp, bytes)?;
-    sync_file_for_durability(&temp)?;
-    atomic_replace(&temp, &journal)?;
-    sync_parent(Some(destination_root));
     Ok(())
 }
 
-fn clear_native_export_journal(destination_root: &Path) {
-    let journal = destination_root.join(".vontaqfs-export-journal.json");
+fn native_export_tracking_scope(
+    application_id: &str,
+    destination_identity: &str,
+    tracking_key: &str,
+) -> String {
+    sha256_hex(
+        format!(
+            "vontaqfs-native-export-scope-v1\0{application_id}\0{destination_identity}\0{tracking_key}"
+        )
+        .as_bytes(),
+    )
+}
+
+fn checksum_is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn parse_portable_relative_path(value: &str) -> Option<PathBuf> {
+    if value.is_empty() || value.starts_with('/') || value.starts_with('\\') || value.contains('\\')
+    {
+        return None;
+    }
+    let mut path = PathBuf::new();
+    for segment in value.split('/') {
+        if segment.is_empty()
+            || segment == "."
+            || segment == ".."
+            || segment.chars().any(|ch| ch.is_control())
+        {
+            return None;
+        }
+        path.push(segment);
+    }
+    Some(path)
+}
+
+fn load_native_export_tracking_manifest(
+    path: &Path,
+    application_id: &str,
+    destination_identity: &str,
+    tracking_key: &str,
+    allow_legacy_scope: bool,
+) -> Option<NativeExportTrackingManifest> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return None;
+    }
+    let manifest = serde_json::from_slice::<NativeExportTrackingManifest>(&bytes).ok()?;
+    if manifest.format != "vontaqfs-native-export"
+        || manifest.format_version != 1
+        || manifest.space_id.trim().is_empty()
+        || manifest.files.is_empty()
+        || manifest.files.len() > 100_000
+    {
+        return None;
+    }
+    let legacy_scope = manifest.application_id.is_none()
+        && manifest.destination_identity.is_none()
+        && manifest.tracking_key.is_none();
+    if legacy_scope {
+        if !allow_legacy_scope {
+            return None;
+        }
+    } else if manifest.application_id.as_deref() != Some(application_id)
+        || manifest.destination_identity.as_deref() != Some(destination_identity)
+        || manifest.tracking_key.as_deref().unwrap_or("") != tracking_key
+    {
+        return None;
+    }
+    if manifest.files.iter().any(|entry| {
+        entry.path.is_empty()
+            || !entry.path.starts_with('/')
+            || !checksum_is_sha256(&entry.checksum)
+            || parse_portable_relative_path(&entry.relative_destination).is_none()
+    }) {
+        return None;
+    }
+    Some(manifest)
+}
+
+fn manifest_checksums_by_destination(
+    manifest: &NativeExportTrackingManifest,
+) -> HashMap<String, String> {
+    manifest
+        .files
+        .iter()
+        .map(|entry| (entry.relative_destination.clone(), entry.checksum.clone()))
+        .collect()
+}
+
+fn write_native_export_tracking_manifest(
+    path: &Path,
+    manifest: &NativeExportTrackingManifest,
+) -> StorageResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension("json.tmp");
+    fs::write(&temp, serde_json::to_vec_pretty(manifest)?)?;
+    sync_file_for_durability(&temp)?;
+    atomic_replace(&temp, path)?;
+    sync_parent(path.parent());
+    Ok(())
+}
+
+struct NativeExportJournalContext<'a> {
+    application_id: &'a str,
+    destination_identity: &'a str,
+    tracking_key: &'a str,
+    space_id: &'a str,
+    mode: &'static str,
+    source_paths: &'a [String],
+}
+
+fn prepare_native_export_journal_at(
+    journal: &Path,
+    context: &NativeExportJournalContext<'_>,
+) -> StorageResult<()> {
+    if let Some(parent) = journal.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if journal.exists() {
+        let previous = if journal.file_name().and_then(|v| v.to_str())
+            == Some(".vontaqfs-export-journal.json")
+        {
+            journal
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(format!(".vontaqfs-export-interrupted-{}.json", now_ms()))
+        } else {
+            journal.with_extension(format!("interrupted-{}.json", now_ms()))
+        };
+        let _ = fs::rename(journal, previous);
+    }
+    write_native_export_journal_at(journal, "running", context)
+}
+
+fn write_native_export_journal_at(
+    journal: &Path,
+    status: &str,
+    context: &NativeExportJournalContext<'_>,
+) -> StorageResult<()> {
+    if let Some(parent) = journal.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp = journal.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(&json!({
+        "format":"vontaqfs-native-export-journal", "formatVersion":1, "status":status,
+        "applicationId":context.application_id, "destinationIdentity":context.destination_identity,
+        "trackingKey":context.tracking_key, "spaceId":context.space_id, "mode":context.mode,
+        "sourcePaths":context.source_paths, "updatedAtMs":now_ms()
+    }))?;
+    fs::write(&temp, bytes)?;
+    sync_file_for_durability(&temp)?;
+    atomic_replace(&temp, journal)?;
+    sync_parent(journal.parent());
+    Ok(())
+}
+
+fn clear_native_export_journal_at(journal: &Path) {
     if journal.exists() {
         let _ = fs::remove_file(journal);
     }
+}
+
+fn export_relative_destination(
+    logical: &LogicalPath,
+    mode: NativeExportMode,
+    directory_layout: DirectoryExportLayout,
+    source_root: Option<&LogicalPath>,
+) -> StorageResult<PathBuf> {
+    if matches!(mode, NativeExportMode::File) {
+        return Ok(PathBuf::from(logical.relative().file_name().ok_or_else(
+            || StorageError::PathInvalid("file has no basename".into()),
+        )?));
+    }
+    if matches!(mode, NativeExportMode::Directory)
+        && matches!(directory_layout, DirectoryExportLayout::Contents)
+    {
+        let source_root = source_root.ok_or_else(|| {
+            StorageError::RequestInvalid("directory contents layout requires a source root".into())
+        })?;
+        let logical_relative = logical.relative();
+        let source_root_relative = source_root.relative();
+        let relative = logical_relative
+            .strip_prefix(&source_root_relative)
+            .map_err(|_| {
+                StorageError::PathInvalid(
+                    "export source is outside the selected directory root".into(),
+                )
+            })?;
+        if relative.as_os_str().is_empty() {
+            return Err(StorageError::RequestInvalid(
+                "directory contents layout source must be a directory".into(),
+            ));
+        }
+        return Ok(relative.to_path_buf());
+    }
+    Ok(logical.relative().to_path_buf())
 }
 
 fn safe_archive_name(value: &str) -> StorageResult<String> {
@@ -4490,10 +4874,24 @@ fn resolve_export_target<A: FnMut(&str) -> StorageResult<bool>>(
         }
     }
 }
+fn verify_selected_export_source<F: Fn() -> bool>(
+    source: &Path,
+    expected_sha256: &str,
+    is_cancelled: &F,
+) -> StorageResult<()> {
+    match sha256_file_cancellable(source, is_cancelled) {
+        Ok(observed) if observed == expected_sha256 => Ok(()),
+        Ok(_) => Err(StorageError::ExportSourceChanged),
+        Err(StorageError::OperationCancelled) => Err(StorageError::OperationCancelled),
+        Err(_) => Err(StorageError::ExportSourceChanged),
+    }
+}
+
 fn copy_file_atomic_stage<F: Fn() -> bool, P: FnMut(u64)>(
     source: &Path,
     temp: &Path,
     target: &Path,
+    expected_sha256: &str,
     is_cancelled: &F,
     mut on_bytes: P,
 ) -> StorageResult<()> {
@@ -4503,8 +4901,9 @@ fn copy_file_atomic_stage<F: Fn() -> bool, P: FnMut(u64)>(
     if let Some(parent) = temp.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut input = File::open(source)?;
+    let mut input = File::open(source).map_err(|_| StorageError::ExportSourceChanged)?;
     let mut output = File::create(temp)?;
+    let mut hasher = Sha256::new();
     let mut buffer = [0u8; 256 * 1024];
     loop {
         if is_cancelled() {
@@ -4512,14 +4911,33 @@ fn copy_file_atomic_stage<F: Fn() -> bool, P: FnMut(u64)>(
             let _ = fs::remove_file(temp);
             return Err(StorageError::OperationCancelled);
         }
-        let read = input.read(&mut buffer)?;
+        let read = match input.read(&mut buffer) {
+            Ok(read) => read,
+            Err(_) => {
+                drop(output);
+                let _ = fs::remove_file(temp);
+                return Err(StorageError::ExportSourceChanged);
+            }
+        };
         if read == 0 {
             break;
         }
         output.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
         on_bytes(read as u64);
     }
     output.sync_all()?;
+    let observed = digest_hex(hasher.finalize());
+    if observed != expected_sha256 {
+        drop(output);
+        let _ = fs::remove_file(temp);
+        return Err(StorageError::ExportSourceChanged);
+    }
+    if is_cancelled() {
+        drop(output);
+        let _ = fs::remove_file(temp);
+        return Err(StorageError::OperationCancelled);
+    }
     atomic_replace(temp, target)?;
     sync_parent(target.parent());
     Ok(())
@@ -5313,30 +5731,6 @@ fn file_matches(path: &Path, expected_hash: &str, expected_size: u64) -> Storage
     }
     Ok(sha256_file(path)? == expected_hash)
 }
-fn scan_usage(root: &Path) -> StorageResult<(u64, u64)> {
-    if !root.exists() {
-        return Ok((0, 0));
-    }
-    let mut bytes = 0u64;
-    let mut files = 0u64;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(dir)?.filter_map(Result::ok) {
-            let metadata = entry.file_type()?;
-            if metadata.is_symlink() {
-                continue;
-            }
-            if metadata.is_dir() {
-                stack.push(entry.path());
-            } else if metadata.is_file() {
-                files += 1;
-                bytes = bytes.saturating_add(entry.metadata()?.len());
-            }
-        }
-    }
-    Ok((bytes, files))
-}
-
 #[derive(Debug, Clone)]
 struct ScannedFile {
     path: String,
@@ -5841,8 +6235,12 @@ impl<W: Write + Seek> SimpleZipWriter<W> {
     where
         F: Fn() -> bool,
     {
-        let (size, crc) = file_crc32_cancellable(path, is_cancelled)?;
-        let mut file = File::open(path)?;
+        let (size, crc) = match file_crc32_cancellable(path, is_cancelled) {
+            Ok(value) => value,
+            Err(StorageError::OperationCancelled) => return Err(StorageError::OperationCancelled),
+            Err(_) => return Err(StorageError::ExportSourceChanged),
+        };
+        let mut file = File::open(path).map_err(|_| StorageError::ExportSourceChanged)?;
         self.add_reader(
             name,
             &mut file,
@@ -5894,7 +6292,15 @@ impl<W: Write + Seek> SimpleZipWriter<W> {
             if is_cancelled() {
                 return Err(StorageError::OperationCancelled);
             }
-            let read = reader.read(&mut buffer)?;
+            let read = match reader.read(&mut buffer) {
+                Ok(value) => value,
+                Err(error) => {
+                    if expected_sha256.is_some() {
+                        return Err(StorageError::ExportSourceChanged);
+                    }
+                    return Err(error.into());
+                }
+            };
             if read == 0 {
                 break;
             }
@@ -5907,16 +6313,16 @@ impl<W: Write + Seek> SimpleZipWriter<W> {
         }
         let observed_crc = !observed_crc;
         if written != size || observed_crc != crc32 {
-            return Err(StorageError::StorageUnavailable(
-                "file changed while export was reading it".into(),
-            ));
+            return Err(if expected_sha256.is_some() {
+                StorageError::ExportSourceChanged
+            } else {
+                StorageError::StorageUnavailable("file changed while export was reading it".into())
+            });
         }
         if let Some(expected) = expected_sha256 {
             let observed = digest_hex(observed_sha.finalize());
             if observed != expected {
-                return Err(StorageError::StorageUnavailable(
-                    "file changed while archive was reading it".into(),
-                ));
+                return Err(StorageError::ExportSourceChanged);
             }
         }
         self.entries.push(ZipCentralEntry {
@@ -6470,6 +6876,122 @@ mod tests {
         }
     }
 
+    fn copy_fixture_tree(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_fixture_tree(&source_path, &destination_path);
+            } else {
+                fs::copy(&source_path, &destination_path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn v01_frozen_fixture_opens_without_schema_migration_and_preserves_records() {
+        let fixture_root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/v01-storage/root");
+        let root = temp_root("v01-compat");
+        copy_fixture_tree(&fixture_root, &root);
+        let persistent_manifest_path =
+            root.join("spaces/33333333-3333-4333-8333-333333333333/.vontaqfs/manifest.json");
+        let manifest_before = fs::read(&persistent_manifest_path).unwrap();
+
+        let engine = StorageEngine::open(&root).unwrap();
+        let app = engine
+            .application_by_identity(
+                ApplicationKind::OtherSupportedClient,
+                "fixture.vontaqfs.v01",
+            )
+            .unwrap()
+            .expect("fixture application");
+        assert_eq!(app.id, "11111111-1111-4111-8111-111111111111");
+
+        let pairings = engine
+            .active_pairings_for_client(&app.id, "fixture-client-v01")
+            .unwrap();
+        assert_eq!(pairings.len(), 1);
+        assert_eq!(pairings[0].credential_hash, "a".repeat(64));
+        assert!(pairings[0].revoked_at_ms.is_none());
+
+        let spaces = engine.list_spaces(&app.id).unwrap();
+        assert_eq!(spaces.len(), 2);
+        let persistent = spaces
+            .iter()
+            .find(|space| space.storage_class == StorageClass::Persistent)
+            .unwrap();
+        let cache = spaces
+            .iter()
+            .find(|space| space.storage_class == StorageClass::Cache)
+            .unwrap();
+        assert_eq!(persistent.format_version, 1);
+        assert_eq!(cache.format_version, 1);
+
+        let small = engine.read_file(&persistent.id, "/small.txt").unwrap();
+        assert_eq!(
+            sha256_hex(&small),
+            "a4da1e12af6e4ff4d28ea9fa4ae3cfee46ebcc3eb2baf38a47b930507fee1566"
+        );
+        let stream = engine.read_file(&persistent.id, "/stream.bin").unwrap();
+        assert_eq!(stream.len(), 307_200);
+        assert_eq!(
+            sha256_hex(&stream),
+            "df434bc1eb4f4512546b008634d9baef5bc274a90e6198723b8bc5bd60f02b00"
+        );
+        let cache_bytes = engine.read_file(&cache.id, "/cache.bin").unwrap();
+        assert_eq!(
+            sha256_hex(&cache_bytes),
+            "174a8e8143aefc29c3cefb2c69d713c99fc3818b2e22b21c5e0dbdbf88a920d1"
+        );
+
+        let kv = engine
+            .kv_get(&persistent.id, "fixture:kv")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            kv.etag,
+            "35bd8fe9686277be57629eb87579038c28c8ee3c5b1556fc47ba36770b1b049b"
+        );
+        assert_eq!(kv.value, json!({"fixture":"v0.1","count":1}));
+
+        let grants = engine.list_directory_grants(&app.id).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].id, "dst_55555555555545558555555555555555");
+        let presets = engine.list_export_presets(&app.id).unwrap();
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].id, "exp_77777777777747778777777777777777");
+        let snapshots = engine.list_snapshots(&persistent.id).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].id, "snp_66666666666646668666666666666666");
+        let snapshot_payload = root
+            .join("spaces")
+            .join(&persistent.id)
+            .join(".vontaqfs/snapshots")
+            .join(&snapshots[0].id)
+            .join("data/stream.bin");
+        assert_eq!(
+            sha256_file(&snapshot_payload).unwrap(),
+            "df434bc1eb4f4512546b008634d9baef5bc274a90e6198723b8bc5bd60f02b00"
+        );
+
+        let schema_version: i64 = engine
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT version FROM schema_meta LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(schema_version, 1);
+        assert_eq!(
+            fs::read(&persistent_manifest_path).unwrap(),
+            manifest_before
+        );
+    }
+
     #[test]
     fn corrupt_registry_restores_verified_backup_without_touching_user_files() {
         let root = temp_root("backup");
@@ -6676,6 +7198,57 @@ mod tests {
         assert!(engine.kv_get(&persistent.id, "keep-kv").unwrap().is_some());
         assert!(matches!(
             engine.clear_cache_space(&persistent.id),
+            Err(StorageError::RequestInvalid(_))
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disposable_clear_supports_temporary_and_rejects_persistent_spaces() {
+        let root = temp_root("disposable-clear");
+        let engine = StorageEngine::open(&root).unwrap();
+        let app = engine
+            .register_application(
+                ApplicationKind::FigmaPlugin,
+                "plugin.disposable",
+                "Disposable Plugin",
+            )
+            .unwrap();
+        let persistent = engine
+            .open_space(&app.id, "persistent", StorageClass::Persistent, None)
+            .unwrap();
+        let temporary = engine
+            .open_space(&app.id, "temporary", StorageClass::Temporary, None)
+            .unwrap();
+        engine
+            .write_file(&temporary.id, "/drop.txt", b"temporary", None, "temp-write")
+            .unwrap();
+        engine
+            .kv_set(
+                &temporary.id,
+                "drop-kv",
+                &json!({"drop":true}),
+                None,
+                None,
+                "temp-kv-write",
+            )
+            .unwrap();
+
+        let report = engine.clear_disposable_space(&temporary.id).unwrap();
+        assert_eq!(report.space_id, temporary.id);
+        assert_eq!(report.deleted_files, 1);
+        assert_eq!(report.deleted_kv_entries, 1);
+        assert_eq!(report.released_bytes, 9);
+        assert!(engine
+            .stat_file(&temporary.id, "/drop.txt")
+            .unwrap()
+            .is_none());
+        assert!(engine.kv_get(&temporary.id, "drop-kv").unwrap().is_none());
+        let refreshed = engine.get_space(&temporary.id).unwrap().unwrap();
+        assert_eq!(refreshed.logical_bytes, 0);
+        assert_eq!(refreshed.file_count, 0);
+        assert!(matches!(
+            engine.clear_disposable_space(&persistent.id),
             Err(StorageError::RequestInvalid(_))
         ));
         let _ = fs::remove_dir_all(root);
@@ -7116,7 +7689,7 @@ mod tests {
         let root = temp_root("d5-native-export");
         let destination = temp_root("d5-native-export-destination");
         let engine = StorageEngine::open(&root).unwrap();
-        let (_, space) = fixture(&engine);
+        let (app, space) = fixture(&engine);
         let payload = vec![0_u8, 255, 13, 10, 128, 42, 7, 0, 99];
         engine
             .write_file(&space.id, "/opaque.vui", &payload, None, "d5-export-write")
@@ -7124,6 +7697,7 @@ mod tests {
         let source_paths = vec!["/opaque.vui".to_owned()];
         let first = engine
             .native_export(
+                &app.id,
                 &space.id,
                 &source_paths,
                 &destination,
@@ -7131,6 +7705,10 @@ mod tests {
                 NativeExportMode::File,
                 ExportConflictPolicy::Replace,
                 None,
+                ExportBookkeepingPolicy::Destination,
+                ExportPrunePolicy::None,
+                None,
+                DirectoryExportLayout::Preserve,
                 || false,
                 |_, _, _, _| {},
                 |_| Ok(true),
@@ -7141,6 +7719,7 @@ mod tests {
         assert!(!destination.join(".vontaqfs-export-journal.json").exists());
         let second = engine
             .native_export(
+                &app.id,
                 &space.id,
                 &source_paths,
                 &destination,
@@ -7148,6 +7727,10 @@ mod tests {
                 NativeExportMode::File,
                 ExportConflictPolicy::UpdateChanged,
                 None,
+                ExportBookkeepingPolicy::Destination,
+                ExportPrunePolicy::None,
+                None,
+                DirectoryExportLayout::Preserve,
                 || false,
                 |_, _, _, _| {},
                 |_| Ok(true),
@@ -7230,7 +7813,7 @@ mod tests {
         let root = temp_root("d5-cancel-export");
         let destination = temp_root("d5-cancel-export-destination");
         let engine = StorageEngine::open(&root).unwrap();
-        let (_, space) = fixture(&engine);
+        let (app, space) = fixture(&engine);
         engine
             .write_file(
                 &space.id,
@@ -7243,6 +7826,7 @@ mod tests {
         let cancel = Cell::new(false);
         let source_paths = vec!["/cancel.bin".to_owned()];
         let result = engine.native_export(
+            &app.id,
             &space.id,
             &source_paths,
             &destination,
@@ -7250,6 +7834,10 @@ mod tests {
             NativeExportMode::File,
             ExportConflictPolicy::Replace,
             None,
+            ExportBookkeepingPolicy::Destination,
+            ExportPrunePolicy::None,
+            None,
+            DirectoryExportLayout::Preserve,
             || cancel.get(),
             |_, _, _, _| cancel.set(true),
             |_| Ok(true),
@@ -7266,6 +7854,135 @@ mod tests {
         );
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(destination);
+    }
+
+    #[test]
+    fn v02_internal_contents_tracking_prunes_only_unchanged_owned_stale_files_across_run_roots() {
+        let root = temp_root("v02-internal-tracked-export");
+        let destination = temp_root("v02-internal-tracked-export-destination");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (app, space) = fixture(&engine);
+        engine
+            .write_file(
+                &space.id,
+                "/runs/run-a/keep.txt",
+                b"keep",
+                None,
+                "v02-run-a-keep",
+            )
+            .unwrap();
+        engine
+            .write_file(
+                &space.id,
+                "/runs/run-a/remove.txt",
+                b"remove",
+                None,
+                "v02-run-a-remove",
+            )
+            .unwrap();
+        engine
+            .write_file(
+                &space.id,
+                "/runs/run-a/modified.txt",
+                b"owned",
+                None,
+                "v02-run-a-modified",
+            )
+            .unwrap();
+        let first_sources = vec!["/runs/run-a".to_owned()];
+        let first = engine
+            .native_export(
+                &app.id,
+                &space.id,
+                &first_sources,
+                &destination,
+                "Destination",
+                NativeExportMode::Directory,
+                ExportConflictPolicy::UpdateChanged,
+                None,
+                ExportBookkeepingPolicy::Internal,
+                ExportPrunePolicy::Tracked,
+                Some("stable-channel"),
+                DirectoryExportLayout::Contents,
+                || false,
+                |_, _, _, _| {},
+                |_| Ok(true),
+            )
+            .unwrap();
+        assert_eq!(first.added, 3);
+        assert!(destination.join("keep.txt").is_file());
+        assert!(destination.join("remove.txt").is_file());
+        assert!(destination.join("modified.txt").is_file());
+        assert!(!destination.join(".vontaqfs-export-manifest.json").exists());
+        assert!(!destination.join(".vontaqfs-export-journal.json").exists());
+
+        fs::write(destination.join("modified.txt"), b"user-modified").unwrap();
+        engine
+            .write_file(
+                &space.id,
+                "/runs/run-b/keep.txt",
+                b"keep",
+                None,
+                "v02-run-b-keep",
+            )
+            .unwrap();
+        engine
+            .write_file(
+                &space.id,
+                "/runs/run-b/new.txt",
+                b"new",
+                None,
+                "v02-run-b-new",
+            )
+            .unwrap();
+        let second_sources = vec!["/runs/run-b".to_owned()];
+        let second = engine
+            .native_export(
+                &app.id,
+                &space.id,
+                &second_sources,
+                &destination,
+                "Destination",
+                NativeExportMode::Directory,
+                ExportConflictPolicy::UpdateChanged,
+                None,
+                ExportBookkeepingPolicy::Internal,
+                ExportPrunePolicy::Tracked,
+                Some("stable-channel"),
+                DirectoryExportLayout::Contents,
+                || false,
+                |_, _, _, _| {},
+                |_| Ok(true),
+            )
+            .unwrap();
+        assert_eq!(second.unchanged, 1);
+        assert_eq!(second.added, 1);
+        assert_eq!(second.deleted, 1);
+        assert!(!destination.join("remove.txt").exists());
+        assert_eq!(
+            fs::read(destination.join("modified.txt")).unwrap(),
+            b"user-modified"
+        );
+        assert_eq!(fs::read(destination.join("new.txt")).unwrap(), b"new");
+        assert!(!destination.join("runs").exists());
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(destination);
+    }
+
+    #[test]
+    fn v02_export_source_hash_mismatch_does_not_replace_destination_target() {
+        let root = temp_root("v02-source-changed");
+        let source = root.join("source.bin");
+        let temp = root.join("target.bin.vontaqfs-tmp");
+        let target = root.join("target.bin");
+        fs::write(&source, b"new-source-bytes").unwrap();
+        fs::write(&target, b"existing-target").unwrap();
+        let expected = sha256_hex(b"different-selected-bytes");
+        let result = copy_file_atomic_stage(&source, &temp, &target, &expected, &|| false, |_| {});
+        assert!(matches!(result, Err(StorageError::ExportSourceChanged)));
+        assert_eq!(fs::read(&target).unwrap(), b"existing-target");
+        assert!(!temp.exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

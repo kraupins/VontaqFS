@@ -28,6 +28,16 @@ pub const EVENT_LONG_POLL_MAX_MS: u64 = 25 * 1000;
 pub const EVENT_BUFFER_CAPACITY: usize = 2048;
 pub const MAX_BATCH_OPERATIONS: usize = 64;
 pub const MAX_BATCH_PAYLOAD_BYTES: usize = 512 * 1024;
+pub const READ_MANY_MAX_ITEMS: usize = 64;
+pub const READ_MANY_MAX_ITEM_BYTES: usize = DIRECT_PAYLOAD_TARGET_BYTES;
+pub const READ_MANY_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+pub const CAPABILITY_BULK_READ: &str = "bulk-read";
+pub const CAPABILITY_SPACE_CLEAR: &str = "space-clear";
+pub const CAPABILITY_DESTINATION_PICKER_HINTS: &str = "destination-picker-hints";
+pub const CAPABILITY_INTERNAL_EXPORT_BOOKKEEPING: &str = "internal-export-bookkeeping";
+pub const CAPABILITY_TRACKED_EXPORT_PRUNE: &str = "tracked-export-prune";
+pub const CAPABILITY_DIRECTORY_CONTENTS_EXPORT: &str = "directory-contents-export";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -89,6 +99,12 @@ impl HealthResponse {
                 "batch".into(),
                 "storage-category".into(),
                 "system-progress-window".into(),
+                CAPABILITY_BULK_READ.into(),
+                CAPABILITY_SPACE_CLEAR.into(),
+                CAPABILITY_DESTINATION_PICKER_HINTS.into(),
+                CAPABILITY_INTERNAL_EXPORT_BOOKKEEPING.into(),
+                CAPABILITY_TRACKED_EXPORT_PRUNE.into(),
+                CAPABILITY_DIRECTORY_CONTENTS_EXPORT.into(),
             ],
         }
     }
@@ -241,6 +257,24 @@ pub struct ListSpacesResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct ClearSpaceRequest {
+    pub request_id: String,
+    pub space_id: String,
+    #[serde(default)]
+    pub operation: Option<OperationRequestWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearSpaceResponse {
+    pub space_id: String,
+    pub deleted_files: u64,
+    pub deleted_kv_entries: u64,
+    pub released_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct KvGetRequest {
     pub space_id: String,
     pub key: String,
@@ -350,6 +384,38 @@ pub struct SmallFileReadRequest {
 pub struct SmallFileReadResponse {
     pub data_base64: String,
     pub file: FileWire,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadManyRequest {
+    pub space_id: String,
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub operation: Option<OperationRequestWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadManyItemResultWire {
+    pub path: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<FileWire>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<BatchItemErrorWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadManyResponse {
+    pub results: Vec<ReadManyItemResultWire>,
+    pub completed_items: u64,
+    pub failed_items: u64,
+    pub total_bytes: u64,
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -587,6 +653,10 @@ pub struct CreateDestinationGrantRequest {
     pub request_id: String,
     pub label: Option<String>,
     pub capability: DirectoryGrantCapabilityWire,
+    #[serde(default)]
+    pub initial_destination_id: Option<String>,
+    #[serde(default)]
+    pub reuse_initial_if_same: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -621,6 +691,27 @@ pub enum ExportConflictPolicyWire {
     UpdateChanged,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExportBookkeepingPolicyWire {
+    Destination,
+    Internal,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExportPrunePolicyWire {
+    None,
+    Tracked,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DirectoryExportLayoutWire {
+    Preserve,
+    Contents,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct StartNativeExportRequest {
@@ -631,6 +722,14 @@ pub struct StartNativeExportRequest {
     pub destination_id: Option<String>,
     pub conflict: ExportConflictPolicyWire,
     pub archive_name: Option<String>,
+    #[serde(default)]
+    pub bookkeeping: Option<ExportBookkeepingPolicyWire>,
+    #[serde(default)]
+    pub prune: Option<ExportPrunePolicyWire>,
+    #[serde(default)]
+    pub tracking_key: Option<String>,
+    #[serde(default)]
+    pub directory_layout: Option<DirectoryExportLayoutWire>,
     pub operation: OperationRequestWire,
 }
 
@@ -838,15 +937,20 @@ pub enum ErrorCode {
     StorageCorrupt,
     RuntimeUpdating,
     RuntimeShuttingDown,
+    CapabilityUnavailable,
     OperationNotFound,
+    OperationLost,
     OperationNotOwned,
     OperationNotCancellable,
     DestinationGrantRequired,
     DestinationGrantRevoked,
+    DestinationBusy,
     DestinationUnavailable,
     DestinationReadOnly,
+    UserCancelled,
     ExportCancelled,
     ExportConflict,
+    ExportSourceChanged,
     ImportCancelled,
     ArchiveUnsupported,
     SnapshotNotFound,
@@ -881,11 +985,87 @@ mod tests {
         assert_eq!(RUNTIME_ENDPOINT_PORTS, [47_833, 47_834, 47_835, 47_836]);
         assert_eq!(health.status, "ready");
         assert!(health.capabilities.contains(&"files".to_owned()));
+        assert!(health
+            .capabilities
+            .contains(&CAPABILITY_BULK_READ.to_owned()));
+        assert!(health
+            .capabilities
+            .contains(&CAPABILITY_SPACE_CLEAR.to_owned()));
+        assert!(health
+            .capabilities
+            .contains(&CAPABILITY_DESTINATION_PICKER_HINTS.to_owned()));
+        assert!(health
+            .capabilities
+            .contains(&CAPABILITY_INTERNAL_EXPORT_BOOKKEEPING.to_owned()));
+        assert!(health
+            .capabilities
+            .contains(&CAPABILITY_TRACKED_EXPORT_PRUNE.to_owned()));
+        assert!(health
+            .capabilities
+            .contains(&CAPABILITY_DIRECTORY_CONTENTS_EXPORT.to_owned()));
     }
 
     #[test]
     fn error_codes_use_stable_wire_names() {
         let encoded = serde_json::to_string(&ErrorCode::AuthInvalid).unwrap();
         assert_eq!(encoded, "\"AUTH_INVALID\"");
+    }
+
+    #[test]
+    fn v02_contracts_remain_protocol_v1_and_old_export_payload_deserializes() {
+        assert_eq!(PROTOCOL_MIN, 1);
+        assert_eq!(PROTOCOL_MAX, 1);
+        assert_eq!(STORAGE_FORMAT_VERSION, 1);
+        assert_eq!(CAPABILITY_BULK_READ, "bulk-read");
+        assert_eq!(CAPABILITY_SPACE_CLEAR, "space-clear");
+        assert_eq!(
+            CAPABILITY_DESTINATION_PICKER_HINTS,
+            "destination-picker-hints"
+        );
+        assert_eq!(
+            CAPABILITY_INTERNAL_EXPORT_BOOKKEEPING,
+            "internal-export-bookkeeping"
+        );
+        assert_eq!(CAPABILITY_TRACKED_EXPORT_PRUNE, "tracked-export-prune");
+        assert_eq!(
+            CAPABILITY_DIRECTORY_CONTENTS_EXPORT,
+            "directory-contents-export"
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::CapabilityUnavailable).unwrap(),
+            "\"CAPABILITY_UNAVAILABLE\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::UserCancelled).unwrap(),
+            "\"USER_CANCELLED\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::OperationLost).unwrap(),
+            "\"OPERATION_LOST\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::DestinationBusy).unwrap(),
+            "\"DESTINATION_BUSY\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::ExportSourceChanged).unwrap(),
+            "\"EXPORT_SOURCE_CHANGED\""
+        );
+
+        let request: StartNativeExportRequest = serde_json::from_value(serde_json::json!({
+            "requestId": "request-1",
+            "spaceId": "space-1",
+            "sourcePaths": ["/out"],
+            "mode": "directory",
+            "destinationId": null,
+            "conflict": "update-changed",
+            "archiveName": null,
+            "operation": { "id": "operation-1", "presentation": "client" }
+        }))
+        .unwrap();
+        assert_eq!(request.bookkeeping, None);
+        assert_eq!(request.prune, None);
+        assert_eq!(request.tracking_key, None);
+        assert_eq!(request.directory_layout, None);
     }
 }
