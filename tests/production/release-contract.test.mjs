@@ -132,8 +132,8 @@ test('developer guide is public SDK/API documentation rather than owner release 
   assert.match(developerReadme, /47833.*47836/s);
   assert.match(wiki021, /@vontaq\/fs@0\.2\.1/);
   assert.match(wiki021, /createFigmaMainHostAdapter/);
-  assert.match(wiki021, /timeoutMode: "none"/);
-  assert.match(wiki021, /## Русская версия для Wiki/);
+  assert.match(wiki021, /requestTimeoutMs[\s\S]*omitted[\s\S]*do not receive an arbitrary wall-clock hard timeout/);
+  assert.match(wiki021, /## Русский/);
   assert.match(changelog, /## \[0\.2\.1\]/);
   assert.match(changelog, /TRANSPORT_CANCELLED/);
   for (const internal of ['WINDOWS_SIGNING_MODE', 'TAURI_SIGNING_PRIVATE_KEY', 'production-release', 'GitHub Environment']) {
