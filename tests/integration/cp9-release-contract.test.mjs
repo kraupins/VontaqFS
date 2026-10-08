@@ -8,6 +8,8 @@ import test from 'node:test';
 const releaseWorkflow = await readFile(new URL('../../.github/workflows/release.yml', import.meta.url), 'utf8');
 const tauri = JSON.parse(await readFile(new URL('../../src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
 const sdk = JSON.parse(await readFile(new URL('../../packages/sdk/package.json', import.meta.url), 'utf8'));
+const releaseVersion = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8')).version;
+const releaseTag = `v${releaseVersion}`;
 const provisioning = await readFile(new URL('../../docs/developer/PRODUCTION_RELEASE.md', import.meta.url), 'utf8');
 const verifierPath = new URL('../../scripts/release/verify-assets.mjs', import.meta.url);
 const updaterPath = new URL('../../scripts/release/generate-updater-json.mjs', import.meta.url);
@@ -95,20 +97,20 @@ test('CP9 updater manifest and checksum scripts produce and verify four-platform
   const dir = await mkdtemp(path.join(tmpdir(), 'vontaqfs-cp9-'));
   try {
     const assets = [
-      'VontaqFS_0.2.0_windows-x86_64-setup.exe',
-      'VontaqFS_0.2.0_windows-x86_64.msi',
-      'VontaqFS_0.2.0_windows-aarch64-setup.exe',
-      'VontaqFS_0.2.0_windows-aarch64.msi',
-      'VontaqFS_0.2.0_darwin-aarch64.dmg',
-      'VontaqFS_0.2.0_darwin-aarch64.app.tar.gz',
-      'VontaqFS_0.2.0_darwin-x86_64.dmg',
-      'VontaqFS_0.2.0_darwin-x86_64.app.tar.gz',
+      `VontaqFS_${releaseVersion}_windows-x86_64-setup.exe`,
+      `VontaqFS_${releaseVersion}_windows-x86_64.msi`,
+      `VontaqFS_${releaseVersion}_windows-aarch64-setup.exe`,
+      `VontaqFS_${releaseVersion}_windows-aarch64.msi`,
+      `VontaqFS_${releaseVersion}_darwin-aarch64.dmg`,
+      `VontaqFS_${releaseVersion}_darwin-aarch64.app.tar.gz`,
+      `VontaqFS_${releaseVersion}_darwin-x86_64.dmg`,
+      `VontaqFS_${releaseVersion}_darwin-x86_64.app.tar.gz`,
     ];
     for (const name of assets) await writeFile(path.join(dir, name), `fixture:${name}`);
     for (const name of assets.filter((name) => name.endsWith('-setup.exe') || name.endsWith('.app.tar.gz'))) {
       await writeFile(path.join(dir, `${name}.sig`), `signature:${name}`);
     }
-    let result = run(updaterPath, ['--dir', dir, '--repo', 'kraupins/VontaqFS', '--tag', 'v0.2.0', '--version', '0.2.0']);
+    let result = run(updaterPath, ['--dir', dir, '--repo', 'kraupins/VontaqFS', '--tag', releaseTag, '--version', releaseVersion]);
     assert.equal(result.status, 0, result.stderr);
     result = run(checksumsPath, [dir]);
     assert.equal(result.status, 0, result.stderr);
@@ -123,7 +125,7 @@ test('CP9 updater manifest and checksum scripts produce and verify four-platform
 });
 
 test('CP9 immutable release gate accepts the current coherent version/tag contract', () => {
-  const result = run(releaseGatePath, ['--tag', 'v0.2.0'], { cwd: path.resolve(new URL('../..', import.meta.url).pathname) });
+  const result = run(releaseGatePath, ['--tag', releaseTag], { cwd: path.resolve(new URL('../..', import.meta.url).pathname) });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /\"ok\": true/);
 });

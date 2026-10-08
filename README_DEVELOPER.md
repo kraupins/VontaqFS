@@ -2,7 +2,11 @@
 
 VontaqFS is a local-first desktop storage runtime. Applications connect through the public TypeScript package `@vontaq/fs`; filesystem paths, pairing credentials and runtime internals stay behind the SDK/runtime boundary.
 
+**Recommended baseline:** use `@vontaq/fs@0.2.1` or newer for new integrations. Version 0.2.1 is the stabilized compatibility baseline for the supported Figma Plugin host path. Earlier 0.1.x and 0.2.0 releases remain compatible with their existing persisted data and protocol contracts, but they do not contain the complete 0.2.1 Figma host integration.
+
 VontaqFS — локальный desktop-runtime хранения данных. Приложения подключаются через публичный TypeScript-пакет `@vontaq/fs`; физические пути файловой системы, pairing credentials и внутреннее устройство runtime не входят в обычный API клиента.
+
+**Рекомендуемая базовая версия:** для новых интеграций используйте `@vontaq/fs@0.2.1` или новее. Версия 0.2.1 — стабилизированная база совместимости для поддерживаемой интеграции с Figma Plugin. Релизы 0.1.x и 0.2.0 сохраняют совместимость со своими существующими данными и protocol contracts, но не содержат полного Figma host path из 0.2.1.
 
 ---
 
@@ -22,6 +26,14 @@ import { createFigmaConnectOptions } from '@vontaq/fs/figma';
 ```
 
 A compatible VontaqFS Desktop application must be installed and running on the user's computer. The SDK automatically discovers the official local runtime endpoint; production integrations should not probe or hard-code a single port themselves.
+
+For a new Figma Plugin integration, pin the supported baseline explicitly while adopting the host adapter:
+
+```bash
+npm install @vontaq/fs@^0.2.1
+```
+
+Updating from 0.1.x or 0.2.0 to 0.2.1 does not require a destructive VFS data migration: wire protocol v1, storage/registry format v1, pairing identity and existing persisted spaces/files remain compatible.
 
 ### 2. Connection and pairing
 
@@ -410,35 +422,79 @@ try {
 }
 ```
 
-Common codes include `RUNTIME_UNREACHABLE`, `PAIRING_REQUIRED`, `AUTH_REVOKED`, `PERMISSION_DENIED`, `NOT_FOUND`, `CONFLICT`, `MATERIALIZATION_LIMIT`, `QUOTA_EXCEEDED`, `DISK_SPACE_LOW`, `CAPABILITY_UNAVAILABLE`, `USER_CANCELLED`, `OPERATION_LOST`, `DESTINATION_GRANT_REQUIRED`, `DESTINATION_BUSY`, `EXPORT_CANCELLED`, `EXPORT_SOURCE_CHANGED`, `IMPORT_CANCELLED`, `SNAPSHOT_NOT_FOUND` and `BATCH_CANCELLED`.
+Common codes include `RUNTIME_UNREACHABLE`, `RUNTIME_DISCONNECTED`, `TRANSPORT_ERROR`, `TRANSPORT_TIMEOUT`, `TRANSPORT_CANCELLED`, `PAIRING_REQUIRED`, `AUTH_REVOKED`, `PERMISSION_DENIED`, `NOT_FOUND`, `CONFLICT`, `MATERIALIZATION_LIMIT`, `QUOTA_EXCEEDED`, `DISK_SPACE_LOW`, `CAPABILITY_UNAVAILABLE`, `USER_CANCELLED`, `OPERATION_LOST`, `DESTINATION_GRANT_REQUIRED`, `DESTINATION_BUSY`, `EXPORT_CANCELLED`, `EXPORT_SOURCE_CHANGED`, `IMPORT_CANCELLED`, `SNAPSHOT_NOT_FOUND` and `BATCH_CANCELLED`.
+
+Transport/liveness codes are intentionally distinct in 0.2.1:
+
+- `RUNTIME_UNREACHABLE` — initial discovery could not find a usable runtime.
+- `RUNTIME_DISCONNECTED` — a previously connected client has evidence that the runtime is no longer reachable.
+- `TRANSPORT_ERROR` — the request path failed, but runtime presence has not been disproven.
+- `TRANSPORT_TIMEOUT` — an actual transport deadline fired.
+- `TRANSPORT_CANCELLED` — local cancellation/abort.
 
 The complete exported list is `VONTAQ_FS_ERROR_CODES`.
 
-### 16. Figma plugins and widgets
+### 16. Figma Plugin integration
 
-Figma-specific helpers are exported from `@vontaq/fs/figma`.
+Production Figma integration uses the public composable main↔UI adapter from `@vontaq/fs/figma`. Figma main does **not** need global `fetch`, Web Crypto, `TextEncoder`, `TextDecoder` or `AbortController` for VontaqFS. The hidden UI iframe owns browser `fetch()` and Web Crypto; the main adapter relays only the official localhost VFS endpoints and supplies connection-scoped secure entropy.
+
+**Figma main:**
 
 ```ts
 import { VontaqFS } from '@vontaq/fs';
 import {
   bindFigmaDocument,
   createFigmaConnectOptions,
+  createFigmaMainHostAdapter,
 } from '@vontaq/fs/figma';
 
+figma.showUI(__html__, { visible: false, width: 1, height: 1 });
+
+const host = createFigmaMainHostAdapter({
+  postMessage: message => figma.ui.postMessage(message),
+});
+
+figma.ui.onmessage = async message => {
+  if (host.handleUiMessage(message)) return;
+  // Handle application-specific UI messages here.
+};
+
+await host.ready();
+
 const fs = await VontaqFS.connect({
-  ...createFigmaConnectOptions(figma, { displayName: 'Example Figma Plugin' }),
+  ...createFigmaConnectOptions(figma, {
+    displayName: 'Example Figma Plugin',
+    host,
+  }),
   onPairingRequired() {
     figma.notify('Approve access in VontaqFS Desktop');
   },
 });
 
-const document = await bindFigmaDocument(figma);
+const document = await bindFigmaDocument(figma, { secureRandom: host.secureRandom });
 const workspace = await fs.workspace(document.id, { displayName: document.displayName });
+
+// In scanner-constrained Figma bundles use bracket syntax for the import method.
+const space = workspace.storage;
+await space["import"]({ /* import options */ });
 ```
 
-`createFigmaConnectOptions()` uses Figma `clientStorage` for SDK pairing state and derives the application identity from the official `pluginId`/`widgetId` exposed by Figma.
+**Figma UI:**
 
-`bindFigmaDocument()` stores a versioned, non-secret document binding in plugin data.
+```ts
+import { handleVontaqFSFigmaUiMessage } from '@vontaq/fs/figma';
+
+window.onmessage = async event => {
+  const message = event.data?.pluginMessage;
+  if (await handleVontaqFSFigmaUiMessage(message, {
+    postMessage: reply => parent.postMessage({ pluginMessage: reply }, '*'),
+  })) return;
+
+  // Handle application-specific UI messages here.
+};
+```
+
+The helpers are composable: they do not replace your global application message handlers. `createFigmaConnectOptions()` keeps the existing Figma `clientStorage` pairing identity/state and, when `host` is provided, supplies the official relay transport plus `host.secureRandom`. `bindFigmaDocument()` stores the same versioned non-secret document binding as previous releases; passing `host.secureRandom` removes a separate main-thread Web Crypto dependency. Entropy is cryptographically secure and fail-closed: there is no `Math.random()` or deterministic fallback.
 
 Published Figma manifests must allow the official loopback endpoints. The SDK exports both `VONTAQ_FS_FIGMA_NETWORK_ACCESS` and `createVontaqFSFigmaNetworkAccess()` for build tooling. The current endpoint set is:
 
@@ -455,6 +511,23 @@ Published Figma manifests must allow the official loopback endpoints. The SDK ex
   }
 }
 ```
+
+**Timeout and liveness behavior.** `discoveryTimeoutMs` bounds each discovery attempt. If `requestTimeoutMs` is omitted, authenticated operational requests use no arbitrary wall-clock hard timeout; a valid long write/analyze flow can therefore exceed 10/60/90 seconds. If you explicitly set `requestTimeoutMs`, that keeps the legacy hard-timeout intent for operational requests. Watch/event long polling uses its own bounded policy. Do not treat elapsed operation time by itself as proof that the runtime disconnected.
+
+**Binary and streams.** The UI relay supports text and binary request/response bodies and materializes binary request bodies as ordinary `ArrayBuffer` values before browser `fetch()`. SDK streamed writes use the runtime's idempotent same-sequence retry contract; local sequence/checksum state advances only after a confirmed ACK.
+
+**Recovery/troubleshooting.**
+
+- `RUNTIME_UNREACHABLE` during connect: start/update VontaqFS Desktop and confirm the manifest contains all official loopback endpoints.
+- `PAIRING_REQUIRED`: approve the request in VontaqFS Desktop; saved client identity survives normal plugin restarts.
+- `TRANSPORT_ERROR`/`TRANSPORT_TIMEOUT`: do not erase pairing state automatically; the request path may have failed while the runtime is still healthy.
+- `RUNTIME_DISCONNECTED`: reconnect using the same application identity/state store after the runtime becomes available again.
+- Use `resetPairingState(stateStore)` only for an explicit “forget/reconnect pairing” action; it preserves the client identity while removing the saved pairing credential.
+- Always call `host.close()` when the plugin integration is shutting down so pending relay/entropy requests are cancelled.
+
+The repository fixture under `examples/figma-plugin/` builds both main and UI bundles using only public `@vontaq/fs` APIs.
+
+**Widgets.** `getFigmaClientIdentity()` / `createFigmaConnectOptions()` can derive an application identity from `figma.widgetId`, but the 0.2.1 production host path documented and release-gated here is the **Figma Plugin main + UI iframe** integration. Do not treat the plugin relay example as a verified Figma Widget transport contract unless your widget host provides an equivalent supported bridge and you validate it in that host.
 
 ### 17. Runtime lifecycle
 
@@ -493,6 +566,14 @@ import { createFigmaConnectOptions } from '@vontaq/fs/figma';
 ```
 
 На компьютере пользователя должен быть установлен и запущен совместимый VontaqFS Desktop. SDK самостоятельно находит официальный локальный runtime; production-интеграции не должны вручную перебирать порты или рассчитывать на один фиксированный порт.
+
+Для новой интеграции с Figma Plugin при подключении host adapter рекомендуется явно использовать стабилизированную базовую версию:
+
+```bash
+npm install @vontaq/fs@^0.2.1
+```
+
+Переход с 0.1.x или 0.2.0 на 0.2.1 не требует destructive migration данных VFS: wire protocol v1, storage/registry format v1, pairing identity и существующие spaces/files остаются совместимыми.
 
 ### 2. Подключение и pairing
 
@@ -831,7 +912,7 @@ if (capabilities.snapshots) {
 
 ### 15. Ошибки
 
-Ошибки SDK/runtime представлены `VontaqFSError` со стабильным `code`:
+SDK/runtime ошибки используют `VontaqFSError` со стабильным `code`:
 
 ```ts
 import { isVontaqFSError } from '@vontaq/fs';
@@ -845,35 +926,79 @@ try {
 }
 ```
 
-Частые коды: `RUNTIME_UNREACHABLE`, `PAIRING_REQUIRED`, `AUTH_REVOKED`, `PERMISSION_DENIED`, `NOT_FOUND`, `CONFLICT`, `MATERIALIZATION_LIMIT`, `QUOTA_EXCEEDED`, `DISK_SPACE_LOW`, `CAPABILITY_UNAVAILABLE`, `USER_CANCELLED`, `OPERATION_LOST`, `DESTINATION_GRANT_REQUIRED`, `DESTINATION_BUSY`, `EXPORT_CANCELLED`, `EXPORT_SOURCE_CHANGED`, `IMPORT_CANCELLED`, `SNAPSHOT_NOT_FOUND`, `BATCH_CANCELLED`.
+Частые коды: `RUNTIME_UNREACHABLE`, `RUNTIME_DISCONNECTED`, `TRANSPORT_ERROR`, `TRANSPORT_TIMEOUT`, `TRANSPORT_CANCELLED`, `PAIRING_REQUIRED`, `AUTH_REVOKED`, `PERMISSION_DENIED`, `NOT_FOUND`, `CONFLICT`, `MATERIALIZATION_LIMIT`, `QUOTA_EXCEEDED`, `DISK_SPACE_LOW`, `CAPABILITY_UNAVAILABLE`, `USER_CANCELLED`, `OPERATION_LOST`, `DESTINATION_GRANT_REQUIRED`, `DESTINATION_BUSY`, `EXPORT_CANCELLED`, `EXPORT_SOURCE_CHANGED`, `IMPORT_CANCELLED`, `SNAPSHOT_NOT_FOUND`, `BATCH_CANCELLED`.
+
+В 0.2.1 transport/liveness ошибки разделены намеренно:
+
+- `RUNTIME_UNREACHABLE` — initial discovery не нашёл доступный runtime.
+- `RUNTIME_DISCONNECTED` — для уже подключённого клиента подтверждено, что runtime больше недоступен.
+- `TRANSPORT_ERROR` — сломался путь запроса, но отсутствие runtime ещё не доказано.
+- `TRANSPORT_TIMEOUT` — реально сработал transport deadline.
+- `TRANSPORT_CANCELLED` — локальная отмена/abort.
 
 Полный список экспортируется как `VONTAQ_FS_ERROR_CODES`.
 
-### 16. Figma plugins и widgets
+### 16. Интеграция с Figma Plugin
 
-Figma helpers находятся в `@vontaq/fs/figma`:
+Production-интеграция Figma использует публичный composable main↔UI adapter из `@vontaq/fs/figma`. Для VontaqFS в Figma main больше не требуются глобальные `fetch`, Web Crypto, `TextEncoder`, `TextDecoder` или `AbortController`. Скрытый UI iframe владеет browser `fetch()` и Web Crypto; main adapter ретранслирует только официальные localhost VFS endpoints и отдаёт connection-scoped secure entropy.
+
+**Figma main:**
 
 ```ts
 import { VontaqFS } from '@vontaq/fs';
 import {
   bindFigmaDocument,
   createFigmaConnectOptions,
+  createFigmaMainHostAdapter,
 } from '@vontaq/fs/figma';
 
+figma.showUI(__html__, { visible: false, width: 1, height: 1 });
+
+const host = createFigmaMainHostAdapter({
+  postMessage: message => figma.ui.postMessage(message),
+});
+
+figma.ui.onmessage = async message => {
+  if (host.handleUiMessage(message)) return;
+  // Здесь обрабатываются сообщения самого приложения.
+};
+
+await host.ready();
+
 const fs = await VontaqFS.connect({
-  ...createFigmaConnectOptions(figma, { displayName: 'Example Figma Plugin' }),
+  ...createFigmaConnectOptions(figma, {
+    displayName: 'Example Figma Plugin',
+    host,
+  }),
   onPairingRequired() {
     figma.notify('Подтвердите доступ в VontaqFS Desktop');
   },
 });
 
-const document = await bindFigmaDocument(figma);
+const document = await bindFigmaDocument(figma, { secureRandom: host.secureRandom });
 const workspace = await fs.workspace(document.id, { displayName: document.displayName });
+
+// В scanner-constrained Figma bundle используйте bracket syntax для метода import.
+const space = workspace.storage;
+await space["import"]({ /* import options */ });
 ```
 
-`createFigmaConnectOptions()` использует Figma `clientStorage` для pairing-состояния SDK и получает identity из официального `pluginId`/`widgetId` Figma.
+**Figma UI:**
 
-`bindFigmaDocument()` сохраняет версионированный несекретный document binding в plugin data.
+```ts
+import { handleVontaqFSFigmaUiMessage } from '@vontaq/fs/figma';
+
+window.onmessage = async event => {
+  const message = event.data?.pluginMessage;
+  if (await handleVontaqFSFigmaUiMessage(message, {
+    postMessage: reply => parent.postMessage({ pluginMessage: reply }, '*'),
+  })) return;
+
+  // Здесь обрабатываются сообщения самого приложения.
+};
+```
+
+Helpers composable: они не заменяют глобальные message handlers приложения. `createFigmaConnectOptions()` сохраняет существующие Figma `clientStorage` pairing identity/state и при переданном `host` добавляет официальный relay transport и `host.secureRandom`. `bindFigmaDocument()` сохраняет тот же versioned non-secret document binding, что и раньше; передача `host.secureRandom` убирает отдельную зависимость от Web Crypto в main. Entropy криптографически стойкая и fail-closed: fallback через `Math.random()` или детерминированные значения отсутствует.
 
 В manifest публичного Figma-плагина должны быть разрешены официальные loopback endpoints. Для build tooling SDK экспортирует `VONTAQ_FS_FIGMA_NETWORK_ACCESS` и `createVontaqFSFigmaNetworkAccess()`.
 
@@ -890,6 +1015,23 @@ const workspace = await fs.workspace(document.id, { displayName: document.displa
   }
 }
 ```
+
+**Timeout и liveness.** `discoveryTimeoutMs` ограничивает каждую попытку discovery. Если `requestTimeoutMs` не задан, authenticated operational requests не получают произвольный wall-clock hard timeout, поэтому валидная длительная write/analyze операция может работать дольше 10/60/90 секунд. Если `requestTimeoutMs` задан явно, сохраняется legacy hard-timeout intent для operational requests. Watch/event long polling использует отдельную ограниченную политику. Само по себе прошедшее время не считается доказательством disconnect.
+
+**Binary и streams.** UI relay поддерживает text/binary request/response bodies и перед browser `fetch()` материализует binary body в обычный `ArrayBuffer`. Streamed writes используют idempotent same-sequence retry runtime; локальные sequence/checksum продвигаются только после подтверждённого ACK.
+
+**Recovery/troubleshooting.**
+
+- `RUNTIME_UNREACHABLE` при connect: запустите/обновите VontaqFS Desktop и проверьте, что manifest содержит все официальные loopback endpoints.
+- `PAIRING_REQUIRED`: подтвердите запрос в VontaqFS Desktop; сохранённая client identity переживает обычный restart плагина.
+- `TRANSPORT_ERROR`/`TRANSPORT_TIMEOUT`: не удаляйте pairing state автоматически — мог сломаться только request path.
+- `RUNTIME_DISCONNECTED`: после возвращения runtime подключитесь заново с той же application identity/state store.
+- `resetPairingState(stateStore)` используйте только для явного действия «forget/reconnect pairing»: helper сохраняет client identity, удаляя сохранённый pairing credential.
+- При завершении интеграции вызывайте `host.close()`, чтобы отменить pending relay/entropy requests.
+
+Repository fixture `examples/figma-plugin/` собирает main и UI bundle только на публичных API `@vontaq/fs`.
+
+**Widgets.** `getFigmaClientIdentity()` / `createFigmaConnectOptions()` умеют получить application identity из `figma.widgetId`, но production host path, документированный и release-gated в 0.2.1, — это именно **Figma Plugin main + UI iframe**. Не следует считать plugin relay автоматически подтверждённым transport contract для Figma Widget без эквивалентного поддерживаемого bridge и отдельной проверки в widget host.
 
 ### 17. Завершение работы клиента
 
@@ -917,7 +1059,9 @@ await fs.close();
 - module format: ESM
 - package Node engine metadata: Node.js 18+
 - production runtime endpoint pool: `localhost:47833`–`localhost:47836`
-- package/product version in this release: `0.2.0`
+- package/product version in this release: `0.2.1`
+- recommended baseline for new Figma Plugin integrations: `>=0.2.1`
+- 0.1.x and 0.2.0: historical preview/integration releases; existing compatible data is preserved, but the stabilized public Figma Plugin host path starts at 0.2.1
 - protocol range in this release: v1
 - storage/registry format in this release: v1
 - package includes compiled JavaScript, TypeScript declarations, source maps, this guide, `CHANGELOG.md` and the VontaqFS license

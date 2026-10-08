@@ -1,6 +1,43 @@
 # Changelog
 
-All notable public changes to VontaqFS are documented here. VontaqFS keeps wire protocol version `1` and storage/registry format version `1` in the 0.2 release line.
+All notable public changes to VontaqFS are documented here.
+
+**Version guidance:** `0.2.1` is the recommended compatibility baseline for new integrations and the supported baseline for new Figma Plugin integrations. The 0.1.x line was an early preview and 0.2.0 was an integration-preview release. Existing compatible VontaqFS data from those releases remains supported; the 0.2 line continues to use wire protocol v1 and storage/registry format v1.
+
+## [0.2.1] - 2026-10-08
+
+### Added
+
+- Official Figma Plugin main↔UI integration in `@vontaq/fs/figma` through `createFigmaMainHostAdapter()` and `handleVontaqFSFigmaUiMessage()`.
+- Connection-scoped secure-random injection through `VontaqFSSecureRandomSource`, including secure document binding with `bindFigmaDocument(..., { secureRandom })`.
+- Independent `discoveryTimeoutMs` configuration so runtime discovery can stay bounded without imposing the same deadline on authenticated operations.
+- Distinct transport/liveness errors: `TRANSPORT_ERROR`, `TRANSPORT_TIMEOUT`, `TRANSPORT_CANCELLED` and `RUNTIME_DISCONNECTED`.
+- A buildable `examples/figma-plugin/` reference integration with main, UI and the complete localhost manifest allowlist.
+
+### Changed
+
+- SDK UTF-8 handling is host-neutral and no longer requires browser `TextEncoder` / `TextDecoder` globals.
+- When `requestTimeoutMs` is omitted, authenticated operational requests no longer receive an implicit wall-clock hard timeout. Explicit `requestTimeoutMs` keeps hard-timeout behavior for callers that intentionally opt into it.
+- Figma Plugin localhost HTTP and secure entropy use the public main↔UI host adapter instead of requiring browser-like globals in Figma main.
+- Figma-scanner-sensitive SDK output is parser-safe. Figma examples use `space["import"](...)`; the existing `space.import(...)` API remains compatible in normal JavaScript environments.
+- Retry-safe streamed writes preserve the same stream/sequence identity until delivery is acknowledged, and commit retries reuse the same stream/session identity and checksum.
+
+### Fixed
+
+- Figma Plugin integration no longer depends on main-sandbox globals that are not guaranteed by the supported host path, including Web Crypto, `fetch`, `AbortController`, `TextEncoder` and `TextDecoder`.
+- Operational transport failures are no longer reported as initial-discovery `RUNTIME_UNREACHABLE` when runtime absence has not actually been established.
+- Valid long-running operations and stream chunks are no longer failed solely because an implicit client wall-clock deadline elapsed.
+- Binary request bodies relayed through the Figma UI are materialized as ordinary `ArrayBuffer` values before browser `fetch()`.
+
+### Compatibility
+
+- VFS wire protocol remains version `1`.
+- Storage/registry format remains version `1`.
+- Existing pairing identity/credential keys and Figma document-binding version remain unchanged.
+- Existing persisted VontaqFS spaces/files and content-addressed data remain compatible; no destructive VFS data migration is required for 0.2.1.
+- Existing `requestTimeoutMs` remains supported; callers that explicitly set it retain hard operational timeout semantics.
+- Existing `space.import(...)` source remains API-compatible outside scanner-constrained Figma bundles.
+- For new Figma Plugin integrations, use `@vontaq/fs@0.2.1` or newer and follow the public main+UI adapter example.
 
 ## [0.2.0] - 2026-10-06
 

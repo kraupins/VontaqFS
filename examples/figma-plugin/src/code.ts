@@ -1,6 +1,7 @@
 import { VontaqFS } from '@vontaq/fs';
-import { bindFigmaDocument, createFigmaConnectOptions } from '@vontaq/fs/figma';
+import { bindFigmaDocument, createFigmaConnectOptions, createFigmaMainHostAdapter } from '@vontaq/fs/figma';
 
+declare const __html__: string;
 declare const figma: {
   pluginId?: string;
   widgetId?: string;
@@ -14,31 +15,54 @@ declare const figma: {
     getPluginData(key: string): string;
     setPluginData(key: string, value: string): void;
   };
+  ui: {
+    postMessage(message: unknown): void;
+    onmessage: ((message: unknown) => void | Promise<void>) | undefined;
+  };
+  showUI(html: string, options?: { visible?: boolean; width?: number; height?: number }): void;
   notify(message: string): void;
   closePlugin(): void;
 };
 
 async function main(): Promise<void> {
-  const client = await VontaqFS.connect({
-    ...createFigmaConnectOptions(figma, { displayName: 'VontaqFS Example' }),
-    onPairingRequired: () => figma.notify('Approve VontaqFS access in the VontaqFS window.'),
-  });
+  figma.showUI(__html__, { visible: false, width: 1, height: 1 });
 
-  const binding = await bindFigmaDocument(figma);
-  const documentSpace = await client.openSpace({
-    key: `figma-document:${binding.id}`,
-    displayName: binding.displayName,
-    storageClass: 'persistent',
+  const host = createFigmaMainHostAdapter({
+    postMessage: message => figma.ui.postMessage(message),
   });
+  figma.ui.onmessage = async message => {
+    if (host.handleUiMessage(message)) return;
+    // Handle application-specific UI messages here.
+  };
 
-  await documentSpace.files.writeJSON('/example.json', {
-    savedAt: new Date().toISOString(),
-    documentBindingId: binding.id,
-  });
+  try {
+    await host.ready();
+    const client = await VontaqFS.connect({
+      ...createFigmaConnectOptions(figma, { displayName: 'VontaqFS Example', host }),
+      onPairingRequired: () => figma.notify('Approve VontaqFS access in the VontaqFS window.'),
+    });
 
-  const restored = await documentSpace.files.readJSON<{ savedAt: string }>('/example.json');
-  figma.notify(`VontaqFS restored data saved at ${restored.savedAt}`);
-  await client.close();
+    try {
+      const binding = await bindFigmaDocument(figma, { secureRandom: host.secureRandom });
+      const documentSpace = await client.openSpace({
+        key: `figma-document:${binding.id}`,
+        displayName: binding.displayName,
+        storageClass: 'persistent',
+      });
+
+      await documentSpace.files.writeJSON('/example.json', {
+        savedAt: new Date().toISOString(),
+        documentBindingId: binding.id,
+      });
+
+      const restored = await documentSpace.files.readJSON<{ savedAt: string }>('/example.json');
+      figma.notify(`VontaqFS restored data saved at ${restored.savedAt}`);
+    } finally {
+      await client.close();
+    }
+  } finally {
+    host.close();
+  }
 }
 
 main()

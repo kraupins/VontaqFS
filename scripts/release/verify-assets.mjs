@@ -17,7 +17,7 @@ const required = [
 for (const [label, marker, suffix] of required) {
   const matches = names.filter((name) => name.includes(marker) && name.endsWith(suffix));
   if (matches.length !== 1) throw new Error(`Release assets: ${label} expected exactly once, found ${matches.length}: ${matches.join(', ')}`);
-  if ((suffix === '-setup.exe' || suffix === '.app.tar.gz') && !names.includes(`${matches[0]}.sig`)) {
+  if ((suffix === '-setup.exe' || suffix === '.msi' || suffix === '.app.tar.gz') && !names.includes(`${matches[0]}.sig`)) {
     throw new Error(`Release assets: signed updater signature missing for ${matches[0]}.`);
   }
 }
@@ -25,7 +25,7 @@ for (const metadata of ['latest.json', 'SHA256SUMS.txt']) {
   if (!names.includes(metadata)) throw new Error(`Release assets: ${metadata} is missing.`);
 }
 const latest = JSON.parse(fs.readFileSync(path.join(directory, 'latest.json'), 'utf8'));
-for (const key of ['windows-x86_64', 'windows-aarch64', 'darwin-x86_64', 'darwin-aarch64']) {
+for (const key of ['windows-x86_64-nsis', 'windows-x86_64-msi', 'windows-aarch64-nsis', 'windows-aarch64-msi', 'windows-x86_64', 'windows-aarch64', 'darwin-x86_64', 'darwin-aarch64']) {
   if (!latest.platforms?.[key]?.url || !latest.platforms?.[key]?.signature) throw new Error(`Release assets: latest.json is missing ${key} URL/signature.`);
 }
 process.stdout.write(`Release asset verification passed (${names.length} files).\n`);

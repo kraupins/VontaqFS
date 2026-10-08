@@ -14,6 +14,9 @@ const releaseWorkflow = read('.github/workflows/release.yml');
 const runner = read('scripts/test-rust-release.mjs');
 const tauriConfig = json('src-tauri/tauri.conf.json');
 const updaterOverlay = read('scripts/release/prepare-updater-config.mjs');
+const updaterGenerator = read('scripts/release/generate-updater-json.mjs');
+const updaterRepair = read('scripts/release/repair-published-updater.mjs');
+const updaterPublishedVerifier = read('scripts/release/verify-published-updater.mjs');
 const tauri = read('src-tauri/src/lib.rs');
 const tauriMain = read('src-tauri/src/main.rs');
 const desktopApi = read('apps/desktop/src/desktopApi.ts');
@@ -22,6 +25,8 @@ const desktopI18n = read('apps/desktop/src/i18n.tsx');
 const clientReadme = read('README.md');
 const developerReadme = read('README_DEVELOPER.md');
 const privacy = read('PRIVACY.md');
+const changelog = read('CHANGELOG.md');
+const wiki021 = read('WIKI_UPDATE_0.2.1.md');
 const license = read('LICENSE');
 
 function collectMarkdown(dir, base = dir) {
@@ -36,7 +41,7 @@ function collectMarkdown(dir, base = dir) {
 }
 
 test('production documentation set includes release history and Wiki handoff while core public docs stay bilingual', () => {
-  assert.deepEqual(collectMarkdown(root), ['CHANGELOG.md', 'PRIVACY.md', 'README.md', 'README_DEVELOPER.md', 'WIKI_UPDATE_0.2.0.md']);
+  assert.deepEqual(collectMarkdown(root), ['CHANGELOG.md', 'PRIVACY.md', 'README.md', 'README_DEVELOPER.md', 'WIKI_UPDATE_0.2.0.md', 'WIKI_UPDATE_0.2.1.md']);
   for (const body of [clientReadme, developerReadme, privacy]) {
     assert.match(body, /## English/);
     assert.match(body, /## Русский/);
@@ -80,6 +85,21 @@ test('local installers stay updater-key-free while production builds generate si
   assert.match(updaterOverlay, /VONTAQFS_UPDATE_ENDPOINT/);
   assert.match(releaseWorkflow, /Generate production updater Tauri overlay[\s\S]*prepare-updater-config\.mjs/);
   assert.match(releaseWorkflow, /--config src-tauri\/tauri\.release\.updater\.conf\.json/);
+  assert.match(tauri, /restart_after_install\(true\)/);
+});
+
+test('Windows updater manifest preserves installer family with legacy fallback and repair tooling', () => {
+  for (const key of ['windows-x86_64-nsis', 'windows-x86_64-msi', 'windows-aarch64-nsis', 'windows-aarch64-msi']) {
+    assert.ok(updaterGenerator.includes(key), `missing updater target ${key}`);
+  }
+  assert.match(updaterGenerator, /legacyWindowsInstaller/);
+  assert.match(updaterRepair, /__TAURI_BUNDLE_TYPE_VAR_MSI/);
+  assert.match(updaterRepair, /__TAURI_BUNDLE_TYPE_VAR_NSS/);
+  assert.match(updaterRepair, /\['release', 'upload'[\s\S]*#latest\.json/);
+  assert.equal(pkg.scripts['release:repair-updater'], 'node scripts/release/repair-published-updater.mjs');
+  assert.equal(pkg.scripts['release:verify-published-updater'], 'node scripts/release/verify-published-updater.mjs');
+  assert.match(updaterPublishedVerifier, /windows-x86_64-msi/);
+  assert.match(updaterPublishedVerifier, /Range: 'bytes=0-0'/);
 });
 
 test('GitHub production release blocks on full release tests and explicit timeouts', () => {
@@ -103,7 +123,19 @@ test('developer guide is public SDK/API documentation rather than owner release 
   assert.match(developerReadme, /FileAPI/);
   assert.match(developerReadme, /Key\/value API/);
   assert.match(developerReadme, /@vontaq\/fs\/figma/);
+  assert.match(developerReadme, /createFigmaMainHostAdapter/);
+  assert.match(developerReadme, /handleVontaqFSFigmaUiMessage/);
+  assert.match(developerReadme, /discoveryTimeoutMs/);
+  assert.match(developerReadme, /RUNTIME_DISCONNECTED/);
+  assert.match(developerReadme, /TRANSPORT_ERROR/);
+  assert.ok(developerReadme.includes('space["import"]'));
   assert.match(developerReadme, /47833.*47836/s);
+  assert.match(wiki021, /@vontaq\/fs@0\.2\.1/);
+  assert.match(wiki021, /createFigmaMainHostAdapter/);
+  assert.match(wiki021, /timeoutMode: "none"/);
+  assert.match(wiki021, /## Русская версия для Wiki/);
+  assert.match(changelog, /## \[0\.2\.1\]/);
+  assert.match(changelog, /TRANSPORT_CANCELLED/);
   for (const internal of ['WINDOWS_SIGNING_MODE', 'TAURI_SIGNING_PRIVATE_KEY', 'production-release', 'GitHub Environment']) {
     assert.equal(developerReadme.includes(internal), false, `developer README leaked internal release instruction: ${internal}`);
   }
@@ -146,12 +178,17 @@ test('free macOS mode uses Tauri ad-hoc signing without Apple certificate secret
   assert.match(releaseWorkflow, /Configure macOS signing[\s\S]*env:[\s\S]*APPLE_CERTIFICATE:[\s\S]*developer-id\)/);
 });
 
-test('draft GitHub release lifecycle is keyed by release ID until publication', () => {
+test('draft GitHub release lifecycle is keyed by release ID, publicly verified, and cleaned on failure', () => {
   assert.match(releaseWorkflow, /Create or resume draft GitHub Release by ID/);
   assert.match(releaseWorkflow, /release_id=\$release_id/);
   assert.match(releaseWorkflow, /RELEASE_ID: \$\{\{ needs\.create-release\.outputs\.release_id \}\}/);
   assert.match(releaseWorkflow, /releases\/\$RELEASE_ID\/assets/);
   assert.match(releaseWorkflow, /releases\/\$RELEASE_ID"/);
+  assert.match(releaseWorkflow, /Verify published release identity and updater transport/);
+  assert.match(releaseWorkflow, /release:verify-published-updater/);
+  assert.match(releaseWorkflow, /cleanup-failed-release:/);
+  assert.match(releaseWorkflow, /Delete incomplete or broken release; keep git tag for a safe rerun/);
+  assert.match(releaseWorkflow, /--method DELETE "repos\/\$GITHUB_REPOSITORY\/releases\/\$RELEASE_ID"/);
   assert.doesNotMatch(releaseWorkflow, /releases\/tags\/\$GITHUB_REF_NAME/);
-  assert.doesNotMatch(releaseWorkflow, /gh release (download|upload|edit) "\$GITHUB_REF_NAME"/);
+  assert.doesNotMatch(releaseWorkflow, /gh release (download|edit) "\$GITHUB_REF_NAME"/);
 });

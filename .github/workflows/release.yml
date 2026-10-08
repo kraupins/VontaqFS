@@ -472,3 +472,37 @@ jobs:
         run: |
           set -euo pipefail
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false -f make_latest=true >/dev/null
+      - name: Verify published release identity and updater transport
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RELEASE_JSON="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")"
+          test "$(jq -r '.tag_name' <<< "$RELEASE_JSON")" = "$GITHUB_REF_NAME"
+          test "$(jq -r '.draft' <<< "$RELEASE_JSON")" = "false"
+          test "$(jq -r '.prerelease' <<< "$RELEASE_JSON")" = "false"
+          VERSION="$(node -p "require('./package.json').version")"
+          npm run release:verify-published-updater -- --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" --version "$VERSION"
+
+  cleanup-failed-release:
+    name: Cleanup failed GitHub Release
+    if: ${{ always() && needs.create-release.result == 'success' && (needs.build-desktop.result != 'success' || needs.publish-sdk.result != 'success' || needs.finalize-release.result != 'success') }}
+    needs: [create-release, build-desktop, publish-sdk, finalize-release]
+    runs-on: ubuntu-24.04
+    environment: production-release
+    permissions:
+      contents: write
+    env:
+      RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+    steps:
+      - name: Delete incomplete or broken release; keep git tag for a safe rerun
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >/dev/null 2>&1; then
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >/dev/null
+            echo "Deleted failed GitHub Release id=$RELEASE_ID; git tag $GITHUB_REF_NAME remains intact."
+          else
+            echo "Release id=$RELEASE_ID is already absent; nothing to clean up."
+          fi

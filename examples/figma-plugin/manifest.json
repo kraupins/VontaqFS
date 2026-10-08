@@ -15,5 +15,6 @@
       "http://localhost:47836"
     ],
     "reasoning": "Connects to the locally installed VontaqFS runtime for local persistent storage using the official fixed endpoint set."
-  }
+  },
+  "ui": "dist/ui.html"
 }

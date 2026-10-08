@@ -1,0 +1,15 @@
+{
+  "name": "vontaqfs-figma-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@vontaq/fs": "0.2.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}

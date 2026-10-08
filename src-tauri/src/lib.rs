@@ -943,6 +943,10 @@ async fn perform_update_check(
 
     match check {
         Ok(Some(update)) => {
+            // Keep restart behavior explicit for Windows updater installs. Tauri defaults to
+            // restarting after install, but making it part of our contract prevents future
+            // config/version changes from silently turning a successful install into an exit.
+            let update = update.restart_after_install(true);
             let status = DesktopUpdaterStatus {
                 phase: DesktopUpdaterPhase::Available,
                 current_version: update.current_version.clone(),

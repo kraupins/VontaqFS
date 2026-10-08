@@ -1,6 +1,6 @@
 {
   "name": "vontaqfs",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "workspaces": [
@@ -27,6 +27,8 @@
     "release:verify": "node scripts/release/verify-release.mjs",
     "release:checksums": "node scripts/release/generate-checksums.mjs",
     "release:verify-assets": "node scripts/release/verify-assets.mjs",
+    "release:repair-updater": "node scripts/release/repair-published-updater.mjs",
+    "release:verify-published-updater": "node scripts/release/verify-published-updater.mjs",
     "check:example": "tsc --noEmit -p examples/figma-plugin/tsconfig.json",
     "test:rc-stress": "node scripts/test-rust-release.mjs --stress",
     "test:rust:release": "node scripts/test-rust-release.mjs",

@@ -3,6 +3,7 @@ export * from './protocol.js';
 
 import { isVontaqFSError, normalizeErrorCode, VontaqFSError, type VontaqFSErrorCode } from './errors.js';
 import { IncrementalSha256 } from './sha256.js';
+import { PortableUtf8Decoder, utf8Decode, utf8Encode } from './utf8.js';
 import {
   VONTAQ_FS_CONTROL_CONTENT_TYPE,
   VONTAQ_FS_DIRECT_PAYLOAD_TARGET_BYTES,
@@ -73,6 +74,8 @@ const PAIRING_CREDENTIAL_KEY = 'vontaqfs.pairing-credential.v1';
 const DEFAULT_SPACE_KEY = 'default';
 const DEFAULT_PAIRING_POLL_INTERVAL_MS = 500;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const DEFAULT_DISCOVERY_TIMEOUT_MS = 10_000;
+const DEFAULT_LONG_POLL_TIMEOUT_MS = VONTAQ_FS_EVENT_LONG_POLL_MAX_MS + 5_000;
 const SESSION_REFRESH_SKEW_MS = 5_000;
 const TEXT_ENCODER_WINDOW_CODE_UNITS = 64 * 1024;
 const MAX_WRITE_TREE_ENTRIES = 100_000;
@@ -92,6 +95,13 @@ export async function resetPairingState(stateStore: ClientStateStore): Promise<v
   else await stateStore.set(PAIRING_CREDENTIAL_KEY, '');
 }
 
+export interface VontaqFSSecureRandomSource {
+  getRandomValues(target: Uint8Array): Uint8Array;
+}
+
+export type VontaqFSRequestPurpose = 'discovery' | 'operational' | 'long-poll';
+export type VontaqFSTimeoutMode = 'hard' | 'none';
+
 export interface VontaqFSHttpRequest {
   method: 'GET' | 'POST' | 'PUT';
   url: string;
@@ -99,6 +109,8 @@ export interface VontaqFSHttpRequest {
   body?: string | Uint8Array;
   responseType?: 'text' | 'binary';
   timeoutMs: number;
+  purpose?: VontaqFSRequestPurpose;
+  timeoutMode?: VontaqFSTimeoutMode;
 }
 
 export interface VontaqFSHttpResponse {
@@ -126,6 +138,8 @@ export interface VontaqFSConnectOptions {
   pairingPollIntervalMs?: number;
   pairingTimeoutMs?: number;
   requestTimeoutMs?: number;
+  discoveryTimeoutMs?: number;
+  secureRandom?: VontaqFSSecureRandomSource;
   retryCount?: number;
   materializationLimitBytes?: number;
   onPairingRequired?: (event: PairingRequiredEvent) => void | Promise<void>;
@@ -304,16 +318,29 @@ export class FetchTransport implements VontaqFSTransport {
   async request(request: VontaqFSHttpRequest): Promise<VontaqFSHttpResponse> {
     const fetchFn = (globalThis as { fetch?: typeof fetch }).fetch;
     if (typeof fetchFn !== 'function') {
-      throw new VontaqFSError('RUNTIME_UNREACHABLE', 'This environment does not provide fetch().');
+      throw new VontaqFSError('TRANSPORT_ERROR', 'This environment does not provide fetch().');
     }
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), request.timeoutMs);
+    const timeoutMode = request.timeoutMode ?? 'hard';
+    const AbortControllerCtor = (globalThis as { AbortController?: typeof AbortController }).AbortController;
+    let controller: AbortController | undefined;
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    if (timeoutMode === 'hard') {
+      if (typeof AbortControllerCtor !== 'function') {
+        throw new VontaqFSError('TRANSPORT_ERROR', 'This environment does not provide AbortController required for a hard transport timeout.');
+      }
+      controller = new AbortControllerCtor();
+      timeoutId = setTimeout(() => {
+        timedOut = true;
+        controller?.abort();
+      }, request.timeoutMs);
+    }
     try {
       const response = await fetchFn(request.url, {
         method: request.method,
         headers: request.headers,
         body: request.body as never,
-        signal: controller.signal,
+        ...(controller ? { signal: controller.signal } : {}),
       });
       return {
         status: response.status,
@@ -321,8 +348,13 @@ export class FetchTransport implements VontaqFSTransport {
           ? new Uint8Array(await response.arrayBuffer())
           : await response.text(),
       };
+    } catch (error) {
+      if (isVontaqFSError(error)) throw error;
+      if (timedOut) throw new VontaqFSError('TRANSPORT_TIMEOUT', 'VontaqFS transport deadline expired.', { cause: safeCause(error), purpose: request.purpose });
+      if (isAbortLikeError(error)) throw new VontaqFSError('TRANSPORT_CANCELLED', 'VontaqFS transport request was cancelled.', { cause: safeCause(error), purpose: request.purpose });
+      throw new VontaqFSError('TRANSPORT_ERROR', 'VontaqFS transport request failed.', { cause: safeCause(error), purpose: request.purpose });
     } finally {
-      clearTimeout(timeoutId);
+      if (timeoutId !== undefined) clearTimeout(timeoutId);
     }
   }
 }
@@ -336,6 +368,10 @@ interface ConnectionSettings {
   pairingPollIntervalMs: number;
   pairingTimeoutMs?: number;
   requestTimeoutMs: number;
+  discoveryTimeoutMs: number;
+  operationalTimeoutMode: VontaqFSTimeoutMode;
+  longPollTimeoutMs: number;
+  secureRandom: VontaqFSSecureRandomSource;
   retryCount: number;
   materializationLimitBytes: number;
   onPairingRequired?: (event: PairingRequiredEvent) => void | Promise<void>;
@@ -360,7 +396,7 @@ class RuntimeConnection {
 
     let clientInstanceId = await settings.stateStore.get(CLIENT_INSTANCE_KEY);
     if (!clientInstanceId) {
-      clientInstanceId = secureId('client');
+      clientInstanceId = secureId(settings.secureRandom, 'client');
       await settings.stateStore.set(CLIENT_INSTANCE_KEY, clientInstanceId);
     }
 
@@ -369,7 +405,7 @@ class RuntimeConnection {
       ? await discoverTrustedRuntime(settings, clientInstanceId, credential)
       : await discoverFirstPairRuntime(settings);
     const connectedSettings = { ...settings, endpoint };
-    const health = await fetchHealth(connectedSettings);
+    const health = await fetchHealth(connectedSettings, 'discovery');
     validateHealth(health);
 
     let session: SessionResponse;
@@ -386,6 +422,7 @@ class RuntimeConnection {
 
   get materializationLimitBytes(): number { return this.settings.materializationLimitBytes; }
   get requestTimeoutMs(): number { return this.settings.requestTimeoutMs; }
+  secureId(prefix: string): string { return secureId(this.settings.secureRandom, prefix); }
   get sessionCapabilityIds(): readonly string[] { return this.session.capabilities; }
 
   requireCapability(capability: string): void {
@@ -406,8 +443,8 @@ class RuntimeConnection {
     this.session = { ...this.session, token: '', expiresAtMs: 0 };
   }
 
-  post<T>(path: string, body: unknown, mode: 'read' | 'mutation'): Promise<T> {
-    return this.withSession(token => requestJson<T>(this.settings, path, body, token, mode, mode === 'mutation'));
+  post<T>(path: string, body: unknown, mode: 'read' | 'mutation', purpose: VontaqFSRequestPurpose = 'operational'): Promise<T> {
+    return this.withSession(token => requestJson<T>(this.settings, path, body, token, mode, mode === 'mutation', purpose));
   }
 
   postNonRetryingMutation<T>(path: string, body: unknown): Promise<T> {
@@ -440,7 +477,26 @@ class RuntimeConnection {
         await this.refreshSession();
         return operation(this.session.token);
       }
+      if (isVontaqFSError(error) && isTransportError(error) && error.code !== 'TRANSPORT_CANCELLED') {
+        await this.confirmConnectedRuntimeAfterTransportFailure(error);
+      }
       throw error;
+    }
+  }
+
+  private async confirmConnectedRuntimeAfterTransportFailure(original: VontaqFSError): Promise<void> {
+    try {
+      const health = await fetchHealth(this.settings, 'discovery');
+      validateHealth(health);
+    } catch (healthError) {
+      if (isVontaqFSError(healthError) && healthError.code === 'RUNTIME_UNREACHABLE') {
+        throw new VontaqFSError('RUNTIME_DISCONNECTED', 'The previously connected VontaqFS runtime is no longer reachable.', {
+          endpoint: this.settings.endpoint,
+          transportCode: original.code,
+        });
+      }
+      // A reachable Runtime that reports a concrete non-ready/protocol state is authoritative.
+      throw healthError;
     }
   }
 
@@ -473,7 +529,7 @@ class OperationObserver {
     private readonly options: OperationOptions,
   ) {
     const presentation = options.progress?.presentation ?? (options.progress?.onProgress ? 'client' : 'silent');
-    this.request = { id: secureId('operation'), presentation };
+    this.request = { id: connection.secureId('operation'), presentation };
   }
 
   async run<T>(action: (operation: OperationRequestWire) => Promise<T>): Promise<T> {
@@ -766,7 +822,7 @@ class SpaceFiles implements FileAPI {
     if (bytes.byteLength <= VONTAQ_FS_DIRECT_PAYLOAD_TARGET_BYTES) {
       const observer = new OperationObserver(this.connection, options);
       return observer.run(operation => this.connection.post<FileInfo>('/v1/fs/write-small', {
-        requestId: secureId('request'), spaceId: this.spaceId, path,
+        requestId: this.connection.secureId('request'), spaceId: this.spaceId, path,
         dataBase64: encodeBase64(bytes), ifMatch: options.ifMatch ?? null,
         metadata: normalizeFileMetadata(options.metadata), operation,
       }, 'mutation'));
@@ -787,10 +843,10 @@ class SpaceFiles implements FileAPI {
     const info = await this.requireFile(path);
     this.assertMaterializable(info);
     if (info.size <= VONTAQ_FS_DIRECT_PAYLOAD_TARGET_BYTES) {
-      return new TextDecoder('utf-8', { fatal: true }).decode(await this.readFileWithInfo(path, info, options));
+      return utf8Decode(await this.readFileWithInfo(path, info, options), { fatal: true });
     }
     const reader = await this.createReader(path, options);
-    const decoder = new TextDecoder('utf-8', { fatal: true });
+    const decoder = new PortableUtf8Decoder({ fatal: true });
     const parts: string[] = [];
     try {
       for (;;) {
@@ -808,12 +864,11 @@ class SpaceFiles implements FileAPI {
   async writeText(path: string, value: string, options: FileWriteOptions = {}): Promise<FileInfo> {
     if (typeof value !== 'string') throw new TypeError('writeText() requires a string.');
     if (value.length <= VONTAQ_FS_DIRECT_PAYLOAD_TARGET_BYTES / 4) {
-      return this.writeFile(path, new TextEncoder().encode(value), options);
+      return this.writeFile(path, utf8Encode(value), options);
     }
     const writer = await this.createWriter(path, options);
-    const encoder = new TextEncoder();
     try {
-      for (const part of textSlices(value, TEXT_ENCODER_WINDOW_CODE_UNITS)) await writer.write(encoder.encode(part));
+      for (const part of textSlices(value, TEXT_ENCODER_WINDOW_CODE_UNITS)) await writer.write(utf8Encode(part));
       return await writer.commit();
     } catch (error) {
       await bestEffortAbort(writer);
@@ -826,13 +881,12 @@ class SpaceFiles implements FileAPI {
   }
 
   async writeJSON(path: string, value: unknown, options: FileWriteOptions = {}): Promise<FileInfo> {
-    const encoder = new TextEncoder();
     const buffered: Uint8Array[] = [];
     let bufferedBytes = 0;
     let writer: VontaqFSWriter | undefined;
     try {
       for (const fragment of jsonFragments(value)) {
-        const bytes = encoder.encode(fragment);
+        const bytes = utf8Encode(fragment);
         if (!writer && bufferedBytes + bytes.byteLength <= VONTAQ_FS_DIRECT_PAYLOAD_TARGET_BYTES) {
           buffered.push(bytes);
           bufferedBytes += bytes.byteLength;
@@ -855,7 +909,7 @@ class SpaceFiles implements FileAPI {
   delete(path: string, options: FileDeleteOptions = {}): Promise<{ deletedFiles: number }> {
     const observer = new OperationObserver(this.connection, options);
     return observer.run(operation => this.connection.post('/v1/fs/delete', {
-      requestId: secureId('request'), spaceId: this.spaceId, path,
+      requestId: this.connection.secureId('request'), spaceId: this.spaceId, path,
       recursive: options.recursive ?? false, ifMatch: options.ifMatch ?? null, operation,
     }, 'mutation'));
   }
@@ -863,14 +917,14 @@ class SpaceFiles implements FileAPI {
   copy(from: string, to: string, options: FileCopyOptions = {}): Promise<{ copiedFiles: number }> {
     const observer = new OperationObserver(this.connection, options);
     return observer.run(operation => this.connection.post('/v1/fs/copy', {
-      requestId: secureId('request'), spaceId: this.spaceId, from, to, overwrite: options.overwrite ?? false, operation,
+      requestId: this.connection.secureId('request'), spaceId: this.spaceId, from, to, overwrite: options.overwrite ?? false, operation,
     }, 'mutation'));
   }
 
   move(from: string, to: string, options: FileMoveOptions = {}): Promise<{ movedFiles: number }> {
     const observer = new OperationObserver(this.connection, options);
     return observer.run(operation => this.connection.post('/v1/fs/move', {
-      requestId: secureId('request'), spaceId: this.spaceId, from, to,
+      requestId: this.connection.secureId('request'), spaceId: this.spaceId, from, to,
       overwrite: options.overwrite ?? false, ifMatch: options.ifMatch ?? null, operation,
     }, 'mutation'));
   }
@@ -883,7 +937,7 @@ class SpaceFiles implements FileAPI {
     observer.start();
     try {
       const response = await this.connection.post<StreamWriteBeginResponse>('/v1/streams/write/begin', {
-        requestId: secureId('request'), spaceId: this.spaceId, path,
+        requestId: this.connection.secureId('request'), spaceId: this.spaceId, path,
         ifMatch: options.ifMatch ?? null, declaredSize: options.declaredSize ?? null,
         metadata: normalizeFileMetadata(options.metadata), operation: observer.request,
       }, 'mutation');
@@ -956,7 +1010,7 @@ class SpaceKeyValue implements KeyValueAPI {
 
   set<T = unknown>(key: string, value: T, options: KeyValueWriteOptions = {}): Promise<KeyValueEntry<T>> {
     return this.connection.post('/v1/kv/set', {
-      requestId: secureId('request'), spaceId: this.spaceId, key, value,
+      requestId: this.connection.secureId('request'), spaceId: this.spaceId, key, value,
       ifVersion: options.ifVersion ?? null, ifMatch: options.ifMatch ?? null,
     }, 'mutation');
   }
@@ -967,7 +1021,7 @@ class ApplicationFormats implements FormatAPI {
 
   register(descriptor: FormatDescriptorInput): Promise<FormatDescriptor> {
     const normalized = normalizeFormatDescriptor(descriptor);
-    return this.connection.post('/v1/formats/register', { requestId: secureId('request'), ...normalized }, 'mutation');
+    return this.connection.post('/v1/formats/register', { requestId: this.connection.secureId('request'), ...normalized }, 'mutation');
   }
 
   async list(): Promise<readonly FormatDescriptor[]> {
@@ -977,7 +1031,7 @@ class ApplicationFormats implements FormatAPI {
 
   async delete(id: string): Promise<boolean> {
     validateFormatId(id);
-    const response = await this.connection.post<{ deleted: boolean }>('/v1/formats/delete', { requestId: secureId('request'), id }, 'mutation');
+    const response = await this.connection.post<{ deleted: boolean }>('/v1/formats/delete', { requestId: this.connection.secureId('request'), id }, 'mutation');
     return response.deleted;
   }
 }
@@ -994,7 +1048,7 @@ class ApplicationDestinations implements DestinationAPI {
       this.connection.requireCapability(VONTAQ_FS_CAPABILITY_IDS.destinationPickerHints);
     }
     return this.connection.postNonRetryingMutation('/v1/destinations/create', {
-      requestId: secureId('request'), label: options.label ?? null, capability,
+      requestId: this.connection.secureId('request'), label: options.label ?? null, capability,
       initialDestinationId: options.initialDestinationId ?? null,
       reuseInitialIfSame: options.reuseInitialIfSame ?? false,
     });
@@ -1005,7 +1059,7 @@ class ApplicationDestinations implements DestinationAPI {
   }
   async revoke(destinationId: string): Promise<boolean> {
     if (!/^dst_[a-f0-9]{32}$/i.test(destinationId)) throw new TypeError('destinationId is invalid.');
-    const response = await this.connection.post<{ revoked: boolean }>('/v1/destinations/revoke', { requestId: secureId('request'), destinationId }, 'mutation');
+    const response = await this.connection.post<{ revoked: boolean }>('/v1/destinations/revoke', { requestId: this.connection.secureId('request'), destinationId }, 'mutation');
     return response.revoked;
   }
 }
@@ -1019,7 +1073,7 @@ class SpaceSnapshots implements SnapshotAPI {
     }
     const observer = new OperationObserver(this.connection, options);
     return observer.runTracked<SnapshotInfo>(operation => this.connection.postNonRetryingMutation<OperationProgress>('/v1/snapshots/create', {
-      requestId: secureId('request'), spaceId: this.spaceId, label: label ?? null, operation,
+      requestId: this.connection.secureId('request'), spaceId: this.spaceId, label: label ?? null, operation,
     }), 'CONFLICT', 'snapshot creation');
   }
 
@@ -1038,14 +1092,14 @@ class SpaceSnapshots implements SnapshotAPI {
     validateSnapshotId(snapshotId);
     const observer = new OperationObserver(this.connection, options);
     return observer.runTracked<SnapshotRestoreReport>(operation => this.connection.postNonRetryingMutation<OperationProgress>('/v1/snapshots/restore', {
-      requestId: secureId('request'), spaceId: this.spaceId, snapshotId, operation,
+      requestId: this.connection.secureId('request'), spaceId: this.spaceId, snapshotId, operation,
     }), 'CONFLICT', 'snapshot restore');
   }
 
   async delete(snapshotId: string): Promise<boolean> {
     validateSnapshotId(snapshotId);
     const response = await this.connection.post<{ deleted: boolean }>('/v1/snapshots/delete', {
-      requestId: secureId('request'), spaceId: this.spaceId, snapshotId,
+      requestId: this.connection.secureId('request'), spaceId: this.spaceId, snapshotId,
     }, 'mutation');
     return response.deleted;
   }
@@ -1059,7 +1113,7 @@ class ApplicationExportPresets implements ExportPresetAPI {
     if (!['file', 'files', 'directory', 'archive'].includes(options.mode)) throw new TypeError('export preset mode is invalid.');
     if (options.archiveFormat && (options.mode !== 'archive' || options.archiveFormat !== 'zip')) throw new TypeError('ZIP is the only supported archive preset format.');
     return this.connection.postNonRetryingMutation('/v1/export-presets/save', {
-      requestId: secureId('request'), id: options.id ?? null, name: options.name,
+      requestId: this.connection.secureId('request'), id: options.id ?? null, name: options.name,
       destinationId: options.destinationId, mode: options.mode, conflict: options.conflict ?? 'ask',
       sourcePath: options.sourcePath, archiveFormat: options.archiveFormat ?? null,
     });
@@ -1069,7 +1123,7 @@ class ApplicationExportPresets implements ExportPresetAPI {
     return response.presets;
   }
   async delete(id: string): Promise<boolean> {
-    const response = await this.connection.post<{ deleted: boolean }>('/v1/export-presets/delete', { requestId: secureId('request'), id }, 'mutation');
+    const response = await this.connection.post<{ deleted: boolean }>('/v1/export-presets/delete', { requestId: this.connection.secureId('request'), id }, 'mutation');
     return response.deleted;
   }
 }
@@ -1097,7 +1151,7 @@ export class VontaqFSSpace {
     this.connection.requireCapability(VONTAQ_FS_CAPABILITY_IDS.spaceClear);
     const observer = new OperationObserver(this.connection, options);
     return observer.run(operation => this.connection.postNonRetryingMutation<SpaceClearReport>('/v1/spaces/clear', {
-      requestId: secureId('request'), spaceId: this.id, operation,
+      requestId: this.connection.secureId('request'), spaceId: this.id, operation,
     }));
   }
 
@@ -1107,7 +1161,7 @@ export class VontaqFSSpace {
     }
     let decodedBytes = 0;
     const wireOperations = operations.map((operation) => {
-      const wire = batchOperationWire(operation);
+      const wire = batchOperationWire(this.connection, operation);
       if (operation.type === 'write-file') decodedBytes += operation.bytes.byteLength;
       return wire;
     });
@@ -1141,7 +1195,7 @@ export class VontaqFSSpace {
       return next;
     }, 0);
     const presentation = options.progress?.presentation ?? (options.progress?.onProgress ? 'client' : 'silent');
-    const aggregateId = secureId('operation');
+    const aggregateId = this.connection.secureId('operation');
     const aggregateStartedAt = Date.now();
     let completedItems = 0;
     let failedItems = 0;
@@ -1242,7 +1296,7 @@ export class VontaqFSSpace {
     if (directoryLayout === 'contents') this.connection.requireCapability(VONTAQ_FS_CAPABILITY_IDS.directoryContentsExport);
     const observer = new OperationObserver(this.connection, options);
     return observer.runTracked<NativeExportReport>(operation => this.connection.postNonRetryingMutation<OperationProgress>('/v1/exports/start', {
-      requestId: secureId('request'), spaceId: this.id, sourcePaths, mode: options.mode,
+      requestId: this.connection.secureId('request'), spaceId: this.id, sourcePaths, mode: options.mode,
       destinationId: options.destinationId ?? null, conflict: options.conflict ?? 'ask',
       archiveName: options.archiveName ?? null, bookkeeping, prune,
       trackingKey: options.trackingKey ?? null, directoryLayout, operation,
@@ -1260,8 +1314,8 @@ export class VontaqFSSpace {
     });
   }
 
-  async import(options: NativeImportOptions): Promise<NativeImportReport> {
-    if (!options || !['file', 'files', 'directory', 'archive'].includes(options.mode)) throw new TypeError('space.import() requires a valid import mode.');
+  async ["import"](options: NativeImportOptions): Promise<NativeImportReport> {
+    if (!options || !['file', 'files', 'directory', 'archive'].includes(options.mode)) throw new TypeError('space["import"]() requires a valid import mode.');
     if (options.sourceId && !/^dst_[a-f0-9]{32}$/i.test(options.sourceId)) throw new TypeError('sourceId is invalid.');
     const sourcePaths = [...(options.sourcePaths ?? [])];
     if (!options.sourceId && sourcePaths.length) throw new TypeError('sourcePaths require a saved sourceId; one-off import uses the native picker.');
@@ -1278,26 +1332,26 @@ export class VontaqFSSpace {
     if (!['replace', 'skip', 'rename', 'ask'].includes(conflict)) throw new TypeError('import conflict policy is invalid.');
     const observer = new OperationObserver(this.connection, options);
     return observer.runTracked<NativeImportReport>(operation => this.connection.postNonRetryingMutation<OperationProgress>('/v1/imports/start', {
-      requestId: secureId('request'), spaceId: this.id, mode: options.mode,
+      requestId: this.connection.secureId('request'), spaceId: this.id, mode: options.mode,
       sourceId: options.sourceId ?? null, sourcePaths, targetPath, conflict, operation,
     }), 'IMPORT_CANCELLED', 'import');
   }
 
   async watch(path: string, callback: WatchCallback, options: WatchOptions = {}): Promise<Unsubscribe> {
     if (typeof callback !== 'function') throw new TypeError('watch() requires a callback.');
-    const maxSafeWaitMs = Math.max(0, Math.min(VONTAQ_FS_EVENT_LONG_POLL_MAX_MS, this.connection.requestTimeoutMs - 250));
+    const maxSafeWaitMs = VONTAQ_FS_EVENT_LONG_POLL_MAX_MS;
     const waitMs = boundedInteger(options.waitMs ?? maxSafeWaitMs, 0, maxSafeWaitMs, 'waitMs');
     let active = true;
     const baseline = await this.connection.post<EventPollResponse>('/v1/events/poll', {
       afterSequence: 0, spaceId: this.id, pathPrefix: path, waitMs: 0,
-    }, 'read');
+    }, 'read', 'long-poll');
     let cursor = baseline.latestSequence;
     const run = async (): Promise<void> => {
       while (active) {
         try {
           const response = await this.connection.post<EventPollResponse>('/v1/events/poll', {
             afterSequence: cursor, spaceId: this.id, pathPrefix: path, waitMs,
-          }, 'read');
+          }, 'read', 'long-poll');
           if (!active) break;
           const sequenceReset = response.latestSequence < cursor;
           if (response.overflow || sequenceReset) {
@@ -1318,7 +1372,7 @@ export class VontaqFSSpace {
           if (!active) break;
           const normalized = isVontaqFSError(error)
             ? error
-            : new VontaqFSError('RUNTIME_UNREACHABLE', 'VontaqFS watch polling failed.', { cause: safeCause(error) });
+            : new VontaqFSError('TRANSPORT_ERROR', 'VontaqFS watch polling failed.', { cause: safeCause(error) });
           if (options.onError) await options.onError(normalized);
           else throw normalized;
           await sleep(100);
@@ -1358,6 +1412,7 @@ export class VontaqFS {
     if (!options || !options.application || !options.stateStore) {
       throw new TypeError('VontaqFS.connect() requires application identity and a client-local stateStore. Figma plugins can use createFigmaConnectOptions().');
     }
+    const explicitRequestTimeout = options.requestTimeoutMs !== undefined;
     const settings: ConnectionSettings = {
       application: options.application,
       stateStore: options.stateStore,
@@ -1367,6 +1422,10 @@ export class VontaqFS {
       pairingPollIntervalMs: boundedInteger(options.pairingPollIntervalMs ?? DEFAULT_PAIRING_POLL_INTERVAL_MS, 0, 10_000, 'pairingPollIntervalMs'),
       pairingTimeoutMs: options.pairingTimeoutMs,
       requestTimeoutMs: boundedInteger(options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS, 100, 120_000, 'requestTimeoutMs'),
+      discoveryTimeoutMs: boundedInteger(options.discoveryTimeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS, 100, 120_000, 'discoveryTimeoutMs'),
+      operationalTimeoutMode: explicitRequestTimeout ? 'hard' : 'none',
+      longPollTimeoutMs: DEFAULT_LONG_POLL_TIMEOUT_MS,
+      secureRandom: resolveSecureRandom(options.secureRandom),
       retryCount: boundedInteger(options.retryCount ?? 1, 0, 3, 'retryCount'),
       materializationLimitBytes: boundedInteger(options.materializationLimitBytes ?? VONTAQ_FS_MATERIALIZATION_LIMIT_BYTES, 1, VONTAQ_FS_MAX_FILE_BYTES, 'materializationLimitBytes'),
       onPairingRequired: options.onPairingRequired,
@@ -1461,7 +1520,7 @@ function validateSnapshotId(snapshotId: string): void {
   if (typeof snapshotId !== 'string' || !/^snp_[a-f0-9]{32}$/i.test(snapshotId)) throw new TypeError('snapshotId is invalid.');
 }
 
-function batchOperationWire(operation: BatchOperation): Record<string, unknown> {
+function batchOperationWire(connection: RuntimeConnection, operation: BatchOperation): Record<string, unknown> {
   if (!operation || typeof operation !== 'object') throw new TypeError('batch operation is invalid.');
   switch (operation.type) {
     case 'write-file': {
@@ -1469,21 +1528,21 @@ function batchOperationWire(operation: BatchOperation): Record<string, unknown> 
       if (operation.bytes.byteLength > VONTAQ_FS_DIRECT_PAYLOAD_TARGET_BYTES) {
         throw new RangeError('batch write-file payload exceeds the direct-transfer threshold; use writeTree()/writeFile() for automatic streaming.');
       }
-      return { type: operation.type, requestId: secureId('request'), path: operation.path, dataBase64: encodeBase64(operation.bytes), ifMatch: operation.ifMatch ?? null, metadata: normalizeFileMetadata(operation.metadata) };
+      return { type: operation.type, requestId: connection.secureId('request'), path: operation.path, dataBase64: encodeBase64(operation.bytes), ifMatch: operation.ifMatch ?? null, metadata: normalizeFileMetadata(operation.metadata) };
     }
     case 'delete':
-      return { type: operation.type, requestId: secureId('request'), path: operation.path, recursive: operation.recursive ?? false, ifMatch: operation.ifMatch ?? null };
+      return { type: operation.type, requestId: connection.secureId('request'), path: operation.path, recursive: operation.recursive ?? false, ifMatch: operation.ifMatch ?? null };
     case 'copy':
-      return { type: operation.type, requestId: secureId('request'), from: operation.from, to: operation.to, overwrite: operation.overwrite ?? false };
+      return { type: operation.type, requestId: connection.secureId('request'), from: operation.from, to: operation.to, overwrite: operation.overwrite ?? false };
     case 'move':
-      return { type: operation.type, requestId: secureId('request'), from: operation.from, to: operation.to, overwrite: operation.overwrite ?? false, ifMatch: operation.ifMatch ?? null };
+      return { type: operation.type, requestId: connection.secureId('request'), from: operation.from, to: operation.to, overwrite: operation.overwrite ?? false, ifMatch: operation.ifMatch ?? null };
     case 'kv-set': {
       if (operation.ifVersion !== undefined && (!Number.isSafeInteger(operation.ifVersion) || operation.ifVersion < 0)) throw new TypeError('batch kv-set ifVersion must be a non-negative safe integer.');
       let encoded: string;
       try { encoded = JSON.stringify(operation.value); } catch { throw new TypeError('batch kv-set value must be JSON-serializable.'); }
       if (encoded === undefined) throw new TypeError('batch kv-set value must be JSON-serializable.');
-      if (new TextEncoder().encode(encoded).byteLength > 512 * 1024) throw new RangeError('batch kv-set value exceeds 512 KiB.');
-      return { type: operation.type, requestId: secureId('request'), key: operation.key, value: operation.value, ifVersion: operation.ifVersion ?? null, ifMatch: operation.ifMatch ?? null };
+      if (utf8Encode(encoded).byteLength > 512 * 1024) throw new RangeError('batch kv-set value exceeds 512 KiB.');
+      return { type: operation.type, requestId: connection.secureId('request'), key: operation.key, value: operation.value, ifVersion: operation.ifVersion ?? null, ifMatch: operation.ifMatch ?? null };
     }
     default:
       throw new TypeError('batch operation type is unsupported.');
@@ -1561,21 +1620,24 @@ async function openSpace(connection: RuntimeConnection, options: OpenSpaceOption
     throw new TypeError('storageCategory is invalid.');
   }
   const info = await connection.post<SpaceInfo>('/v1/spaces/open', {
-    requestId: secureId('request'), key: options.key,
+    requestId: connection.secureId('request'), key: options.key,
     storageClass: options.storageClass ?? 'persistent', storageCategory: options.storageCategory ?? null, displayName: options.displayName ?? null,
   }, 'mutation');
   return normalizeSpaceInfo(info);
 }
 
-async function fetchHealth(settings: ConnectionSettings): Promise<RuntimeStatus> {
+async function fetchHealth(settings: ConnectionSettings, purpose: VontaqFSRequestPurpose = 'operational'): Promise<RuntimeStatus> {
   let response: VontaqFSHttpResponse;
   try {
     response = await settings.transport.request({
-      method: 'GET', url: `${settings.endpoint}/v1/health`, headers: {}, timeoutMs: settings.requestTimeoutMs,
+      method: 'GET', url: `${settings.endpoint}/v1/health`, headers: {}, ...requestTiming(settings, purpose),
     });
   } catch (error) {
-    if (isVontaqFSError(error)) throw error;
-    throw new VontaqFSError('RUNTIME_UNREACHABLE', 'VontaqFS is not reachable. Install or start VontaqFS, then try again.', { cause: safeCause(error), endpoint: settings.endpoint });
+    if (purpose === 'discovery') {
+      if (isVontaqFSError(error) && !isTransportError(error)) throw error;
+      throw new VontaqFSError('RUNTIME_UNREACHABLE', 'VontaqFS is not reachable. Install or start VontaqFS, then try again.', { cause: safeCause(error), endpoint: settings.endpoint });
+    }
+    throw normalizeTransportError(error, `${settings.endpoint}/v1/health`);
   }
   if (response.status < 200 || response.status >= 300) throw decodeRuntimeError(response);
   try { return JSON.parse(responseText(response)) as RuntimeStatus; }
@@ -1585,7 +1647,7 @@ async function fetchHealth(settings: ConnectionSettings): Promise<RuntimeStatus>
 async function probeHealth(settings: ConnectionSettings, endpoint: string): Promise<RuntimeStatus | null> {
   try {
     const candidate = { ...settings, endpoint };
-    const response = await candidate.transport.request({ method: 'GET', url: `${endpoint}/v1/health`, headers: {}, timeoutMs: candidate.requestTimeoutMs });
+    const response = await candidate.transport.request({ method: 'GET', url: `${endpoint}/v1/health`, headers: {}, ...requestTiming(candidate, 'discovery') });
     if (response.status < 200 || response.status >= 300) return null;
     const health = JSON.parse(responseText(response)) as RuntimeStatus;
     if (!health || health.service !== 'vontaqfs') return null;
@@ -1594,7 +1656,7 @@ async function probeHealth(settings: ConnectionSettings, endpoint: string): Prom
     }
     return health;
   } catch (error) {
-    if (isVontaqFSError(error)) throw error;
+    if (isVontaqFSError(error) && !isTransportError(error)) throw error;
     return null;
   }
 }
@@ -1645,21 +1707,19 @@ async function discoverTrustedRuntime(settings: ConnectionSettings, clientInstan
 }
 
 async function verifyRuntimeIdentity(settings: ConnectionSettings, clientInstanceId: string, pairingCredential: string): Promise<boolean> {
-  const nonce = secureHex(32);
+  const nonce = secureHex(settings.secureRandom, 32);
   let response: RuntimeIdentityChallengeResponse;
   try {
     response = await requestJson<RuntimeIdentityChallengeResponse>(settings, '/v1/identity/challenge', {
       application: { kind: settings.application.kind, externalId: settings.application.externalId },
       clientInstanceId,
       nonce,
-    }, undefined, 'read');
-  } catch (error) {
-    if (isVontaqFSError(error) && ['PAIRING_RUNTIME_NOT_FOUND', 'NOT_FOUND', 'AUTH_INVALID'].includes(error.code)) return false;
-    if (isVontaqFSError(error)) return false;
+    }, undefined, 'read', true, 'discovery');
+  } catch {
     return false;
   }
-  const credentialHash = sha256Bytes(new TextEncoder().encode(pairingCredential));
-  const message = new TextEncoder().encode(`${VONTAQ_FS_RUNTIME_IDENTITY_DOMAIN_SEPARATOR}${nonce}`);
+  const credentialHash = sha256Bytes(utf8Encode(pairingCredential));
+  const message = utf8Encode(`${VONTAQ_FS_RUNTIME_IDENTITY_DOMAIN_SEPARATOR}${nonce}`);
   const expected = hmacSha256Hex(credentialHash, message);
   return constantTimeHexEqual(expected, response.mac);
 }
@@ -1698,13 +1758,19 @@ function createSession(settings: ConnectionSettings, clientInstanceId: string, p
   return requestJson<SessionResponse>(settings, '/v1/sessions', { clientInstanceId, pairingCredential }, undefined, 'mutation');
 }
 
-async function requestJson<T>(settings: ConnectionSettings, path: string, body: unknown, token: string | undefined, mode: 'read' | 'mutation', retrySafe = mode === 'read'): Promise<T> {
+function requestTiming(settings: ConnectionSettings, purpose: VontaqFSRequestPurpose): Pick<VontaqFSHttpRequest, 'timeoutMs' | 'purpose' | 'timeoutMode'> {
+  if (purpose === 'discovery') return { timeoutMs: settings.discoveryTimeoutMs, purpose, timeoutMode: 'hard' };
+  if (purpose === 'long-poll') return { timeoutMs: settings.longPollTimeoutMs, purpose, timeoutMode: 'hard' };
+  return { timeoutMs: settings.requestTimeoutMs, purpose, timeoutMode: settings.operationalTimeoutMode };
+}
+
+async function requestJson<T>(settings: ConnectionSettings, path: string, body: unknown, token: string | undefined, mode: 'read' | 'mutation', retrySafe = mode === 'read', purpose: VontaqFSRequestPurpose = 'operational'): Promise<T> {
   const headers: Record<string, string> = { 'Content-Type': VONTAQ_FS_CONTROL_CONTENT_TYPE };
   if (token) headers.Authorization = `Bearer ${token}`;
   const bodyText = JSON.stringify(body);
   return retryTransport(settings, path, retrySafe, async () => {
     const response = await settings.transport.request({
-      method: 'POST', url: `${settings.endpoint}${path}`, headers, body: bodyText, timeoutMs: settings.requestTimeoutMs,
+      method: 'POST', url: `${settings.endpoint}${path}`, headers, body: bodyText, ...requestTiming(settings, purpose),
     });
     if (response.status < 200 || response.status >= 300) throw decodeRuntimeError(response);
     const text = responseText(response);
@@ -1717,7 +1783,7 @@ async function requestBinaryJson<T>(settings: ConnectionSettings, path: string, 
     const response = await settings.transport.request({
       method: 'PUT', url: `${settings.endpoint}${path}`,
       headers: { 'Content-Type': 'application/octet-stream', Authorization: `Bearer ${token}` },
-      body: bytes, timeoutMs: settings.requestTimeoutMs,
+      body: bytes, ...requestTiming(settings, 'operational'),
     });
     if (response.status < 200 || response.status >= 300) throw decodeRuntimeError(response);
     return JSON.parse(responseText(response)) as T;
@@ -1728,26 +1794,36 @@ async function requestBinary(settings: ConnectionSettings, path: string, token: 
   return retryTransport(settings, path, true, async () => {
     const response = await settings.transport.request({
       method: 'GET', url: `${settings.endpoint}${path}`, headers: { Authorization: `Bearer ${token}` },
-      responseType: 'binary', timeoutMs: settings.requestTimeoutMs,
+      responseType: 'binary', ...requestTiming(settings, 'operational'),
     });
     if (response.status < 200 || response.status >= 300) throw decodeRuntimeError(response);
-    return response.body instanceof Uint8Array ? response.body : new TextEncoder().encode(response.body);
+    return response.body instanceof Uint8Array ? response.body : utf8Encode(response.body);
   });
 }
 
+function isTransportError(error: VontaqFSError): boolean {
+  return error.code === 'TRANSPORT_ERROR' || error.code === 'TRANSPORT_TIMEOUT' || error.code === 'TRANSPORT_CANCELLED';
+}
+
+function normalizeTransportError(error: unknown, path: string): VontaqFSError {
+  if (isVontaqFSError(error)) return error;
+  return new VontaqFSError('TRANSPORT_ERROR', 'VontaqFS transport request failed.', { cause: safeCause(error), path });
+}
+
 async function retryTransport<T>(settings: ConnectionSettings, path: string, retrySafe: boolean, operation: () => Promise<T>): Promise<T> {
-  let lastTransportError: unknown;
+  let lastTransportError: VontaqFSError | undefined;
   for (let attempt = 0; attempt <= settings.retryCount; attempt += 1) {
     try { return await operation(); }
     catch (error) {
-      if (isVontaqFSError(error)) throw error;
-      lastTransportError = error;
-      if (attempt >= settings.retryCount) break;
-      if (!retrySafe) break;
+      if (isVontaqFSError(error) && !isTransportError(error)) throw error;
+      const transportError = normalizeTransportError(error, path);
+      if (transportError.code === 'TRANSPORT_CANCELLED') throw transportError;
+      lastTransportError = transportError;
+      if (attempt >= settings.retryCount || !retrySafe) break;
       await sleep(Math.min(25 * (attempt + 1), 100));
     }
   }
-  throw new VontaqFSError('RUNTIME_UNREACHABLE', 'VontaqFS became unreachable while processing the request.', { cause: safeCause(lastTransportError), path });
+  throw lastTransportError ?? new VontaqFSError('TRANSPORT_ERROR', 'VontaqFS transport request failed.', { path });
 }
 
 function decodeRuntimeError(response: VontaqFSHttpResponse): VontaqFSError {
@@ -1761,7 +1837,7 @@ function decodeRuntimeError(response: VontaqFSHttpResponse): VontaqFSError {
 }
 
 function responseText(response: VontaqFSHttpResponse): string {
-  return typeof response.body === 'string' ? response.body : new TextDecoder().decode(response.body);
+  return typeof response.body === 'string' ? response.body : utf8Decode(response.body);
 }
 
 function validateApplication(application: ClientIdentity): void {
@@ -1781,12 +1857,30 @@ function boundedInteger(value: number, min: number, max: number, name: string): 
   return value;
 }
 
-function secureHex(byteLength: number): string {
-  const cryptoApi = globalThis.crypto;
-  if (!cryptoApi || typeof cryptoApi.getRandomValues !== 'function') throw new VontaqFSError('INTERNAL_ERROR', 'A cryptographically secure random source is required by VontaqFS.');
+function resolveSecureRandom(source?: VontaqFSSecureRandomSource): VontaqFSSecureRandomSource {
+  if (source !== undefined) {
+    if (!source || typeof source.getRandomValues !== 'function') throw new TypeError('secureRandom must provide getRandomValues(Uint8Array).');
+    return source;
+  }
+  const cryptoApi = (globalThis as { crypto?: { getRandomValues(target: Uint8Array): Uint8Array } }).crypto;
+  if (!cryptoApi || typeof cryptoApi.getRandomValues !== 'function') {
+    throw new VontaqFSError('INTERNAL_ERROR', 'A cryptographically secure random source is required by VontaqFS.');
+  }
+  return { getRandomValues: target => cryptoApi.getRandomValues(target) };
+}
+
+function secureBytes(source: VontaqFSSecureRandomSource, byteLength: number): Uint8Array {
   const bytes = new Uint8Array(byteLength);
-  cryptoApi.getRandomValues(bytes);
-  return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+  const result = source.getRandomValues(bytes);
+  if (!(result instanceof Uint8Array) || result.byteLength !== bytes.byteLength) {
+    throw new VontaqFSError('INTERNAL_ERROR', 'The configured secure random source returned an invalid result.');
+  }
+  if (result !== bytes) bytes.set(result);
+  return bytes;
+}
+
+function secureHex(source: VontaqFSSecureRandomSource, byteLength: number): string {
+  return Array.from(secureBytes(source, byteLength), byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
 function sha256Bytes(data: Uint8Array): Uint8Array {
@@ -1828,12 +1922,8 @@ function constantTimeHexEqual(expected: string, actual: string): boolean {
   return diff === 0;
 }
 
-function secureId(prefix: string): string {
-  const cryptoApi = globalThis.crypto;
-  if (!cryptoApi || typeof cryptoApi.getRandomValues !== 'function') throw new VontaqFSError('INTERNAL_ERROR', 'A cryptographically secure random source is required by VontaqFS.');
-  const bytes = new Uint8Array(16);
-  cryptoApi.getRandomValues(bytes);
-  return `${prefix}-${Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')}`;
+function secureId(source: VontaqFSSecureRandomSource, prefix: string): string {
+  return `${prefix}-${Array.from(secureBytes(source, 16), byte => byte.toString(16).padStart(2, '0')).join('')}`;
 }
 
 function encodeBase64(bytes: Uint8Array): string {
@@ -1982,5 +2072,8 @@ function abortError(): Error {
   return DomException ? new DomException('The VontaqFS operation was aborted.', 'AbortError') : Object.assign(new Error('The VontaqFS operation was aborted.'), { name: 'AbortError' });
 }
 
+function isAbortLikeError(error: unknown): boolean {
+  return error instanceof Error && (error.name === 'AbortError' || /abort|cancel/i.test(error.message));
+}
 function safeCause(error: unknown): string { return error instanceof Error ? error.message : String(error ?? 'unknown error'); }
 function sleep(milliseconds: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, milliseconds)); }
