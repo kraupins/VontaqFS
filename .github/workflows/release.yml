@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ inputs.tag || github.ref_name }}
           fetch-depth: 0
       - name: Install Linux build prerequisites
         run: |
@@ -85,7 +85,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ inputs.tag || github.ref_name }}
           fetch-depth: 0
       - uses: actions/setup-node@v6
         with:
@@ -167,7 +167,7 @@ jobs:
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       VONTAQFS_UPDATE_ENDPOINT: https://github.com/${{ github.repository }}/releases/latest/download/latest.json
       VONTAQFS_PUBLIC_REPOSITORY_URL: https://github.com/${{ github.repository }}
-      VONTAQFS_PUBLIC_REPOSITORY_REF: ${{ env.RELEASE_TAG }}
+      VONTAQFS_PUBLIC_REPOSITORY_REF: ${{ inputs.tag || github.ref_name }}
       VONTAQFS_UPDATER_PUBLIC_KEY: ${{ vars.VONTAQFS_UPDATER_PUBLIC_KEY }}
       WINDOWS_SIGNING_MODE: ${{ vars.WINDOWS_SIGNING_MODE }}
       MACOS_SIGNING_MODE: ${{ vars.MACOS_SIGNING_MODE }}
@@ -183,7 +183,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ inputs.tag || github.ref_name }}
           fetch-depth: 0
       - uses: actions/setup-node@v6
         with:
@@ -305,7 +305,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
-          tagName: ${{ env.RELEASE_TAG }}
+          tagName: ${{ inputs.tag || github.ref_name }}
           releaseDraft: true
           prerelease: false
           retryAttempts: 2
@@ -361,7 +361,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
@@ -412,7 +412,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ inputs.tag || github.ref_name }}
       - name: Checkout release-control scripts from this workflow commit
         uses: actions/checkout@v7
         with:

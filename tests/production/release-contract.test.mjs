@@ -185,7 +185,9 @@ test('free macOS mode uses Tauri ad-hoc signing without Apple certificate secret
 test('draft GitHub release lifecycle is keyed by release ID, supports same-tag recovery, and publicly verifies updater transport', () => {
   assert.match(releaseWorkflow, /workflow_dispatch:[\s\S]*tag:[\s\S]*Existing release tag to build\/recover/);
   assert.match(releaseWorkflow, /RELEASE_TAG: \$\{\{ inputs\.tag \|\| github\.ref_name \}\}/);
-  assert.match(releaseWorkflow, /ref: \$\{\{ env\.RELEASE_TAG \}\}/);
+  assert.match(releaseWorkflow, /ref: \$\{\{ inputs\.tag \|\| github\.ref_name \}\}/);
+  assert.match(releaseWorkflow, /VONTAQFS_PUBLIC_REPOSITORY_REF: \$\{\{ inputs\.tag \|\| github\.ref_name \}\}/);
+  assert.doesNotMatch(releaseWorkflow, /\$\{\{ env\.RELEASE_TAG \}\}/);
   assert.match(releaseWorkflow, /Create or resume draft GitHub Release by ID/);
   assert.match(releaseWorkflow, /target_sha="\$\(git rev-list -n 1 "\$RELEASE_TAG"\)"/);
   assert.match(releaseWorkflow, /release_id=\$release_id/);
