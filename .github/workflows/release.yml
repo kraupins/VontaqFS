@@ -4,9 +4,18 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to build/recover (for example v0.2.1)'
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 concurrency:
-  group: production-release-${{ github.ref }}
+  group: production-release-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -19,6 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
       - name: Install Linux build prerequisites
         run: |
@@ -53,7 +63,7 @@ jobs:
           workspaces: './ -> target'
       - run: npm ci
       - name: Verify immutable release contract
-        run: npm run release:verify -- --tag "$GITHUB_REF_NAME"
+        run: npm run release:verify -- --tag "$RELEASE_TAG"
       - run: npm run check
       - name: Run full release test gate
         run: npm run test:release
@@ -75,6 +85,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
       - uses: actions/setup-node@v6
         with:
@@ -91,18 +102,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          existing="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | [.id, .draft] | @tsv" | head -n 1)"
+          target_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+          test -n "$target_sha" || { echo "Tag $RELEASE_TAG does not resolve to a commit." >&2; exit 1; }
+          existing="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq ".[] | select(.tag_name == \"$RELEASE_TAG\") | [.id, .draft] | @tsv" | head -n 1)"
           if [ -n "$existing" ]; then
             IFS=$'\t' read -r release_id draft <<< "$existing"
             if [ "$draft" != "true" ]; then
-              echo "Release $GITHUB_REF_NAME already exists and is not a draft; refusing to mutate a published release." >&2
+              echo "Release $RELEASE_TAG already exists and is not a draft; refusing to mutate a published release." >&2
               exit 1
             fi
           else
             release_id="$(gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
-              -f tag_name="$GITHUB_REF_NAME" \
-              -f target_commitish="$GITHUB_SHA" \
-              -f name="VontaqFS $GITHUB_REF_NAME" \
+              -f tag_name="$RELEASE_TAG" \
+              -f target_commitish="$target_sha" \
+              -f name="VontaqFS $RELEASE_TAG" \
               -F draft=true \
               -F prerelease=false \
               --raw-field body="$(cat release-notes.md)" \
@@ -154,7 +167,7 @@ jobs:
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       VONTAQFS_UPDATE_ENDPOINT: https://github.com/${{ github.repository }}/releases/latest/download/latest.json
       VONTAQFS_PUBLIC_REPOSITORY_URL: https://github.com/${{ github.repository }}
-      VONTAQFS_PUBLIC_REPOSITORY_REF: ${{ github.ref_name }}
+      VONTAQFS_PUBLIC_REPOSITORY_REF: ${{ env.RELEASE_TAG }}
       VONTAQFS_UPDATER_PUBLIC_KEY: ${{ vars.VONTAQFS_UPDATER_PUBLIC_KEY }}
       WINDOWS_SIGNING_MODE: ${{ vars.WINDOWS_SIGNING_MODE }}
       MACOS_SIGNING_MODE: ${{ vars.MACOS_SIGNING_MODE }}
@@ -170,6 +183,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
       - uses: actions/setup-node@v6
         with:
@@ -291,7 +305,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
-          tagName: ${{ github.ref_name }}
+          tagName: ${{ env.RELEASE_TAG }}
           releaseDraft: true
           prerelease: false
           retryAttempts: 2
@@ -346,6 +360,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
@@ -360,18 +376,26 @@ jobs:
       - name: Report deferred npm publication
         if: vars.PUBLISH_NPM != 'true'
         run: echo 'PUBLISH_NPM is not true; GitHub release may proceed and npm publication remains owner-deferred.'
-      - name: Refuse an already-published immutable version
+      - id: npm_state
+        name: Check immutable npm package publication state
         if: vars.PUBLISH_NPM == 'true'
         shell: bash
         run: |
           set -euo pipefail
           VERSION="$(node -p "require('./packages/sdk/package.json').version")"
-          if npm view "@vontaq/fs@$VERSION" version >/dev/null 2>&1; then
-            echo "@vontaq/fs@$VERSION already exists; refusing to republish an immutable package version." >&2
+          PUBLISHED="$(npm view "@vontaq/fs@$VERSION" version 2>/dev/null || true)"
+          if [ "$PUBLISHED" = "$VERSION" ]; then
+            npm view "@vontaq/fs@$VERSION" name version dist.integrity dist.tarball --json
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+            echo "@vontaq/fs@$VERSION is already immutable on npm; treating this as a safe release rerun and skipping republish."
+          elif [ -n "$PUBLISHED" ]; then
+            echo "Unexpected npm version response for @vontaq/fs@$VERSION: $PUBLISHED" >&2
             exit 1
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Publish public SDK through npm Trusted Publishing/OIDC
-        if: vars.PUBLISH_NPM == 'true'
+        if: vars.PUBLISH_NPM == 'true' && steps.npm_state.outputs.already_published != 'true'
         run: npm publish --workspace @vontaq/fs --access public
 
   finalize-release:
@@ -387,6 +411,13 @@ jobs:
       RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Checkout release-control scripts from this workflow commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: .release-control
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
@@ -424,7 +455,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="$(node -p "require('./package.json').version")"
-          node scripts/release/generate-updater-json.mjs --dir release-assets --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" --version "$VERSION" --notes release-assets/SIGNING_NOTICE.txt
+          node scripts/release/generate-updater-json.mjs --dir release-assets --repo "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" --version "$VERSION" --notes release-assets/SIGNING_NOTICE.txt
           node scripts/release/generate-checksums.mjs release-assets
           node scripts/release/verify-assets.mjs release-assets
       - name: Upload release metadata by ID
@@ -477,12 +508,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          RELEASE_JSON="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")"
-          test "$(jq -r '.tag_name' <<< "$RELEASE_JSON")" = "$GITHUB_REF_NAME"
-          test "$(jq -r '.draft' <<< "$RELEASE_JSON")" = "false"
-          test "$(jq -r '.prerelease' <<< "$RELEASE_JSON")" = "false"
           VERSION="$(node -p "require('./package.json').version")"
-          npm run release:verify-published-updater -- --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" --version "$VERSION"
+          node .release-control/scripts/release/verify-published-updater.mjs \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "$RELEASE_TAG" \
+            --version "$VERSION" \
+            --release-id "$RELEASE_ID"
 
   cleanup-failed-release:
     name: Cleanup failed GitHub Release
@@ -502,7 +533,7 @@ jobs:
           set -euo pipefail
           if gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >/dev/null 2>&1; then
             gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >/dev/null
-            echo "Deleted failed GitHub Release id=$RELEASE_ID; git tag $GITHUB_REF_NAME remains intact."
+            echo "Deleted failed GitHub Release id=$RELEASE_ID; git tag $RELEASE_TAG remains intact."
           else
             echo "Release id=$RELEASE_ID is already absent; nothing to clean up."
           fi

@@ -100,6 +100,10 @@ test('Windows updater manifest preserves installer family with legacy fallback a
   assert.equal(pkg.scripts['release:verify-published-updater'], 'node scripts/release/verify-published-updater.mjs');
   assert.match(updaterPublishedVerifier, /windows-x86_64-msi/);
   assert.match(updaterPublishedVerifier, /Range: 'bytes=0-0'/);
+  assert.match(updaterPublishedVerifier, /releases\/download\/\$\{encodedTag\}\/latest\.json/);
+  assert.match(updaterPublishedVerifier, /releases\/latest\/download\/latest\.json/);
+  assert.match(updaterPublishedVerifier, /GitHub latest-release API/);
+  assert.match(updaterPublishedVerifier, /did not converge after/);
 });
 
 test('GitHub production release blocks on full release tests and explicit timeouts', () => {
@@ -178,14 +182,22 @@ test('free macOS mode uses Tauri ad-hoc signing without Apple certificate secret
   assert.match(releaseWorkflow, /Configure macOS signing[\s\S]*env:[\s\S]*APPLE_CERTIFICATE:[\s\S]*developer-id\)/);
 });
 
-test('draft GitHub release lifecycle is keyed by release ID, publicly verified, and cleaned on failure', () => {
+test('draft GitHub release lifecycle is keyed by release ID, supports same-tag recovery, and publicly verifies updater transport', () => {
+  assert.match(releaseWorkflow, /workflow_dispatch:[\s\S]*tag:[\s\S]*Existing release tag to build\/recover/);
+  assert.match(releaseWorkflow, /RELEASE_TAG: \$\{\{ inputs\.tag \|\| github\.ref_name \}\}/);
+  assert.match(releaseWorkflow, /ref: \$\{\{ env\.RELEASE_TAG \}\}/);
   assert.match(releaseWorkflow, /Create or resume draft GitHub Release by ID/);
+  assert.match(releaseWorkflow, /target_sha="\$\(git rev-list -n 1 "\$RELEASE_TAG"\)"/);
   assert.match(releaseWorkflow, /release_id=\$release_id/);
   assert.match(releaseWorkflow, /RELEASE_ID: \$\{\{ needs\.create-release\.outputs\.release_id \}\}/);
   assert.match(releaseWorkflow, /releases\/\$RELEASE_ID\/assets/);
   assert.match(releaseWorkflow, /releases\/\$RELEASE_ID"/);
+  assert.match(releaseWorkflow, /Check immutable npm package publication state/);
+  assert.match(releaseWorkflow, /already_published=true/);
+  assert.match(releaseWorkflow, /safe release rerun and skipping republish/);
   assert.match(releaseWorkflow, /Verify published release identity and updater transport/);
-  assert.match(releaseWorkflow, /release:verify-published-updater/);
+  assert.match(releaseWorkflow, /\.release-control\/scripts\/release\/verify-published-updater\.mjs/);
+  assert.match(releaseWorkflow, /--release-id "\$RELEASE_ID"/);
   assert.match(releaseWorkflow, /cleanup-failed-release:/);
   assert.match(releaseWorkflow, /Delete incomplete or broken release; keep git tag for a safe rerun/);
   assert.match(releaseWorkflow, /--method DELETE "repos\/\$GITHUB_REPOSITORY\/releases\/\$RELEASE_ID"/);
