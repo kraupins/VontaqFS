@@ -190,6 +190,11 @@ test('draft GitHub release lifecycle is keyed by release ID, supports same-tag r
   assert.doesNotMatch(releaseWorkflow, /\$\{\{ env\.RELEASE_TAG \}\}/);
   assert.match(releaseWorkflow, /Create or resume draft GitHub Release by ID/);
   assert.match(releaseWorkflow, /target_sha="\$\(git rev-list -n 1 "\$RELEASE_TAG"\)"/);
+  assert.match(releaseWorkflow, /Require workflow-capable release token for manual same-tag recovery/);
+  assert.match(releaseWorkflow, /RELEASE_GITHUB_TOKEN: \$\{\{ secrets\.RELEASE_GITHUB_TOKEN \}\}/);
+  assert.match(releaseWorkflow, /secrets\.RELEASE_GITHUB_TOKEN \|\| github\.token/);
+  assert.match(releaseWorkflow, /Contents: Read and write and Workflows: Read and write/);
+  assert.doesNotMatch(releaseWorkflow, /-f target_commitish="\$target_sha"/);
   assert.match(releaseWorkflow, /release_id=\$release_id/);
   assert.match(releaseWorkflow, /RELEASE_ID: \$\{\{ needs\.create-release\.outputs\.release_id \}\}/);
   assert.match(releaseWorkflow, /releases\/\$RELEASE_ID\/assets/);

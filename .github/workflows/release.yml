@@ -96,10 +96,20 @@ jobs:
           set -euo pipefail
           VERSION="$(node -p "require('./package.json').version")"
           node scripts/release/extract-changelog-section.mjs "$VERSION" release-notes.md
+      - name: Require workflow-capable release token for manual same-tag recovery
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RELEASE_GITHUB_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RELEASE_GITHUB_TOKEN" ]; then
+            echo "::error::Manual same-tag recovery requires secret RELEASE_GITHUB_TOKEN. Use a fine-grained token limited to this repository with Contents: Read and write and Workflows: Read and write (or a classic PAT with repo + workflow)."
+            exit 1
+          fi
       - id: release
         name: Create or resume draft GitHub Release by ID
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN || github.token }}
         run: |
           set -euo pipefail
           target_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
@@ -114,7 +124,6 @@ jobs:
           else
             release_id="$(gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
               -f tag_name="$RELEASE_TAG" \
-              -f target_commitish="$target_sha" \
               -f name="VontaqFS $RELEASE_TAG" \
               -F draft=true \
               -F prerelease=false \
@@ -302,7 +311,7 @@ jobs:
       - name: Build, sign and upload release artifacts
         uses: tauri-apps/tauri-action@v1
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN || github.token }}
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           tagName: ${{ inputs.tag || github.ref_name }}
@@ -424,7 +433,7 @@ jobs:
           package-manager-cache: false
       - name: Download draft release assets by ID
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN || github.token }}
         run: |
           set -euo pipefail
           mkdir -p release-assets
@@ -460,7 +469,7 @@ jobs:
           node scripts/release/verify-assets.mjs release-assets
       - name: Upload release metadata by ID
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN || github.token }}
         run: |
           set -euo pipefail
           upload_asset() {
@@ -484,7 +493,7 @@ jobs:
           upload_asset release-assets/SIGNING_NOTICE.txt
       - name: Prepend signing notice to release notes by ID
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN || github.token }}
         run: |
           set -euo pipefail
           CURRENT_NOTES="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq '.body // ""')"
@@ -499,13 +508,13 @@ jobs:
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --input release-assets/release-update.json >/dev/null
       - name: Publish release only after all gates succeed
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN || github.token }}
         run: |
           set -euo pipefail
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false -f make_latest=true >/dev/null
       - name: Verify published release identity and updater transport
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN || github.token }}
         run: |
           set -euo pipefail
           VERSION="$(node -p "require('./package.json').version")"
@@ -528,7 +537,7 @@ jobs:
     steps:
       - name: Delete incomplete or broken release; keep git tag for a safe rerun
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN || github.token }}
         run: |
           set -euo pipefail
           if gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >/dev/null 2>&1; then
