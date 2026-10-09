@@ -92,6 +92,7 @@ function validateRelease(release, label) {
   if (release?.tag_name !== tag) throw new Error(`${label} tag ${release?.tag_name ?? '(missing)'} does not match ${tag}`);
   if (release?.draft !== false) throw new Error(`${label} is still draft=${String(release?.draft)}`);
   if (release?.prerelease !== false) throw new Error(`${label} has prerelease=${String(release?.prerelease)}`);
+  if (!release?.tarball_url || !release?.zipball_url) throw new Error(`${label} is not bound to a published Git tag archive.`);
   return release;
 }
 
@@ -106,10 +107,11 @@ function validateManifest(manifest, label) {
 
 async function verifyReleaseIdentity() {
   if (releaseId) {
-    return retry(`release id ${releaseId}`, async () => {
-      const release = await fetchJson(`${githubApiBase}/releases/${encodeURIComponent(releaseId)}`, `release id ${releaseId}`, githubApiHeaders());
-      return validateRelease(release, `release id ${releaseId}`);
-    }, Math.min(attempts, 12));
+    // A concrete release ID already existed throughout this workflow. Identity
+    // mismatch here is deterministic workflow corruption, not CDN propagation;
+    // fail immediately instead of retrying the same broken release for a minute.
+    const release = await fetchJson(`${githubApiBase}/releases/${encodeURIComponent(releaseId)}`, `release id ${releaseId}`, githubApiHeaders());
+    return validateRelease(release, `release id ${releaseId}`);
   }
   return retry(`release ${tag}`, async () => {
     const release = await fetchJson(`${githubApiBase}/releases/tags/${encodedTag}`, `release ${tag}`, githubApiHeaders());

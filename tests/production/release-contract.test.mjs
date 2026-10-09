@@ -104,6 +104,9 @@ test('Windows updater manifest preserves installer family with legacy fallback a
   assert.match(updaterPublishedVerifier, /releases\/latest\/download\/latest\.json/);
   assert.match(updaterPublishedVerifier, /GitHub latest-release API/);
   assert.match(updaterPublishedVerifier, /did not converge after/);
+  assert.match(updaterPublishedVerifier, /not bound to a published Git tag archive/);
+  assert.match(updaterPublishedVerifier, /deterministic workflow corruption/);
+  assert.doesNotMatch(updaterPublishedVerifier, /retry\(`release id \${releaseId}`/);
 });
 
 test('GitHub production release blocks on full release tests and explicit timeouts', () => {
@@ -195,6 +198,17 @@ test('draft GitHub release lifecycle is keyed by release ID, supports same-tag r
   assert.match(releaseWorkflow, /secrets\.RELEASE_GITHUB_TOKEN \|\| github\.token/);
   assert.match(releaseWorkflow, /Contents: Read and write and Workflows: Read and write/);
   assert.doesNotMatch(releaseWorkflow, /-f target_commitish="\$target_sha"/);
+  assert.match(releaseWorkflow, /startswith[^(]*\(.*untagged-/);
+  assert.match(releaseWorkflow, /Recovering draft release id=\$release_id from placeholder tag/);
+  assert.match(releaseWorkflow, /Deleting broken published placeholder release id=\$release_id/);
+  assert.match(releaseWorkflow, /GITHUB_EVENT_NAME:-.*workflow_dispatch/);
+  assert.match(releaseWorkflow, /\{tag_name: \$tag, name: \$name, body: \$body, draft: true, prerelease: false\}/);
+  assert.match(releaseWorkflow, /\{tag_name: \$tag, name: \$name, draft: false, prerelease: false, make_latest: "true"\}/);
+  assert.match(releaseWorkflow, /Draft release identity mismatch after update/);
+  assert.match(releaseWorkflow, /Published release identity mismatch/);
+  assert.match(releaseWorkflow, /published_tarball/);
+  assert.doesNotMatch(releaseWorkflow, /\{body: \$body\}/);
+  assert.doesNotMatch(releaseWorkflow, /-F draft=false -f make_latest=true/);
   assert.match(releaseWorkflow, /release_id=\$release_id/);
   assert.match(releaseWorkflow, /RELEASE_ID: \$\{\{ needs\.create-release\.outputs\.release_id \}\}/);
   assert.match(releaseWorkflow, /releases\/\$RELEASE_ID\/assets/);
