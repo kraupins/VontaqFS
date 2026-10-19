@@ -2,11 +2,11 @@
 
 VontaqFS is a local-first desktop storage runtime. Applications connect through the public TypeScript package `@vontaq/fs`; filesystem paths, pairing credentials and runtime internals stay behind the SDK/runtime boundary.
 
-**Current coordinated release candidate:** use `@vontaq/fs@0.2.3` with VontaqFS Runtime/Desktop `0.2.3` for new dual-method streaming. Version 0.2.1 is the stabilized compatibility baseline for the supported Figma Plugin host path. Earlier 0.1.x and 0.2.0 releases remain compatible with their existing persisted data and protocol contracts, but they do not contain the complete 0.2.1 Figma host integration.
+**Current release:** `@vontaq/fs@0.2.3` with VontaqFS Runtime/Desktop `0.2.3`. Version 0.2.3 adds authorized binary PUT/POST streaming and status-based recovery. Version 0.2.1 introduced the public Figma Plugin host adapter; earlier releases remain historical compatibility baselines for their existing API and data contracts.
 
 VontaqFS — локальный desktop-runtime хранения данных. Приложения подключаются через публичный TypeScript-пакет `@vontaq/fs`; физические пути файловой системы, pairing credentials и внутреннее устройство runtime не входят в обычный API клиента.
 
-**Текущий согласованный release candidate:** используйте `@vontaq/fs@0.2.3` с Runtime/Desktop `0.2.3` для PUT/POST streaming. Версия 0.2.1 — стабилизированная база совместимости для поддерживаемой интеграции с Figma Plugin. Релизы 0.1.x и 0.2.0 сохраняют совместимость со своими существующими данными и protocol contracts, но не содержат полного Figma host path из 0.2.1.
+**Текущий релиз:** `@vontaq/fs@0.2.3` с VontaqFS Runtime/Desktop `0.2.3`. Версия 0.2.3 добавляет авторизованный бинарный PUT/POST streaming и восстановление через статус операции. В 0.2.1 появился публичный адаптер для Figma Plugin; более ранние версии остаются историческими базами совместимости своих API и данных.
 
 ---
 
@@ -27,13 +27,13 @@ import { createFigmaConnectOptions } from '@vontaq/fs/figma';
 
 A compatible VontaqFS Desktop application must be installed and running on the user's computer. The SDK automatically discovers the official local runtime endpoint; production integrations should not probe or hard-code a single port themselves.
 
-For a new Figma Plugin integration, pin the supported baseline explicitly while adopting the host adapter:
+For new integrations, including Figma plugins, use the current SDK release:
 
 ```bash
 npm install @vontaq/fs@0.2.3
 ```
 
-The historical 0.1.x/0.2.0 → 0.2.1 migration preserved both storage and registry v1. **This 0.2.3 candidate advances internal registry to v2**, while portable storage remains v1; back up the registry before upgrade.
+The historical 0.1.x/0.2.0 → 0.2.1 migration preserved both storage and registry v1. **Release 0.2.3 upgrades only the private SQLite registry to schema v2**, while portable Storage Format remains v1. Back up the registry before upgrading; older Runtimes cannot read schema v2.
 
 ### 2. Connection and pairing
 
@@ -215,15 +215,12 @@ const writer = await fs.files.createWriter('/large/output.bin', {
   declaredSize: 10_000_000,
 });
 
-try {
-  await writer.write(chunkA);
-  await writer.write(chunkB);
-  await writer.commit();
-} catch (error) {
-  await writer.abort();
-  throw error;
-}
+await writer.write(chunkA);
+await writer.write(chunkB);
+await writer.commit();
 ```
+
+For a confirmed open stream that you choose to discard, use `await writer.abort()`. Do not interpret an unacknowledged abort, chunk or commit request as a confirmed terminal outcome. For an uncertain transport result, inspect the SDK error and reconcile with Runtime status before starting a new write.
 
 The default high-level materialization limit is exported as `VONTAQ_FS_MATERIALIZATION_LIMIT_BYTES`.
 
@@ -527,7 +524,7 @@ Published Figma manifests must allow the official loopback endpoints. The SDK ex
 
 The repository fixture under `examples/figma-plugin/` builds both main and UI bundles using only public `@vontaq/fs` APIs.
 
-**Widgets.** `getFigmaClientIdentity()` / `createFigmaConnectOptions()` can derive an application identity from `figma.widgetId`, but the 0.2.1 production host path documented and release-gated here is the **Figma Plugin main + UI iframe** integration. Do not treat the plugin relay example as a verified Figma Widget transport contract unless your widget host provides an equivalent supported bridge and you validate it in that host.
+**Widgets.** `getFigmaClientIdentity()` / `createFigmaConnectOptions()` can derive an application identity from `figma.widgetId`, but the supported Figma Plugin host path documented here is the **Figma Plugin main + UI iframe** integration. Do not treat the plugin relay example as a verified Figma Widget transport contract unless the widget host provides an equivalent supported transport and you validate it in that host.
 
 ### 17. Runtime lifecycle
 
@@ -567,13 +564,13 @@ import { createFigmaConnectOptions } from '@vontaq/fs/figma';
 
 На компьютере пользователя должен быть установлен и запущен совместимый VontaqFS Desktop. SDK самостоятельно находит официальный локальный runtime; production-интеграции не должны вручную перебирать порты или рассчитывать на один фиксированный порт.
 
-Для новой интеграции с Figma Plugin при подключении host adapter рекомендуется явно использовать стабилизированную базовую версию:
+Для новых интеграций, включая плагины Figma, используйте актуальную версию SDK:
 
 ```bash
 npm install @vontaq/fs@0.2.3
 ```
 
-Исторический переход 0.1.x/0.2.0 → 0.2.1 сохранял storage/registry v1. **Этот кандидат 0.2.3 обновляет внутреннюю registry до v2**, сохраняя переносимый Storage Format v1; перед обновлением сделайте резервную копию registry.
+Исторический переход 0.1.x/0.2.0 → 0.2.1 сохранял storage/registry v1. **Релиз 0.2.3 обновляет только внутреннюю SQLite registry до schema v2**, сохраняя переносимый Storage Format v1. Перед обновлением сделайте резервную копию registry: старый Runtime не сможет открыть новую schema.
 
 ### 2. Подключение и pairing
 
@@ -739,15 +736,12 @@ const writer = await fs.files.createWriter('/large/output.bin', {
   declaredSize: 10_000_000,
 });
 
-try {
-  await writer.write(chunkA);
-  await writer.write(chunkB);
-  await writer.commit();
-} catch (error) {
-  await writer.abort();
-  throw error;
-}
+await writer.write(chunkA);
+await writer.write(chunkB);
+await writer.commit();
 ```
+
+Если поток заведомо открыт и больше не нужен, вызовите `await writer.abort()`. Отсутствие ответа на abort, запись чанка или commit **не** подтверждает отмену либо завершение. При неопределённом результате следует свериться с Runtime status, прежде чем начинать новую запись.
 
 Стандартный лимит высокоуровневой материализации экспортируется как `VONTAQ_FS_MATERIALIZATION_LIMIT_BYTES`.
 
@@ -1031,7 +1025,7 @@ Helpers composable: они не заменяют глобальные message ha
 
 Repository fixture `examples/figma-plugin/` собирает main и UI bundle только на публичных API `@vontaq/fs`.
 
-**Widgets.** `getFigmaClientIdentity()` / `createFigmaConnectOptions()` умеют получить application identity из `figma.widgetId`, но production host path, документированный и release-gated в 0.2.1, — это именно **Figma Plugin main + UI iframe**. Не следует считать plugin relay автоматически подтверждённым transport contract для Figma Widget без эквивалентного поддерживаемого bridge и отдельной проверки в widget host.
+**Widgets.** `getFigmaClientIdentity()` / `createFigmaConnectOptions()` умеют получить application identity из `figma.widgetId`, но описанный здесь поддерживаемый host path — это именно **Figma Plugin main + UI iframe**. Не следует считать plugin relay автоматически подтверждённым transport contract для Figma Widget без эквивалентного поддерживаемого транспорта и отдельной проверки в widget host.
 
 ### 17. Завершение работы клиента
 
@@ -1059,8 +1053,8 @@ await fs.close();
 - module format: ESM
 - package Node engine metadata: Node.js 18+
 - production runtime endpoint pool: `localhost:47833`–`localhost:47836`
-- current source candidate (not released): SDK/Runtime/Desktop `0.2.3` (Bridge `0.9.4`)
-- recommended baseline for new Figma Plugin integrations: `>=0.2.1`
+- current release: SDK/Runtime/Desktop `0.2.3`
+- recommended SDK for new integrations (including Figma plugins): `@vontaq/fs@0.2.3`
 - 0.1.x and 0.2.0: historical preview/integration releases; existing compatible data is preserved, but the stabilized public Figma Plugin host path starts at 0.2.1
 - protocol range in this release: v1
 - portable user storage format: v1; private SQLite registry schema: v2 (requires backup for downgrade)
@@ -1071,10 +1065,38 @@ For exact compile-time types and constants, the installed package declarations a
 Для точных TypeScript-типов, констант и сигнатур источником истины являются declarations установленного пакета.
 
 
-## Development candidate — explicit dual-method chunk transport (2026-10-17, NOT RELEASED)
+## VontaqFS 0.2.3 — authorized PUT/POST streaming / Авторизованная передача PUT/POST
 
-The code in the attached development archive introduces explicit `supportedChunkMethods: ['PUT','POST']` at first pairing approval. A persisted per-connection Runtime policy chooses exactly one method; existing pairings migrate as PUT-only. The authorized user chooses between the supported methods in VontaqFS Desktop → Settings → Data transfer, with revision-based CAS; changing the preference affects **new streams only**. The SDK pins the method from begin to commit, validates ACK identity/sequence/bytes, and queries Runtime stream status after ambiguous responses. A missing response is **not** proof of failure. No automatic PUT-to-POST fallback exists.
+### English
 
-The protocol uses version **v1 with explicit feature negotiation** (`chunk-upload-post`, `stream-status`); GET `/v1/streams/write/{streamId}/status`, POST `/v1/streams/write/resolve`, POST `/v1/streams/write/capability`, and POST `/v1/streams/write/{streamId}/{seq}/chunk` are development-only additions requiring the matching Runtime/SDK pair. Chunk media is **application/octet-stream**, not JSON or Base64. A health capability alone does not grant the method: Runtime enforces approved pairing declaration and local selected preference. The SDK calls the authenticated capability endpoint before each begin.
+Applications may declare `supportedChunkMethods: ['PUT', 'POST']` when requesting pairing for the first time. The declaration describes client support; it does **not** itself authorize a method. The user approves the connection in VontaqFS Desktop and selects the preferred **permitted** method in Settings → Data transfer. Existing pairings retain PUT-only rights until explicitly reauthorized, and a settings change affects only newly begun streams.
 
-**Compatibility & release warning:** Source release metadata is prepared for SDK/Runtime 0.2.3 and Bridge 0.9.4, but these builds are not validated or published by this archive. Internal registry schema v2 is distinct from portable Storage Format v1. Downgrades require restoring a verified registry backup, not changing the schema number. Old binaries cannot operate on a v2 registry. Real Windows/Figma E2E, native security, recovery and migration testing have not been performed in this implementation handoff. Do not enable production delivery without the checklist in `../CP7_VALIDATION_HANDOFF.md` and explicit owner acceptance of non-durable unsaved Meta drafts. Corporate IT transfer restrictions must be respected.
+```ts
+const fs = await VontaqFS.connect({
+  application: {
+    kind: 'other-supported-client',
+    externalId: 'com.example.plugin',
+    displayName: 'Example Plugin',
+  },
+  stateStore,
+  supportedChunkMethods: ['PUT', 'POST'],
+});
+
+await fs.writeFile('/data/example.bin', bytes);
+```
+
+The SDK requests the Runtime-selected method, pins it for the lifetime of the stream, validates chunk acknowledgements, and reconciles ambiguous outcomes. Missing HTTP responses do not prove a write failed or was rolled back. There is **no automatic PUT-to-POST fallback**.
+
+Protocol v1 advertises optional `chunk-upload-post` and `stream-status` features. POST chunks carry raw `application/octet-stream`, not JSON/Base64. Authenticated stream endpoints include `POST /v1/streams/write/capability`, `GET /v1/streams/write/{streamId}/status`, `POST /v1/streams/write/resolve`, and `POST /v1/streams/write/{streamId}/{seq}/chunk`. These requests still require pairing credentials and the applicable space permissions; the client cannot set its own Desktop transport preference over the public HTTP interface.
+
+**Upgrade/downgrade:** Portable Storage Format remains v1, while the private SQLite registry migrates from schema v1 to v2. For rollback, restore a previously saved compatible registry with the older Runtime binary; never edit schema version numbers to force a downgrade. Use network transport methods only where permitted by organizational policy.
+
+### Русский
+
+При запросе первого сопряжения приложение может указать `supportedChunkMethods: ['PUT', 'POST']`. Это **объявление поддержки клиентом**, а не выдача разрешения. Пользователь подтверждает приложение в VontaqFS Desktop и выбирает разрешённый метод в Settings → Передача данных. Старые подключения сохраняют PUT-only права до повторной авторизации; переключение влияет только на новые потоки.
+
+SDK запрашивает выбранный Runtime метод, закрепляет его за потоком, проверяет ACK и сверяет неоднозначный результат с Runtime. Отсутствие HTTP-ответа **не** означает, что запись не была выполнена. Автоматического переключения PUT → POST при ошибке нет.
+
+В HTTP protocol v1 добавлены согласуемые возможности `chunk-upload-post` и `stream-status`. POST-чанки содержат бинарный `application/octet-stream`, не JSON/Base64. Маршруты `capability`, `status`, `resolve` и `chunk` требуют обычной авторизации pairing и соответствующих прав space; клиент не может менять настройку Desktop по публичному HTTP API.
+
+**Обновление и откат:** переносимый Storage Format остаётся v1, внутренняя SQLite registry мигрирует с schema v1 на v2. Для отката нужна ранее сохранённая совместимая копия registry и старая версия Runtime. Нельзя принудительно понижать номер schema. Используйте разрешённые корпоративной политикой транспортные методы.
