@@ -2,16 +2,16 @@
 
 All notable public changes to VontaqFS are documented here.
 
-**Current release:** VontaqFS Runtime/Desktop `0.2.3` and public TypeScript SDK `@vontaq/fs@0.2.3`. The HTTP wire protocol remains v1 and the portable Storage Format remains v1. The private SQLite registry schema advances to v2; a downgrade requires restoring a compatible registry backup.
+**Current release:** VontaqFS Runtime/Desktop `0.2.4` and public TypeScript SDK `@vontaq/fs@0.2.4`. The HTTP wire protocol remains v1 and the portable Storage Format remains v1. The private SQLite registry uses schema v2 (introduced in 0.2.3); a downgrade requires restoring a compatible registry backup.
 
-## [0.2.4] - 2026-10-19 (source candidate, unpublished)
+## [0.2.4] - 2026-10-19
 
 - SDK: coalesced serialized JSON and text payloads into bounded UTF-8 stream chunks to avoid request amplification; existing direct/stream thresholds and ACK semantics are unchanged.
 - Desktop: dark-mode radio control for the already-authorized PUT/POST selection, with keyboard focus and forced-colors support.
 - Desktop/Runtime: explicit per-space deletion and permanent application-record removal with `DELETE` confirmation, active-session/stream checks, and user-visible failure reporting. External plugin installations and previously exported OS files are not removed.
 - Storage: FK-complete transactional cleanup of managed space/application registry rows, and quarantine recovery for interrupted destructive operations before registry commit.
-- Runtime (source implementation): per-stream synchronization and blocking-worker write/commit/abort; the global stream lookup mutex no longer surrounds disk I/O or durable journal updates. Added checked per-reader open handles and independent-offset reads with ETag/version/size verification.
-- No changes to portable storage format, PUT/POST authorization policy, wire protocol or durable journal semantics. The `0.2.4` changes are an unpublished source candidate and require release-gate and Windows Desktop validation before publication.
+- Runtime: per-stream synchronization and blocking-worker write/commit/abort; the global stream lookup mutex no longer surrounds disk I/O or durable journal updates. Added checked per-reader open handles and independent-offset reads with ETag/version/size verification.
+- Compatibility: portable storage format v1, HTTP wire protocol v1, SQLite registry schema v2, PUT/POST authorization policy and durable journal semantics remain unchanged from 0.2.3.
 
 
 ## [0.2.3] - 2026-10-17

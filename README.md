@@ -2,7 +2,7 @@
 
 ## English
 
-VontaqFS is a local-first desktop storage runtime for applications and plugins built by independent developers, including supported Figma integrations. It keeps application data on your computer and provides controlled local storage, import/export, backup, snapshots, and application access management.
+VontaqFS is a local-first desktop storage runtime for applications and plugins built by independent developers, including supported Figma integrations. It keeps application data on your computer and provides controlled local storage, import/export, backup, snapshots, and application access management. **Current release: 0.2.4** (Runtime, Desktop and `@vontaq/fs` SDK).
 
 ### What VontaqFS does
 
@@ -19,9 +19,9 @@ VontaqFS does not bypass the security restrictions of a host application or oper
 
 ### PUT / POST transfer (0.2.3)
 
-VontaqFS 0.2.3 supports authorized binary PUT and POST stream uploads. During pairing, an integration can declare PUT, POST, or both. In Desktop Settings → Data transfer, the local user selects **one supported and authorized method per connection**. Runtime enforces that choice for new streams; already-active streams keep their original method. Previously approved connections remain PUT-only until explicitly reauthorized for additional methods.
+VontaqFS 0.2.4 supports authorized binary PUT and POST stream uploads (introduced in 0.2.3). During pairing, an integration can declare PUT, POST, or both. In Desktop Settings → Data transfer, the local user selects **one supported and authorized method per connection**. Runtime enforces that choice for new streams; already-active streams keep their original method. Previously approved connections remain PUT-only until explicitly reauthorized for additional methods.
 
-The SDK `@vontaq/fs@0.2.3` discovers the Runtime-selected method; application developers do not need to implement method switching in ordinary Files API calls. There is no automatic PUT-to-POST fallback, no bypass of organization policies, and no transfer without the relevant pairing and space authorization. Internal registry schema v2 requires a compatible registry backup for downgrades; see [the changelog](CHANGELOG.md).
+The SDK `@vontaq/fs@0.2.4` discovers the Runtime-selected method; application developers do not need to implement method switching in ordinary Files API calls. There is no automatic PUT-to-POST fallback, no bypass of organization policies, and no transfer without the relevant pairing and space authorization. Internal registry schema v2 requires a compatible registry backup for downgrades; see [the changelog](CHANGELOG.md).
 
 ### First start
 
@@ -36,7 +36,7 @@ The production Runtime uses the official loopback endpoint pool `localhost:47833
 
 Normal VontaqFS storage is local. Revoking a pairing removes access **without deleting stored data**. Uninstalling VontaqFS does not intentionally erase managed user data by default.
 
-**VontaqFS 0.2.4 source candidate (not yet published):** In Desktop → Applications, you can delete an individual managed storage space, or choose **Remove application completely** to permanently remove that application's VontaqFS-managed spaces, pairing records, grants and associated settings. Enter `DELETE` to confirm. Disconnect active sessions first; removal is refused while an application has active sessions or unresolved storage streams. This does **not** uninstall the external plugin/application or remove files previously exported to user-selected OS folders. These controls are not features of the published 0.2.3 release.
+**VontaqFS 0.2.4:** In Desktop → Applications, you can delete an individual managed storage space, or choose **Remove application completely** to permanently remove that application's VontaqFS-managed spaces, pairing records, grants and associated settings. Enter `DELETE` to confirm. Disconnect active sessions first; removal is refused while an application has active sessions or unresolved storage streams. This does **not** uninstall the external plugin/application or remove files previously exported to user-selected OS folders.
 
 ### Updates
 
@@ -55,7 +55,7 @@ VontaqFS source may be used, copied, modified and redistributed under the Vontaq
 
 ## Русский
 
-VontaqFS — локальный desktop-runtime хранения данных для приложений и плагинов сторонних разработчиков, включая поддерживаемые интеграции Figma. Он хранит данные приложений на вашем компьютере и предоставляет управляемое локальное хранилище, импорт/экспорт, резервные копии, snapshots и управление доступом приложений.
+VontaqFS — локальный desktop-runtime хранения данных для приложений и плагинов сторонних разработчиков, включая поддерживаемые интеграции Figma. Он хранит данные приложений на вашем компьютере и предоставляет управляемое локальное хранилище, импорт/экспорт, резервные копии, snapshots и управление доступом приложений. **Текущий релиз: 0.2.4** (Runtime, Desktop и SDK `@vontaq/fs`).
 
 ### Что делает VontaqFS
 
@@ -72,9 +72,9 @@ VontaqFS не обходит ограничения безопасности О�
 
 ### Передача PUT / POST (0.2.3)
 
-VontaqFS 0.2.3 поддерживает авторизованную потоковую запись бинарных данных методами PUT и POST. При сопряжении интеграция объявляет поддержку PUT, POST или обоих методов. В Desktop Settings → Передача данных пользователь выбирает **один разрешённый метод для каждого подключения**. Runtime применяет выбор к новым потокам, а активные потоки сохраняют свой метод. Ранее авторизованные подключения остаются PUT-only до явного повторного разрешения новых методов.
+VontaqFS 0.2.4 поддерживает авторизованную потоковую запись бинарных данных методами PUT и POST (доступна начиная с 0.2.3). При сопряжении интеграция объявляет поддержку PUT, POST или обоих методов. В Desktop Settings → Передача данных пользователь выбирает **один разрешённый метод для каждого подключения**. Runtime применяет выбор к новым потокам, а активные потоки сохраняют свой метод. Ранее авторизованные подключения остаются PUT-only до явного повторного разрешения новых методов.
 
-SDK `@vontaq/fs@0.2.3` получает выбранный метод от Runtime. Разработчику приложения не требуется вручную переключать HTTP-метод в обычном Files API. Автоматического fallback с PUT на POST, обхода корпоративных ограничений или передачи без необходимого разрешения нет. Для отката с внутренней SQLite registry schema v2 требуется резервная копия совместимой registry; подробнее в [CHANGELOG](CHANGELOG.md).
+SDK `@vontaq/fs@0.2.4` получает выбранный метод от Runtime. Разработчику приложения не требуется вручную переключать HTTP-метод в обычном Files API. Автоматического fallback с PUT на POST, обхода корпоративных ограничений или передачи без необходимого разрешения нет. Для отката с внутренней SQLite registry schema v2 требуется резервная копия совместимой registry; подробнее в [CHANGELOG](CHANGELOG.md).
 
 ### Первый запуск
 
@@ -89,7 +89,7 @@ Production Runtime использует официальный loopback-пул `
 
 VontaqFS хранит данные локально. Отзыв pairing прекращает доступ, **но не удаляет данные**. Деинсталляция самого VontaqFS также по умолчанию не предполагает удаления пользовательского хранилища.
 
-**Исходный кандидат VontaqFS 0.2.4 (ещё не опубликован):** в Desktop → Applications можно удалить отдельное управляемое хранилище или выбрать **«Полностью удалить приложение»** для удаления его хранилищ VontaqFS, сопряжений, разрешений на папки и связанных настроек. Для подтверждения вводится `DELETE`. Перед удалением отключите активные сессии; операция отклоняется при активных подключениях и незавершённых потоках хранения. Сам внешний плагин/приложение не деинсталлируется, а файлы, ранее экспортированные в выбранные папки ОС, не удаляются. В опубликованном релизе 0.2.3 этой функции нет.
+**VontaqFS 0.2.4:** в Desktop → Applications можно удалить отдельное управляемое хранилище или выбрать **«Полностью удалить приложение»** для удаления его хранилищ VontaqFS, сопряжений, разрешений на папки и связанных настроек. Для подтверждения вводится `DELETE`. Перед удалением отключите активные сессии; операция отклоняется при активных подключениях и незавершённых потоках хранения. Сам внешний плагин/приложение не деинсталлируется, а файлы, ранее экспортированные в выбранные папки ОС, не удаляются.
 
 ### Обновления
 

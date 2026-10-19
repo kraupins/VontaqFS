@@ -2,11 +2,11 @@
 
 VontaqFS is a local-first desktop storage runtime. Applications connect through the public TypeScript package `@vontaq/fs`; filesystem paths, pairing credentials and runtime internals stay behind the SDK/runtime boundary.
 
-**Current published release:** `@vontaq/fs@0.2.3` with VontaqFS Runtime/Desktop `0.2.3`. The `0.2.4` tree is an **unpublished source candidate**; do not assume it is available through npm or the public updater. Version 0.2.3 adds authorized binary PUT/POST streaming and status-based recovery. Version 0.2.1 introduced the public Figma Plugin host adapter; earlier releases remain historical compatibility baselines for their existing API and data contracts.
+**Current release:** `@vontaq/fs@0.2.4` with VontaqFS Runtime/Desktop `0.2.4`. Version 0.2.3 adds authorized binary PUT/POST streaming and status-based recovery. Version 0.2.1 introduced the public Figma Plugin host adapter; earlier releases remain historical compatibility baselines for their existing API and data contracts.
 
 VontaqFS — локальный desktop-runtime хранения данных. Приложения подключаются через публичный TypeScript-пакет `@vontaq/fs`; физические пути файловой системы, pairing credentials и внутреннее устройство runtime не входят в обычный API клиента.
 
-**Текущий опубликованный релиз:** `@vontaq/fs@0.2.3` с VontaqFS Runtime/Desktop `0.2.3`. Код `0.2.4` — **неопубликованный исходный кандидат**: не следует считать, что он уже доступен через npm или публичное обновление. Версия 0.2.3 добавляет авторизованный бинарный PUT/POST streaming и восстановление через статус операции. В 0.2.1 появился публичный адаптер для Figma Plugin; более ранние версии остаются историческими базами совместимости своих API и данных.
+**Текущий релиз:** `@vontaq/fs@0.2.4` с VontaqFS Runtime/Desktop `0.2.4`. Версия 0.2.3 добавляет авторизованный бинарный PUT/POST streaming и восстановление через статус операции. В 0.2.1 появился публичный адаптер для Figma Plugin; более ранние версии остаются историческими базами совместимости своих API и данных.
 
 ---
 
@@ -30,7 +30,7 @@ A compatible VontaqFS Desktop application must be installed and running on the u
 For new integrations, including Figma plugins, use the current SDK release:
 
 ```bash
-npm install @vontaq/fs@0.2.3
+npm install @vontaq/fs@0.2.4
 ```
 
 The historical 0.1.x/0.2.0 → 0.2.1 migration preserved both storage and registry v1. **Release 0.2.3 upgrades only the private SQLite registry to schema v2**, while portable Storage Format remains v1. Back up the registry before upgrading; older Runtimes cannot read schema v2.
@@ -67,7 +67,7 @@ const fs = await VontaqFS.connect({
 });
 ```
 
-On first connection, VontaqFS Desktop asks the user to approve the application. The SDK reuses the approved credential on later connections and refreshes runtime sessions automatically. A revoked application must be approved again; revoking access does not automatically delete its stored data. Beginning with the **0.2.4 Desktop source candidate** (not the published 0.2.3 release), the user can separately delete a managed storage space or permanently remove an application identity and its VontaqFS-managed data through Desktop → Applications with `DELETE` confirmation. Active sessions and unresolved streams block deletion. Previously exported OS files and the external plugin installation are unaffected. These are **Desktop administration actions**, not ordinary public SDK deletion methods.
+On first connection, VontaqFS Desktop asks the user to approve the application. The SDK reuses the approved credential on later connections and refreshes runtime sessions automatically. A revoked application must be approved again; revoking access does not automatically delete its stored data. Beginning with **Desktop 0.2.4**, the user can separately delete a managed storage space or permanently remove an application identity and its VontaqFS-managed data through Desktop → Applications with `DELETE` confirmation. Active sessions and unresolved streams block deletion. Previously exported OS files and the external plugin installation are unaffected. These are **Desktop administration actions**, not ordinary public SDK deletion methods.
 
 `developmentEndpoint` exists only for development/test overrides. Published integrations should use normal discovery.
 
@@ -567,7 +567,7 @@ import { createFigmaConnectOptions } from '@vontaq/fs/figma';
 Для новых интеграций, включая плагины Figma, используйте актуальную версию SDK:
 
 ```bash
-npm install @vontaq/fs@0.2.3
+npm install @vontaq/fs@0.2.4
 ```
 
 Исторический переход 0.1.x/0.2.0 → 0.2.1 сохранял storage/registry v1. **Релиз 0.2.3 обновляет только внутреннюю SQLite registry до schema v2**, сохраняя переносимый Storage Format v1. Перед обновлением сделайте резервную копию registry: старый Runtime не сможет открыть новую schema.
@@ -604,7 +604,7 @@ const fs = await VontaqFS.connect({
 });
 ```
 
-При первом подключении VontaqFS Desktop просит пользователя подтвердить доступ приложения. При следующих запусках SDK повторно использует разрешённый credential и автоматически обновляет runtime-сессии. После отзыва доступа требуется новое подтверждение. Отзыв доступа сам по себе не удаляет сохранённые данные. Начиная с **исходного кандидата Desktop 0.2.4** (не опубликованного релиза 0.2.3), пользователь может отдельно удалить хранилище или полностью удалить запись приложения с его управляемыми данными через Desktop → Applications с подтверждением `DELETE`. Активные сессии и незавершённые потоки блокируют удаление. Ранее экспортированные файлы ОС и установка внешнего плагина сохраняются. Это **операции администрирования Desktop**, а не методы обычного публичного SDK.
+При первом подключении VontaqFS Desktop просит пользователя подтвердить доступ приложения. При следующих запусках SDK повторно использует разрешённый credential и автоматически обновляет runtime-сессии. После отзыва доступа требуется новое подтверждение. Отзыв доступа сам по себе не удаляет сохранённые данные. Начиная с **Desktop 0.2.4**, пользователь может отдельно удалить хранилище или полностью удалить запись приложения с его управляемыми данными через Desktop → Applications с подтверждением `DELETE`. Активные сессии и незавершённые потоки блокируют удаление. Ранее экспортированные файлы ОС и установка внешнего плагина сохраняются. Это **операции администрирования Desktop**, а не методы обычного публичного SDK.
 
 `developmentEndpoint` предназначен только для разработки и тестов. Публичные интеграции используют обычное обнаружение runtime.
 
@@ -1053,8 +1053,8 @@ await fs.close();
 - module format: ESM
 - package Node engine metadata: Node.js 18+
 - production runtime endpoint pool: `localhost:47833`–`localhost:47836`
-- current release: SDK/Runtime/Desktop `0.2.3`
-- recommended SDK for new integrations (including Figma plugins): `@vontaq/fs@0.2.3`
+- current release: SDK/Runtime/Desktop `0.2.4`
+- recommended SDK for new integrations (including Figma plugins): `@vontaq/fs@0.2.4`
 - 0.1.x and 0.2.0: historical preview/integration releases; existing compatible data is preserved, but the stabilized public Figma Plugin host path starts at 0.2.1
 - protocol range in this release: v1
 - portable user storage format: v1; private SQLite registry schema: v2 (requires backup for downgrade)
