@@ -6,13 +6,23 @@ All notable public changes to VontaqFS are documented here.
 
 ## [0.2.4] - 2026-10-19
 
-- SDK: coalesced serialized JSON and text payloads into bounded UTF-8 stream chunks to avoid request amplification; existing direct/stream thresholds and ACK semantics are unchanged.
-- Desktop: dark-mode radio control for the already-authorized PUT/POST selection, with keyboard focus and forced-colors support.
-- Desktop/Runtime: explicit per-space deletion and permanent application-record removal with `DELETE` confirmation, active-session/stream checks, and user-visible failure reporting. External plugin installations and previously exported OS files are not removed.
-- Storage: FK-complete transactional cleanup of managed space/application registry rows, and quarantine recovery for interrupted destructive operations before registry commit.
-- Runtime: per-stream synchronization and blocking-worker write/commit/abort; the global stream lookup mutex no longer surrounds disk I/O or durable journal updates. Added checked per-reader open handles and independent-offset reads with ETag/version/size verification.
-- Compatibility: portable storage format v1, HTTP wire protocol v1, SQLite registry schema v2, PUT/POST authorization policy and durable journal semantics remain unchanged from 0.2.3.
+### Added
 
+- Desktop/Runtime: explicit per-space deletion and permanent application-record removal with `DELETE` confirmation, active-session/stream checks, and user-visible failure reporting. External plugin installations and previously exported OS files are not removed.
+- Desktop: dark-mode radio control for the already-authorized PUT/POST selection, with keyboard focus and forced-colors support.
+
+### Changed
+
+- SDK: coalesced serialized JSON and text payloads into bounded UTF-8 stream chunks to avoid request amplification; existing direct/stream thresholds and ACK semantics are unchanged.
+- Runtime: per-stream synchronization and blocking-worker write/commit/abort; the global stream lookup mutex no longer surrounds disk I/O or durable journal updates. Added checked per-reader open handles and independent-offset reads with ETag/version/size verification.
+
+### Fixed
+
+- Storage: FK-complete transactional cleanup of managed space/application registry rows and quarantine recovery for interrupted destructive operations before registry commit.
+
+### Compatibility
+
+- Portable Storage Format v1, HTTP wire protocol v1, private SQLite registry schema v2, PUT/POST authorization policy and durable journal semantics remain unchanged from 0.2.3.
 
 ## [0.2.3] - 2026-10-17
 
