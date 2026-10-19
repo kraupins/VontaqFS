@@ -28,10 +28,11 @@ use vontaqfs_core::{
     ExportPresetRecord, ExportPrunePolicy, FileMetadata, FileRecord, ImportConflictPolicy,
     KvRecord, LogicalPath, NativeExportMode, NativeImportMode, RestoreConflictPolicy, SpaceRecord,
     StorageCategory, StorageClass, StorageDiagnostics, StorageEngine, StorageError, StorageResult,
+    StreamOperationRecord,
 };
 use vontaqfs_protocol::{
     BatchItemErrorWire, BatchItemResultWire, BatchOperationWire, BatchRequest, BatchResponse,
-    ClearSpaceRequest, ClearSpaceResponse, ClientIdentity, ClientKind,
+    ChunkMethod, ClearSpaceRequest, ClearSpaceResponse, ClientIdentity, ClientKind,
     CreateDestinationGrantRequest, CreateSnapshotRequest, DeleteExportPresetRequest,
     DeleteFormatRequest, DeleteSnapshotRequest, DestinationGrantWire, DirectoryExportLayoutWire,
     DirectoryGrantCapabilityWire, ErrorBody, ErrorCode, ErrorResponse, EventKindWire,
@@ -63,7 +64,7 @@ use vontaqfs_protocol::{
 
 const PAIRING_RATE_WINDOW_MS: i64 = 60_000;
 const PAIRING_RATE_MAX: usize = 10;
-const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30); // Per-read inactivity, not a whole-file deadline.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const SLEEP_RESUME_GAP_MS: i64 = 45_000;
 const LIFECYCLE_RUNNING: u8 = 0;
@@ -107,6 +108,7 @@ pub struct PendingPairingSummary {
     pub application_id: String,
     pub application: ClientIdentity,
     pub client_instance_id: String,
+    pub supported_chunk_methods: Vec<ChunkMethod>,
     pub created_at_ms: i64,
     pub expires_at_ms: i64,
 }
@@ -274,6 +276,36 @@ pub struct DiagnosticsReport {
     pub recent_sanitized_logs: Vec<String>,
 }
 
+/// Trusted desktop-only DTO. POST remains runtime-disabled until the parity/safety checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionTransportSettings {
+    pub connection_id: String,
+    pub display_name: String,
+    pub authorization: String,
+    pub declared_methods: Vec<ChunkMethod>,
+    pub runtime_methods: Vec<ChunkMethod>,
+    pub allowed_methods: Vec<ChunkMethod>,
+    pub selected_method: Option<ChunkMethod>,
+    pub effective_method: Option<ChunkMethod>,
+    pub active_stream_count: usize,
+    pub blocked_reasons: HashMap<String, String>,
+    pub revision: i64,
+}
+
+/// Only callable via a locally trusted admin surface, never via localhost HTTP.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SetTransportPreference {
+    pub connection_id: String,
+    pub method: ChunkMethod,
+    pub expected_revision: i64,
+}
+
+// CP1 enables policy storage and authority but NOT the new POST binary route.
+// CP2 will enable POST only after backend parity and authorization tests.
+const ENABLE_POST_CHUNKS: bool = true; // Runtime pairing policy still gates every begin/chunk.
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopPairingSummary {
@@ -349,6 +381,131 @@ impl RuntimeHandle {
         values
     }
 
+    pub fn list_connection_transport_settings(
+        &self,
+    ) -> Result<Vec<ConnectionTransportSettings>, RuntimeAdminError> {
+        let applications = self.desktop_applications()?;
+        let streams = self
+            .state
+            .write_streams
+            .lock()
+            .map_err(|_| RuntimeAdminError::Internal("stream mutex poisoned".into()))?;
+        let mut result = Vec::new();
+        for app in applications {
+            for pairing in app.pairings {
+                let policy = self
+                    .state
+                    .storage
+                    .pairing_transport_policy(&pairing.id)?
+                    .ok_or_else(|| {
+                        RuntimeAdminError::Internal(
+                            "missing persisted pairing transport policy".into(),
+                        )
+                    })?;
+                let declared_methods = policy
+                    .declared_methods
+                    .iter()
+                    .map(|method| match method.as_str() {
+                        "PUT" => Ok(ChunkMethod::Put),
+                        "POST" => Ok(ChunkMethod::Post),
+                        _ => Err(RuntimeAdminError::Internal(
+                            "invalid persisted transport method".into(),
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let authorized = pairing.revoked_at_ms.is_none();
+                let runtime_methods = if ENABLE_POST_CHUNKS {
+                    vec![ChunkMethod::Put, ChunkMethod::Post]
+                } else {
+                    vec![ChunkMethod::Put]
+                };
+                let allowed_methods = if authorized {
+                    declared_methods
+                        .iter()
+                        .copied()
+                        .filter(|method| runtime_methods.contains(method))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let selected_method = match policy.selected_method.as_str() {
+                    "PUT" => Some(ChunkMethod::Put),
+                    "POST" => Some(ChunkMethod::Post),
+                    _ => {
+                        return Err(RuntimeAdminError::Internal(
+                            "invalid persisted selected method".into(),
+                        ))
+                    }
+                };
+                let effective_method =
+                    selected_method.filter(|method| allowed_methods.contains(method));
+                let mut blocked_reasons = HashMap::new();
+                for method in [ChunkMethod::Put, ChunkMethod::Post] {
+                    if !allowed_methods.contains(&method) {
+                        let reason = if !authorized {
+                            "UNAUTHORIZED"
+                        } else if !declared_methods.contains(&method) {
+                            "INTEGRATION_UNSUPPORTED"
+                        } else {
+                            "RUNTIME_UNSUPPORTED"
+                        };
+                        blocked_reasons.insert(method.as_str().into(), reason.into());
+                    }
+                }
+                result.push(ConnectionTransportSettings {
+                    connection_id: pairing.id.clone(),
+                    display_name: app.application.display_name.clone(),
+                    authorization: if authorized {
+                        "AUTHORIZED".into()
+                    } else {
+                        "REVOKED".into()
+                    },
+                    declared_methods,
+                    runtime_methods,
+                    allowed_methods,
+                    selected_method,
+                    effective_method,
+                    active_stream_count: streams
+                        .values()
+                        .filter(|stream| {
+                            stream.pairing_id == pairing.id && stream.committed.is_none()
+                        })
+                        .count(),
+                    blocked_reasons,
+                    revision: policy.revision,
+                });
+            }
+        }
+        result.sort_by(|a, b| a.connection_id.cmp(&b.connection_id));
+        Ok(result)
+    }
+
+    pub fn set_connection_transport_preference(
+        &self,
+        input: SetTransportPreference,
+    ) -> Result<ConnectionTransportSettings, RuntimeAdminError> {
+        let current = self
+            .list_connection_transport_settings()?
+            .into_iter()
+            .find(|setting| setting.connection_id == input.connection_id)
+            .ok_or(RuntimeAdminError::NotFound)?;
+        if current.authorization != "AUTHORIZED" || !current.allowed_methods.contains(&input.method)
+        {
+            return Err(RuntimeAdminError::Internal(
+                "chunk method is not authorized for this connection".into(),
+            ));
+        }
+        self.state.storage.set_pairing_transport_method(
+            &input.connection_id,
+            input.method.as_str(),
+            input.expected_revision,
+        )?;
+        self.list_connection_transport_settings()?
+            .into_iter()
+            .find(|setting| setting.connection_id == input.connection_id)
+            .ok_or(RuntimeAdminError::NotFound)
+    }
+
     pub fn approve_pairing(&self, request_id: &str) -> Result<PairingApproval, RuntimeAdminError> {
         self.state.prune_ephemeral();
         let mut pending =
@@ -371,10 +528,15 @@ impl RuntimeHandle {
             .state
             .storage
             .active_pairings_for_client(&entry.application_id, &entry.client_instance_id)?;
-        let pairing = self.state.storage.create_pairing(
+        let pairing = self.state.storage.create_pairing_with_transport(
             &entry.application_id,
             &entry.client_instance_id,
             &credential_hash,
+            &entry
+                .supported_chunk_methods
+                .iter()
+                .map(|method| method.as_str().to_owned())
+                .collect::<Vec<_>>(),
         )?;
         if !previous_pairings.is_empty() {
             let previous_ids = previous_pairings
@@ -418,6 +580,46 @@ impl RuntimeHandle {
     pub fn revoke_pairing(&self, persisted_pairing_id: &str) -> Result<bool, RuntimeAdminError> {
         let revoked = self.state.storage.revoke_pairing(persisted_pairing_id)?;
         if revoked {
+            // Synchronous stream mutex serializes against in-flight chunk/commit.
+            let mut writes = self
+                .state
+                .write_streams
+                .lock()
+                .map_err(|_| RuntimeAdminError::Internal("stream mutex poisoned".into()))?;
+            let ids = writes
+                .iter()
+                .filter(|(_, v)| v.pairing_id == persisted_pairing_id)
+                .map(|(k, _)| k.clone())
+                .collect::<Vec<_>>();
+            for id in ids {
+                if let Some(mut stream) = writes.remove(&id) {
+                    let mut safe_to_unlock = stream.committed.is_some();
+                    if stream.committed.is_none() {
+                        stream.file.take();
+                        if self
+                            .state
+                            .storage
+                            .abort_stream_temp(&stream.space_id, &stream.temp_path)
+                            .is_ok()
+                        {
+                            let _ = self.state.storage.finish_stream_operation(
+                                &id,
+                                persisted_pairing_id,
+                                "OPEN",
+                                "EXPIRED_FENCED",
+                                None,
+                            );
+                            safe_to_unlock = true;
+                        }
+                    }
+                    if safe_to_unlock {
+                        if let Ok(mut paths) = self.state.active_write_paths.lock() {
+                            paths.remove(&write_path_key(&stream.space_id, &stream.path));
+                        }
+                    }
+                }
+            }
+            drop(writes);
             let revoked_tokens = {
                 let mut sessions =
                     self.state.sessions.lock().map_err(|_| {
@@ -1681,6 +1883,7 @@ struct RuntimeState {
     bulk_slots: Arc<Semaphore>,
     pairing_bulk_slots: Mutex<HashMap<String, Arc<Semaphore>>>,
     write_streams: Mutex<HashMap<String, WriteStreamState>>,
+    active_upload_receives: Mutex<HashMap<String, usize>>,
     read_streams: Mutex<HashMap<String, ReadStreamState>>,
     active_write_paths: Mutex<HashMap<String, String>>,
     events: Mutex<VecDeque<BufferedEvent>>,
@@ -1717,6 +1920,7 @@ impl RuntimeState {
             bulk_slots: Arc::new(Semaphore::new(MAX_ACTIVE_BULK_REQUESTS)),
             pairing_bulk_slots: Mutex::new(HashMap::new()),
             write_streams: Mutex::new(HashMap::new()),
+            active_upload_receives: Mutex::new(HashMap::new()),
             read_streams: Mutex::new(HashMap::new()),
             active_write_paths: Mutex::new(HashMap::new()),
             events: Mutex::new(VecDeque::new()),
@@ -1822,16 +2026,27 @@ impl RuntimeState {
         }
         let mut expired = Vec::new();
         if let Ok(mut writes) = self.write_streams.lock() {
-            expired.extend(writes.drain().map(|(_, stream)| stream));
+            expired.extend(writes.drain());
         }
         if let Ok(mut paths) = self.active_write_paths.lock() {
-            for mut stream in expired {
-                paths.remove(&write_path_key(&stream.space_id, &stream.path));
+            for (stream_id, mut stream) in expired {
                 stream.file.take();
-                if stream.committed.is_none() {
-                    let _ = self
+                let safe = stream.committed.is_some()
+                    || self
                         .storage
-                        .abort_stream_temp(&stream.space_id, &stream.temp_path);
+                        .abort_stream_temp(&stream.space_id, &stream.temp_path)
+                        .is_ok();
+                if safe {
+                    if stream.committed.is_none() {
+                        let _ = self.storage.finish_stream_operation(
+                            &stream_id,
+                            &stream.pairing_id,
+                            "OPEN",
+                            "EXPIRED_FENCED",
+                            None,
+                        );
+                    }
+                    paths.remove(&write_path_key(&stream.space_id, &stream.path));
                 }
             }
         }
@@ -2458,34 +2673,56 @@ impl RuntimeState {
             });
         }
         let mut expired_writes = Vec::new();
-        if let Ok(mut writes) = self.write_streams.lock() {
+        // The receive guard lives from HTTP headers through chunk dispatch, even for a
+        // slowly arriving binary body. Lock order active_upload_receives -> write_streams.
+        if let (Ok(active), Ok(mut writes)) = (
+            self.active_upload_receives.lock(),
+            self.write_streams.lock(),
+        ) {
             let ids = writes
                 .iter()
-                .filter(|(_, stream)| stream.last_activity_ms <= now - STREAM_IDLE_TIMEOUT_MS)
+                .filter(|(id, stream)| {
+                    stream.last_activity_ms <= now - STREAM_IDLE_TIMEOUT_MS
+                        && !active.contains_key(*id)
+                })
                 .map(|(id, _)| id.clone())
                 .collect::<Vec<_>>();
             for id in ids {
                 if let Some(stream) = writes.remove(&id) {
-                    expired_writes.push(stream);
+                    expired_writes.push((id, stream));
                 }
             }
         }
         if !expired_writes.is_empty() {
             if let Ok(mut paths) = self.active_write_paths.lock() {
-                for mut stream in expired_writes {
-                    paths.remove(&write_path_key(&stream.space_id, &stream.path));
+                for (stream_id, mut stream) in expired_writes {
                     stream.file.take();
-                    if stream.committed.is_none() {
-                        let _ = self
-                            .storage
-                            .abort_stream_temp(&stream.space_id, &stream.temp_path);
+                    let cleanup = if stream.committed.is_none() {
+                        self.storage
+                            .abort_stream_temp(&stream.space_id, &stream.temp_path)
+                    } else {
+                        Ok(())
+                    };
+                    if cleanup.is_ok() {
+                        paths.remove(&write_path_key(&stream.space_id, &stream.path));
+                        if stream.committed.is_none() {
+                            let _ = self.storage.finish_stream_operation(
+                                &stream_id,
+                                &stream.pairing_id,
+                                "OPEN",
+                                "EXPIRED_FENCED",
+                                None,
+                            );
+                        }
                     }
-                    if let Some(operation_id) = stream.operation_id.as_deref() {
-                        self.fail_operation_code(
-                            operation_id,
-                            "STREAM_EXPIRED",
-                            "stream expired after being idle".into(),
-                        );
+                    if cleanup.is_ok() {
+                        if let Some(operation_id) = stream.operation_id.as_deref() {
+                            self.fail_operation_code(
+                                operation_id,
+                                "STREAM_EXPIRED",
+                                "stream expired after confirmed idle cleanup".into(),
+                            );
+                        }
                     }
                 }
             }
@@ -2802,6 +3039,7 @@ struct PendingPairing {
     application_id: String,
     application: ClientIdentity,
     client_instance_id: String,
+    supported_chunk_methods: Vec<ChunkMethod>,
     created_at_ms: i64,
     expires_at_ms: i64,
     decision: PairingDecision,
@@ -2814,6 +3052,7 @@ impl PendingPairing {
             application_id: self.application_id.clone(),
             application: self.application.clone(),
             client_instance_id: self.client_instance_id.clone(),
+            supported_chunk_methods: self.supported_chunk_methods.clone(),
             created_at_ms: self.created_at_ms,
             expires_at_ms: self.expires_at_ms,
         }
@@ -2838,6 +3077,7 @@ struct WriteStreamState {
     application_id: String,
     space_id: String,
     path: String,
+    chunk_method: ChunkMethod,
     request_id: String,
     if_match: Option<String>,
     declared_size: Option<u64>,
@@ -2853,6 +3093,98 @@ struct WriteStreamState {
     existed_before: bool,
     committed: Option<FileRecord>,
     operation_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamResolveRequest {
+    space_id: String,
+    request_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamLastChunk {
+    seq: u64,
+    length: u64,
+    sha256: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamOutcomeWire {
+    connection_id: String,
+    request_id: String,
+    stream_id: String,
+    chunk_method: String,
+    phase: String,
+    next_seq: u64,
+    confirmed_bytes: u64,
+    declared_size: Option<u64>,
+    last_accepted_chunk: Option<StreamLastChunk>,
+    result: Option<FileWire>,
+    state_revision: i64,
+    can_continue: bool,
+    can_retry: bool,
+    can_request_cancel: bool,
+    can_check_status: bool,
+}
+
+fn stream_outcome_wire(op: StreamOperationRecord, live: bool) -> StreamOutcomeWire {
+    let phase = if op.phase == "OPEN" && !live {
+        "UNCERTAIN"
+    } else {
+        op.phase.as_str()
+    };
+    let open = phase == "OPEN" && live;
+    StreamOutcomeWire {
+        connection_id: op.pairing_id,
+        request_id: op.request_id,
+        stream_id: op.stream_id,
+        chunk_method: op.method,
+        phase: phase.to_owned(),
+        next_seq: op.next_seq,
+        confirmed_bytes: op.confirmed_bytes,
+        declared_size: op.declared_size,
+        last_accepted_chunk: if op.next_seq > 0 {
+            op.last_chunk_sha256.map(|sha256| StreamLastChunk {
+                seq: op.next_seq - 1,
+                length: op.last_chunk_len,
+                sha256,
+            })
+        } else {
+            None
+        },
+        result: op.result.map(file_wire),
+        state_revision: op.state_revision,
+        can_continue: open,
+        can_retry: phase == "EXPIRED_FENCED",
+        can_request_cancel: open,
+        can_check_status: true,
+    }
+}
+
+fn stream_operation_snapshot(stream_id: &str, stream: &WriteStreamState) -> StreamOperationRecord {
+    StreamOperationRecord {
+        pairing_id: stream.pairing_id.clone(),
+        space_id: stream.space_id.clone(),
+        request_id: stream.request_id.clone(),
+        stream_id: stream_id.into(),
+        method: stream.chunk_method.as_str().into(),
+        path: stream.path.clone(),
+        declared_size: stream.declared_size,
+        phase: if stream.committed.is_some() {
+            "COMMITTED".into()
+        } else {
+            "OPEN".into()
+        },
+        state_revision: 1,
+        next_seq: stream.next_seq,
+        confirmed_bytes: stream.received_bytes,
+        last_chunk_sha256: stream.last_chunk_sha256.clone(),
+        last_chunk_len: stream.last_chunk_len as u64,
+        result: stream.committed.clone(),
+    }
 }
 
 struct ReadStreamState {
@@ -2878,6 +3210,31 @@ struct LongOperationEntry {
     desktop_dismissed: bool,
 }
 
+// Tracks a received chunk from header parsing through the entire authenticated handler.
+// A slow but progressing request must not be swept as an idle stream.
+struct UploadReceiveGuard {
+    state: Arc<RuntimeState>,
+    stream_id: String,
+}
+impl std::fmt::Debug for UploadReceiveGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UploadReceiveGuard")
+    }
+}
+impl Drop for UploadReceiveGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.state.active_upload_receives.lock() {
+            if let Some(count) = active.get_mut(&self.stream_id) {
+                if *count > 1 {
+                    *count -= 1;
+                } else {
+                    active.remove(&self.stream_id);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct HttpRequest {
     method: String,
@@ -2885,6 +3242,7 @@ struct HttpRequest {
     version: String,
     headers: HashMap<String, String>,
     body: Vec<u8>,
+    _upload_guard: Option<UploadReceiveGuard>,
 }
 
 #[derive(Debug)]
@@ -3087,26 +3445,55 @@ async fn serve_connection(
     mut stream: TcpStream,
     state: Arc<RuntimeState>,
 ) -> Result<(), std::io::Error> {
-    let request = match timeout(REQUEST_READ_TIMEOUT, read_request(&mut stream)).await {
+    #[cfg(feature = "ingress-trace")]
+    let mut trace = ingress_trace::Trace::new(stream.peer_addr().ok().map(|peer| peer.port()));
+    #[cfg(feature = "ingress-trace")]
+    let received: Result<_, tokio::time::error::Elapsed> =
+        Ok(read_request(&mut stream, Arc::clone(&state), &mut trace).await);
+    #[cfg(not(feature = "ingress-trace"))]
+    let received: Result<_, tokio::time::error::Elapsed> =
+        Ok(read_request(&mut stream, Arc::clone(&state)).await);
+    let request = match received {
         Ok(Ok(request)) => request,
         Ok(Err(error)) => {
             let response = error.response();
-            return write_response(&mut stream, response).await;
+            #[cfg(feature = "ingress-trace")]
+            let status = response.status;
+            let result = write_response(&mut stream, response).await;
+            #[cfg(feature = "ingress-trace")]
+            trace.response(status, result.is_ok());
+            return result;
         }
         Err(_) => {
+            #[cfg(feature = "ingress-trace")]
+            trace.outcome("read_timeout");
             let response =
                 ApiError::new(408, ErrorCode::RequestInvalid, "request timed out").response();
-            return write_response(&mut stream, response).await;
+            #[cfg(feature = "ingress-trace")]
+            let status = response.status;
+            let result = write_response(&mut stream, response).await;
+            #[cfg(feature = "ingress-trace")]
+            trace.response(status, result.is_ok());
+            return result;
         }
     };
 
     let origin = request.headers.get("origin").cloned();
+    #[cfg(feature = "ingress-trace")]
+    trace.milestone("dispatch_started");
     let response = match handle_request(&state, request).await {
         Ok(response) => response,
         Err(error) => error.response(),
     };
+    #[cfg(feature = "ingress-trace")]
+    trace.milestone("handler_completed");
     let response = apply_cors(response, origin.as_deref());
-    write_response(&mut stream, response).await
+    #[cfg(feature = "ingress-trace")]
+    let status = response.status;
+    let result = write_response(&mut stream, response).await;
+    #[cfg(feature = "ingress-trace")]
+    trace.response(status, result.is_ok());
+    result
 }
 
 async fn handle_request(
@@ -3157,7 +3544,10 @@ async fn handle_request(
         }
     }
 
-    if request.path != "/v1/streams/write/begin" && request.path.starts_with("/v1/streams/write/") {
+    if request.path != "/v1/streams/write/begin"
+        && request.path != "/v1/streams/write/capability"
+        && request.path.starts_with("/v1/streams/write/")
+    {
         return handle_write_stream_route(state, request).await;
     }
     if request.path != "/v1/streams/read/begin" && request.path.starts_with("/v1/streams/read/") {
@@ -3225,6 +3615,18 @@ async fn handle_request(
             require_control_content_type(&request)?;
             let input: PairingRequest = parse_json(&request.body)?;
             validate_identity(&input.application, &input.client_instance_id)?;
+            let declared_methods = input
+                .supported_chunk_methods
+                .clone()
+                .unwrap_or_else(|| vec![ChunkMethod::Put]);
+            if declared_methods.is_empty()
+                || declared_methods.len() > 2
+                || (declared_methods.len() == 2 && declared_methods[0] == declared_methods[1])
+            {
+                return Err(ApiError::bad_request(
+                    "supportedChunkMethods must be a nonempty distinct set",
+                ));
+            }
             state.prune_ephemeral();
             let rate_key = format!(
                 "{:?}:{}:{}",
@@ -3251,6 +3653,17 @@ async fn handle_request(
                     && entry.expires_at_ms > now
                     && matches!(&entry.decision, PairingDecision::Pending)
             }) {
+                if existing.supported_chunk_methods.len() != declared_methods.len()
+                    || declared_methods
+                        .iter()
+                        .any(|method| !existing.supported_chunk_methods.contains(method))
+                {
+                    return Err(ApiError::new(
+                        409,
+                        ErrorCode::Conflict,
+                        "pending pairing has different declared chunk methods",
+                    ));
+                }
                 return HttpResponse::json(
                     200,
                     &PairingRequestResponse {
@@ -3283,6 +3696,7 @@ async fn handle_request(
                     application_id: application.id,
                     application: input.application,
                     client_instance_id: input.client_instance_id,
+                    supported_chunk_methods: declared_methods,
                     created_at_ms: now,
                     expires_at_ms,
                     decision: PairingDecision::Pending,
@@ -3362,6 +3776,26 @@ async fn handle_request(
                 .storage
                 .touch_pairing(&pairing.id)
                 .map_err(ApiError::from_storage)?;
+            let policy = state
+                .storage
+                .pairing_transport_policy(&pairing.id)
+                .map_err(ApiError::from_storage)?
+                .ok_or_else(ApiError::internal)?;
+            let effective_chunk_method = match policy.selected_method.as_str() {
+                "PUT" if policy.declared_methods.iter().any(|method| method == "PUT") => {
+                    Some(ChunkMethod::Put)
+                }
+                "POST"
+                    if ENABLE_POST_CHUNKS
+                        && policy
+                            .declared_methods
+                            .iter()
+                            .any(|method| method == "POST") =>
+                {
+                    Some(ChunkMethod::Post)
+                }
+                _ => None,
+            };
             state.prune_ephemeral();
             let token = random_secret_hex(32);
             let expires_at_ms = now_ms() + SESSION_TTL_MS;
@@ -3377,7 +3811,7 @@ async fn handle_request(
                 sessions.insert(
                     token.clone(),
                     SessionState {
-                        pairing_id: pairing.id,
+                        pairing_id: pairing.id.clone(),
                         application_id: pairing.application_id.clone(),
                         expires_at_ms,
                     },
@@ -3389,11 +3823,15 @@ async fn handle_request(
                     token,
                     expires_at_ms,
                     application_id: pairing.application_id,
+                    connection_id: Some(pairing.id.clone()),
+                    effective_chunk_method,
                     capabilities: vec![
                         "files".into(),
                         "kv".into(),
                         "spaces".into(),
                         "streams".into(),
+                        "stream-status".into(),
+                        "chunk-upload-post".into(),
                         "events".into(),
                         "formats".into(),
                         "operations".into(),
@@ -3631,10 +4069,50 @@ async fn handle_request(
             );
             HttpResponse::json(200, &kv_wire(entry))
         }
+        ("POST", "/v1/streams/write/capability") => {
+            require_control_content_type(&request)?;
+            let session = state.authenticate(&request)?;
+            let policy = state
+                .storage
+                .pairing_transport_policy(&session.pairing_id)
+                .map_err(ApiError::from_storage)?
+                .ok_or_else(ApiError::auth_invalid)?;
+            let method = match policy.selected_method.as_str() {
+                "PUT" if policy.declared_methods.iter().any(|v| v == "PUT") => {
+                    Some(ChunkMethod::Put)
+                }
+                "POST"
+                    if ENABLE_POST_CHUNKS
+                        && policy.declared_methods.iter().any(|v| v == "POST") =>
+                {
+                    Some(ChunkMethod::Post)
+                }
+                _ => None,
+            };
+            HttpResponse::json(200, &serde_json::json!({"chunkMethod":method}))
+        }
         ("POST", "/v1/streams/write/begin") => {
             require_control_content_type(&request)?;
             let session = state.authenticate(&request)?;
             let input: StreamWriteBeginRequest = parse_json(&request.body)?;
+            let transport = state
+                .storage
+                .pairing_transport_policy(&session.pairing_id)
+                .map_err(ApiError::from_storage)?
+                .ok_or_else(ApiError::auth_invalid)?;
+            if transport.selected_method != input.chunk_method.as_str()
+                || !transport
+                    .declared_methods
+                    .iter()
+                    .any(|method| method == input.chunk_method.as_str())
+                || (input.chunk_method == ChunkMethod::Post && !ENABLE_POST_CHUNKS)
+            {
+                return Err(ApiError::new(
+                    403,
+                    ErrorCode::PermissionDenied,
+                    "selected stream method is not permitted for this pairing",
+                ));
+            }
             validate_request_id(&input.request_id)?;
             let space = state.authorize_space(&session, &input.space_id)?;
             if input
@@ -3672,6 +4150,7 @@ async fn handle_request(
                         || stream.if_match != input.if_match
                         || stream.declared_size != input.declared_size
                         || stream.metadata != requested_metadata
+                        || stream.chunk_method != input.chunk_method
                         || stream.operation_id.as_deref() != requested_operation_id
                     {
                         return Err(ApiError::new(
@@ -3683,6 +4162,8 @@ async fn handle_request(
                     return HttpResponse::json(
                         200,
                         &StreamWriteBeginResponse {
+                            chunk_method: stream.chunk_method,
+                            request_id: stream.request_id.clone(),
                             stream_id: stream_id.clone(),
                             max_chunk_bytes: MAX_STREAM_CHUNK_BYTES,
                         },
@@ -3701,6 +4182,19 @@ async fn handle_request(
                         "too many concurrent stream writes for this session",
                     ));
                 }
+            }
+            // Request IDs survive restarts. Never create another stream for a lost begin ACK.
+            if state
+                .storage
+                .resolve_stream_operation(&session.pairing_id, &input.space_id, &input.request_id)
+                .map_err(ApiError::from_storage)?
+                .is_some()
+            {
+                return Err(ApiError::new(
+                    409,
+                    ErrorCode::Conflict,
+                    "requestId already exists; resolve the previous stream outcome",
+                ));
             }
             let key = write_path_key(&input.space_id, &input.path);
             {
@@ -3773,11 +4267,13 @@ async fn handle_request(
             }
             let cleanup_space_id = input.space_id.clone();
             let cleanup_temp_path = temp_path.clone();
+            let stream_request_id = input.request_id.clone();
             let stream = WriteStreamState {
                 pairing_id: session.pairing_id.clone(),
                 application_id: space.owner_application_id,
                 space_id: input.space_id,
                 path: input.path,
+                chunk_method: input.chunk_method,
                 request_id: input.request_id,
                 if_match: input.if_match,
                 declared_size: input.declared_size,
@@ -3794,6 +4290,19 @@ async fn handle_request(
                 committed: None,
                 operation_id: operation.as_ref().map(|(snapshot, _)| snapshot.id.clone()),
             };
+            if let Err(error) = state
+                .storage
+                .begin_stream_operation(&stream_operation_snapshot(&stream_id, &stream))
+            {
+                drop(stream);
+                let _ = state
+                    .storage
+                    .abort_stream_temp(&cleanup_space_id, &cleanup_temp_path);
+                if let Ok(mut paths) = state.active_write_paths.lock() {
+                    paths.remove(&key);
+                }
+                return Err(ApiError::from_storage(error));
+            }
             match state.write_streams.lock() {
                 Ok(mut streams) => {
                     streams.insert(stream_id.clone(), stream);
@@ -3812,6 +4321,8 @@ async fn handle_request(
             HttpResponse::json(
                 200,
                 &StreamWriteBeginResponse {
+                    chunk_method: input.chunk_method,
+                    request_id: stream_request_id,
                     stream_id,
                     max_chunk_bytes: MAX_STREAM_CHUNK_BYTES,
                 },
@@ -5813,7 +6324,51 @@ async fn handle_write_stream_route(
         .strip_prefix("/v1/streams/write/")
         .ok_or_else(|| ApiError::bad_request("invalid stream path"))?;
     let parts = tail.split('/').collect::<Vec<_>>();
-    if request.method == "PUT" && parts.len() == 2 {
+    if request.method == "POST" && parts.len() == 1 && parts[0] == "resolve" {
+        require_control_content_type(&request)?;
+        let input: StreamResolveRequest = parse_json(&request.body)?;
+        state.authorize_space(&session, &input.space_id)?;
+        let op = state
+            .storage
+            .resolve_stream_operation(&session.pairing_id, &input.space_id, &input.request_id)
+            .map_err(ApiError::from_storage)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    404,
+                    ErrorCode::StreamNotFound,
+                    "no authoritative outcome for requestId",
+                )
+            })?;
+        let live = state
+            .write_streams
+            .lock()
+            .map_err(|_| ApiError::internal())?
+            .contains_key(&op.stream_id);
+        return HttpResponse::json(200, &stream_outcome_wire(op, live));
+    }
+    if request.method == "GET" && parts.len() == 2 && parts[1] == "status" {
+        let op = state
+            .storage
+            .resolve_stream_by_id(&session.pairing_id, parts[0])
+            .map_err(ApiError::from_storage)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    404,
+                    ErrorCode::StreamNotFound,
+                    "no authoritative outcome for streamId",
+                )
+            })?;
+        state.authorize_space(&session, &op.space_id)?;
+        let live = state
+            .write_streams
+            .lock()
+            .map_err(|_| ApiError::internal())?
+            .contains_key(parts[0]);
+        return HttpResponse::json(200, &stream_outcome_wire(op, live));
+    }
+    if (request.method == "PUT" && parts.len() == 2)
+        || (request.method == "POST" && parts.len() == 3 && parts[2] == "chunk")
+    {
         require_binary_content_type(&request)?;
         if request.body.len() > MAX_STREAM_CHUNK_BYTES {
             return Err(ApiError::new(
@@ -5849,6 +6404,18 @@ async fn handle_write_stream_route(
                 "stream belongs to another session",
             ));
         }
+        let wire_method = if request.method == "PUT" {
+            ChunkMethod::Put
+        } else {
+            ChunkMethod::Post
+        };
+        if stream.chunk_method != wire_method {
+            return Err(ApiError::new(
+                403,
+                ErrorCode::PermissionDenied,
+                "stream method differs from pinned begin method",
+            ));
+        }
         if stream.committed.is_some() {
             return Err(ApiError::new(
                 409,
@@ -5867,7 +6434,7 @@ async fn handle_write_stream_route(
             }
         }
         let chunk_hash = sha256_hex(&request.body);
-        if seq + 1 == stream.next_seq
+        if seq.checked_add(1) == Some(stream.next_seq)
             && stream.last_chunk_sha256.as_deref() == Some(chunk_hash.as_str())
             && stream.last_chunk_len == request.body.len()
         {
@@ -5936,6 +6503,10 @@ async fn handle_write_stream_route(
         stream.last_chunk_len = request.body.len();
         stream.next_seq += 1;
         stream.last_activity_ms = now_ms();
+        state
+            .storage
+            .advance_stream_chunk(&stream_operation_snapshot(stream_id, stream))
+            .map_err(ApiError::from_storage)?;
         if let Some(operation_id) = stream.operation_id.as_deref() {
             state.update_operation_bytes(
                 operation_id,
@@ -6020,6 +6591,10 @@ async fn handle_write_stream_route(
                     ApiError::new(503, ErrorCode::StorageUnavailable, "failed to sync stream")
                 })?;
             }
+            state
+                .storage
+                .finish_stream_operation(stream_id, &session.pairing_id, "OPEN", "COMMITTING", None)
+                .map_err(ApiError::from_storage)?;
             let result = state
                 .storage
                 .commit_stream_file_with_metadata(
@@ -6034,6 +6609,16 @@ async fn handle_write_stream_route(
                 )
                 .map_err(ApiError::from_storage)?;
             stream.committed = Some(result.clone());
+            state
+                .storage
+                .finish_stream_operation(
+                    stream_id,
+                    &session.pairing_id,
+                    "COMMITTING",
+                    "COMMITTED",
+                    Some(&result),
+                )
+                .map_err(ApiError::from_storage)?;
             stream.last_activity_ms = now_ms();
             (
                 stream.application_id.clone(),
@@ -6074,39 +6659,44 @@ async fn handle_write_stream_route(
     } else if request.method == "POST" && parts.len() == 2 && parts[1] == "abort" {
         require_control_content_type(&request)?;
         let stream_id = parts[0];
-        let mut stream = state
+        let mut writes = state
             .write_streams
             .lock()
-            .map_err(|_| ApiError::internal())?
-            .remove(stream_id)
-            .ok_or_else(|| {
-                ApiError::new(
-                    404,
-                    ErrorCode::StreamNotFound,
-                    "write stream not found or expired",
-                )
-            })?;
+            .map_err(|_| ApiError::internal())?;
+        let stream = writes.get(stream_id).ok_or_else(|| {
+            ApiError::new(
+                404,
+                ErrorCode::StreamNotFound,
+                "write stream not found; resolve by requestId",
+            )
+        })?;
         if stream.pairing_id != session.pairing_id {
-            state
-                .write_streams
-                .lock()
-                .map_err(|_| ApiError::internal())?
-                .insert(stream_id.to_owned(), stream);
             return Err(ApiError::new(
                 403,
                 ErrorCode::PermissionDenied,
-                "stream belongs to another session",
+                "stream belongs to another pairing",
             ));
         }
+        if stream.committed.is_some() {
+            return Err(ApiError::new(
+                409,
+                ErrorCode::Conflict,
+                "already committed; cancellation cannot undo saved data",
+            ));
+        }
+        let mut stream = writes.remove(stream_id).ok_or_else(ApiError::internal)?;
+        // The map mutex excludes a simultaneous commit/chunk. A missing cleanup ACK remains nonterminal.
+        stream.file.take();
+        state
+            .storage
+            .abort_stream_temp(&stream.space_id, &stream.temp_path)
+            .map_err(ApiError::from_storage)?;
+        state
+            .storage
+            .finish_stream_operation(stream_id, &session.pairing_id, "OPEN", "ABORTED", None)
+            .map_err(ApiError::from_storage)?;
         if let Ok(mut paths) = state.active_write_paths.lock() {
             paths.remove(&write_path_key(&stream.space_id, &stream.path));
-        }
-        stream.file.take();
-        if stream.committed.is_none() {
-            state
-                .storage
-                .abort_stream_temp(&stream.space_id, &stream.temp_path)
-                .map_err(ApiError::from_storage)?;
         }
         if let Some(operation_id) = stream.operation_id.as_deref() {
             state.cancelled_operation(operation_id);
@@ -6522,16 +7112,217 @@ fn apply_cors(mut response: HttpResponse, origin: Option<&str>) -> HttpResponse 
     response
 }
 
-async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, ApiError> {
+// Opt-in build-only ingress diagnostics. This module is absent from normal release builds.
+// Log counters and stage only: never record request bytes, headers, tokens or paths.
+#[cfg(feature = "ingress-trace")]
+mod ingress_trace {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(0);
+    const MAX_TRACED_CONNECTIONS: u64 = 10_000;
+
+    pub(super) struct Trace {
+        enabled: bool,
+        connection_id: u64,
+        peer_port: Option<u16>,
+        method_class: &'static str,
+        stream_write: bool,
+        response_status: Option<u16>,
+        response_written: Option<bool>,
+        started: Instant,
+        phase: &'static str,
+        outcome: &'static str,
+        read_calls: usize,
+        bytes_read: usize,
+        header_bytes_seen: usize,
+        header_cr_count: usize,
+        header_lf_count: usize,
+        delimiter_offset: Option<usize>,
+        body_bytes_received: usize,
+        declared_body_bytes: Option<usize>,
+    }
+
+    impl Trace {
+        pub(super) fn new(peer_port: Option<u16>) -> Self {
+            let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed) + 1;
+            Self {
+                enabled: connection_id <= MAX_TRACED_CONNECTIONS
+                    && std::env::var("VONTAQFS_INGRESS_TRACE").as_deref() == Ok("1"),
+                connection_id,
+                peer_port,
+                method_class: "UNKNOWN",
+                stream_write: false,
+                response_status: None,
+                response_written: None,
+                started: Instant::now(),
+                phase: "await_headers",
+                outcome: "incomplete_or_cancelled",
+                read_calls: 0,
+                bytes_read: 0,
+                header_bytes_seen: 0,
+                header_cr_count: 0,
+                header_lf_count: 0,
+                delimiter_offset: None,
+                body_bytes_received: 0,
+                declared_body_bytes: None,
+            }
+        }
+
+        pub(super) fn classify(&mut self, method: &str, path: &str) {
+            self.method_class = match method {
+                "GET" => "GET",
+                "POST" => "POST",
+                "PUT" => "PUT",
+                "OPTIONS" => "OPTIONS",
+                _ => "OTHER",
+            };
+            self.stream_write = method == "PUT" && path.starts_with("/v1/streams/write/");
+        }
+
+        // Diagnostic milestones for stream writes only. In particular, these help
+        // distinguish a blocked server handler from a browser that never gets an ACK.
+        // Never log stream IDs, full URLs, headers, token values, or body bytes.
+        pub(super) fn milestone(&self, name: &'static str) {
+            if !self.enabled || !self.stream_write {
+                return;
+            }
+            let line = format!(
+                "[vontaqfs-ingress] conn={} peer_port={:?} method={} stream_write=true event={} elapsed_ms={}",
+                self.connection_id,
+                self.peer_port,
+                self.method_class,
+                name,
+                self.started.elapsed().as_millis(),
+            );
+            Self::output(&line);
+        }
+
+        pub(super) fn response(&mut self, status: u16, written: bool) {
+            self.response_status = Some(status);
+            self.response_written = Some(written);
+            self.milestone("response_write_finished");
+        }
+
+        fn output(line: &str) {
+            if let Ok(path) = std::env::var("VONTAQFS_INGRESS_TRACE_PATH") {
+                if !path.is_empty() {
+                    match OpenOptions::new().create(true).append(true).open(path) {
+                        Ok(mut file) => {
+                            if let Err(error) = writeln!(file, "{line}") {
+                                eprintln!(
+                                    "[vontaqfs-ingress] trace write error: {:?}",
+                                    error.kind()
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("[vontaqfs-ingress] trace open error: {:?}", error.kind());
+                        }
+                    }
+                }
+            }
+            eprintln!("{line}");
+        }
+
+        pub(super) fn read(&mut self, bytes: &[u8], headers: bool) {
+            if !self.enabled {
+                return;
+            }
+            self.read_calls += 1;
+            self.bytes_read += bytes.len();
+            if headers {
+                self.header_bytes_seen += bytes.len();
+                self.header_cr_count += bytes.iter().filter(|&&byte| byte == b'\r').count();
+                self.header_lf_count += bytes.iter().filter(|&&byte| byte == b'\n').count();
+            } else {
+                self.body_bytes_received += bytes.len();
+            }
+        }
+
+        pub(super) fn headers_complete(&mut self, header: &[u8], delimiter_offset: usize) {
+            self.phase = "headers_complete";
+            self.delimiter_offset = Some(delimiter_offset);
+            if self.enabled {
+                // A coalesced read may already contain body bytes. Only count header bytes.
+                self.header_bytes_seen = header.len();
+                self.header_cr_count = header.iter().filter(|&&byte| byte == b'\r').count();
+                self.header_lf_count = header.iter().filter(|&&byte| byte == b'\n').count();
+            }
+        }
+
+        pub(super) fn await_body(&mut self, received: usize, declared: usize) {
+            self.phase = "await_body";
+            self.body_bytes_received = received;
+            self.declared_body_bytes = Some(declared);
+        }
+
+        pub(super) fn result(&mut self, phase: &'static str, outcome: &'static str) {
+            self.phase = phase;
+            self.outcome = outcome;
+        }
+
+        pub(super) fn outcome(&mut self, outcome: &'static str) {
+            self.outcome = outcome;
+        }
+    }
+
+    impl Drop for Trace {
+        fn drop(&mut self) {
+            if !self.enabled {
+                return;
+            }
+            let line = format!(
+                "[vontaqfs-ingress] conn={} peer_port={:?} method={} stream_write={} elapsed_ms={} phase={} outcome={} reads={} bytes_read={} header_bytes={} header_cr={} header_lf={} delimiter_offset={:?} body_bytes={} declared_body={:?} response_status={:?} response_written={:?}",
+                self.connection_id,
+                self.peer_port,
+                self.method_class,
+                self.stream_write,
+                self.started.elapsed().as_millis(),
+                self.phase,
+                self.outcome,
+                self.read_calls,
+                self.bytes_read,
+                self.header_bytes_seen,
+                self.header_cr_count,
+                self.header_lf_count,
+                self.delimiter_offset,
+                self.body_bytes_received,
+                self.declared_body_bytes,
+                self.response_status,
+                self.response_written,
+            );
+            Self::output(&line);
+        }
+    }
+}
+
+async fn read_request(
+    stream: &mut TcpStream,
+    state: Arc<RuntimeState>,
+    #[cfg(feature = "ingress-trace")] trace: &mut ingress_trace::Trace,
+) -> Result<HttpRequest, ApiError> {
     let mut buffer = Vec::with_capacity(4096);
     let mut chunk = [0_u8; 4096];
     let header_end;
     loop {
-        let read = stream
-            .read(&mut chunk)
+        let read = timeout(REQUEST_READ_TIMEOUT, stream.read(&mut chunk))
             .await
+            .map_err(|_| {
+                ApiError::new(
+                    408,
+                    ErrorCode::RequestInvalid,
+                    "request header idle timeout",
+                )
+            })?
             .map_err(|_| ApiError::bad_request("failed to read request"))?;
+        #[cfg(feature = "ingress-trace")]
+        trace.read(&chunk[..read], true);
         if read == 0 {
+            #[cfg(feature = "ingress-trace")]
+            trace.result("await_headers", "header_eof");
             return Err(ApiError::bad_request(
                 "connection closed before request completed",
             ));
@@ -6545,6 +7336,8 @@ async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, ApiError> {
             ));
         }
         if let Some(index) = find_header_end(&buffer) {
+            #[cfg(feature = "ingress-trace")]
+            trace.headers_complete(&buffer[..index + 4], index);
             header_end = index;
             break;
         }
@@ -6584,6 +7377,8 @@ async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, ApiError> {
         .next()
         .ok_or_else(|| ApiError::bad_request("HTTP version missing"))?
         .to_owned();
+    #[cfg(feature = "ingress-trace")]
+    trace.classify(&method, &path);
     if parts.next().is_some() || !path.starts_with('/') || path.contains("//") {
         return Err(ApiError::bad_request("request line is invalid"));
     }
@@ -6635,13 +7430,70 @@ async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, ApiError> {
         ));
     }
 
+    // Only actual binary write routes can renew a lease. No auth bypass:
+    // authorization is still checked by handle_write_stream_route before mutation.
+    let chunk_stream_id = if path.starts_with("/v1/streams/write/")
+        && ((method == "PUT" && path.split('/').count() == 6)
+            || (method == "POST" && path.split('/').count() == 7 && path.ends_with("/chunk")))
+    {
+        path.split('/').nth(4).map(str::to_owned)
+    } else {
+        None
+    };
+    // A mere guessed stream ID must not let an unauthenticated connection hold a
+    // write lease. Check the current token/owner before creating the receive guard;
+    // the full pairing and space authorization is still repeated at dispatch.
+    let header_session = headers
+        .get("authorization")
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .and_then(|token| {
+            state
+                .sessions
+                .lock()
+                .ok()
+                .and_then(|sessions| sessions.get(token).cloned())
+        })
+        .filter(|session| session.expires_at_ms > now_ms());
+    let guarded_stream_id = match (chunk_stream_id, header_session) {
+        (Some(id), Some(session)) => {
+            let owned = state
+                .write_streams
+                .lock()
+                .map_err(|_| ApiError::internal())?
+                .get(&id)
+                .is_some_and(|stream| stream.pairing_id == session.pairing_id);
+            owned.then_some(id)
+        }
+        _ => None,
+    };
+    let upload_guard = if let Some(stream_id) = guarded_stream_id {
+        let mut active = state
+            .active_upload_receives
+            .lock()
+            .map_err(|_| ApiError::internal())?;
+        *active.entry(stream_id.clone()).or_insert(0) += 1;
+        Some(UploadReceiveGuard {
+            state: Arc::clone(&state),
+            stream_id,
+        })
+    } else {
+        None
+    };
     let body_start = header_end + 4;
+    #[cfg(feature = "ingress-trace")]
+    trace.await_body(buffer.len().saturating_sub(body_start), content_length);
     while buffer.len().saturating_sub(body_start) < content_length {
-        let read = stream
-            .read(&mut chunk)
+        let read = timeout(REQUEST_READ_TIMEOUT, stream.read(&mut chunk))
             .await
+            .map_err(|_| {
+                ApiError::new(408, ErrorCode::RequestInvalid, "request body idle timeout")
+            })?
             .map_err(|_| ApiError::bad_request("failed to read request body"))?;
+        #[cfg(feature = "ingress-trace")]
+        trace.read(&chunk[..read], false);
         if read == 0 {
+            #[cfg(feature = "ingress-trace")]
+            trace.result("await_body", "body_eof");
             return Err(ApiError::bad_request(
                 "connection closed before request body completed",
             ));
@@ -6663,12 +7515,19 @@ async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, ApiError> {
         buffer.truncate(body_start + content_length);
     }
     let body = buffer[body_start..body_start + content_length].to_vec();
+    #[cfg(feature = "ingress-trace")]
+    {
+        trace.await_body(content_length, content_length);
+        trace.result("request_complete", "complete");
+        trace.milestone("request_received");
+    }
     Ok(HttpRequest {
         method,
         path,
         version,
         headers,
         body,
+        _upload_guard: upload_guard,
     })
 }
 
@@ -7147,6 +8006,7 @@ mod tests {
                 ("content-type".into(), CONTROL_CONTENT_TYPE.into()),
             ]),
             body: body.to_vec(),
+            _upload_guard: None,
         }
     }
 
@@ -7163,6 +8023,219 @@ mod tests {
             },
             Arc::new(HeadlessHostServices),
         ))
+    }
+
+    // Unlike handle_request unit tests, these tests use a real loopback TCP socket,
+    // the production read_request() and serve_connection() code paths, and a sender
+    // which deliberately keeps its write half open after a complete HTTP request.
+    async fn tcp_ingress_roundtrip(
+        state: Arc<RuntimeState>,
+        parts: &[&[u8]],
+        half_close: bool,
+        response_timeout: Duration,
+    ) -> String {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            assert!(peer.ip().is_loopback());
+            serve_connection(stream, state).await.unwrap();
+        });
+        let mut client = TcpStream::connect(address).await.unwrap();
+        for (index, part) in parts.iter().enumerate() {
+            if index > 0 {
+                // Force a separate socket read for the second fragment where possible.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            client.write_all(part).await.unwrap();
+        }
+        if half_close {
+            client.shutdown().await.unwrap();
+        }
+        let mut response = Vec::new();
+        timeout(response_timeout, client.read_to_end(&mut response))
+            .await
+            .expect("server did not respond within the TCP regression deadline")
+            .unwrap();
+        server.await.unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    fn tcp_ingress_request(
+        method: &str,
+        path: &str,
+        length: Option<usize>,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:47833\r\n");
+        if path.starts_with("/v1/streams/write/") {
+            head.push_str("Content-Type: application/octet-stream\r\n");
+            head.push_str("Authorization: Bearer invalid-diagnostic-token\r\n");
+        } else if method == "POST" {
+            head.push_str("Content-Type: application/vnd.vontaqfs+json; version=1\r\n");
+        }
+        if let Some(length) = length {
+            head.push_str(&format!("Content-Length: {length}\r\n"));
+        }
+        head.push_str("\r\n");
+        let mut wire = head.into_bytes();
+        wire.extend_from_slice(body);
+        wire
+    }
+
+    #[tokio::test]
+    async fn tcp_ingress_complete_put_does_not_wait_for_eof() {
+        let state = test_state();
+        let budget = Duration::from_secs(4);
+        let health = tcp_ingress_request("GET", "/v1/health", None, b"");
+        let response = tcp_ingress_roundtrip(Arc::clone(&state), &[&health], false, budget).await;
+        assert!(response.starts_with("HTTP/1.1 200 "), "T1 {response}");
+
+        let empty_put = tcp_ingress_request("PUT", "/v1/health", None, b"");
+        let response =
+            tcp_ingress_roundtrip(Arc::clone(&state), &[&empty_put], false, budget).await;
+        assert!(response.starts_with("HTTP/1.1 404 "), "T2 {response}");
+
+        let full_put = tcp_ingress_request(
+            "PUT",
+            "/v1/streams/write/diagnostic-invalid-stream/0",
+            Some(1),
+            b"x",
+        );
+        let response = tcp_ingress_roundtrip(Arc::clone(&state), &[&full_put], false, budget).await;
+        assert!(response.starts_with("HTTP/1.1 401 "), "T3 {response}");
+        assert!(response.contains("AUTH_INVALID"), "T3 {response}");
+
+        let response = tcp_ingress_roundtrip(Arc::clone(&state), &[&full_put], true, budget).await;
+        assert!(response.starts_with("HTTP/1.1 401 "), "T4 {response}");
+
+        let post = tcp_ingress_request("POST", "/v1/unknown-diagnostic-path", Some(2), b"{}");
+        let response = tcp_ingress_roundtrip(Arc::clone(&state), &[&post], false, budget).await;
+        assert!(response.starts_with("HTTP/1.1 404 "), "T5 {response}");
+
+        let partial = tcp_ingress_request(
+            "PUT",
+            "/v1/streams/write/diagnostic-invalid-stream/0",
+            Some(2),
+            b"x",
+        );
+        let response = tcp_ingress_roundtrip(Arc::clone(&state), &[&partial], true, budget).await;
+        assert!(response.starts_with("HTTP/1.1 400 "), "T6 {response}");
+        assert!(
+            response.contains("connection closed before request body completed"),
+            "T6 {response}"
+        );
+
+        // Split exactly before the body; the declared length still controls completion.
+        let split = full_put.len() - 1;
+        let response = tcp_ingress_roundtrip(
+            Arc::clone(&state),
+            &[&full_put[..split], &full_put[split..]],
+            false,
+            budget,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 401 "), "T8 {response}");
+
+        // A single write lets the OS coalesce complete headers and body in one read.
+        let response = tcp_ingress_roundtrip(state, &[&full_put], false, budget).await;
+        assert!(response.starts_with("HTTP/1.1 401 "), "T9 {response}");
+    }
+
+    #[tokio::test]
+    async fn tcp_ingress_binary_size_bounds_and_invalid_host() {
+        let state = test_state();
+        let budget = Duration::from_secs(8);
+        // At the maximum supported chunk size, the request is fully parsed and
+        // reaches authorization. Bad credentials must *not* trigger a false ACK.
+        let binary = vec![b'x'; MAX_STREAM_CHUNK_BYTES];
+        let complete = tcp_ingress_request(
+            "PUT",
+            "/v1/streams/write/diagnostic-invalid-stream/0",
+            Some(binary.len()),
+            &binary,
+        );
+        let response = tcp_ingress_roundtrip(Arc::clone(&state), &[&complete], false, budget).await;
+        assert!(
+            response.starts_with("HTTP/1.1 401 "),
+            "max supported chunk: {response}"
+        );
+        assert!(!response.starts_with("HTTP/1.1 200 "));
+
+        // Reject out-of-bounds body based on Content-Length before dispatch;
+        // no need to allocate a large body or update stream persistence.
+        let too_large = tcp_ingress_request(
+            "PUT",
+            "/v1/streams/write/diagnostic-invalid-stream/0",
+            Some(MAX_STREAM_CHUNK_BYTES + 1),
+            b"",
+        );
+        let response =
+            tcp_ingress_roundtrip(Arc::clone(&state), &[&too_large], false, budget).await;
+        assert!(
+            response.starts_with("HTTP/1.1 413 "),
+            "oversize binary: {response}"
+        );
+
+        let over_control = tcp_ingress_request(
+            "POST",
+            "/v1/unknown-diagnostic-path",
+            Some(MAX_CONTROL_BODY_BYTES + 1),
+            b"",
+        );
+        let response =
+            tcp_ingress_roundtrip(Arc::clone(&state), &[&over_control], false, budget).await;
+        assert!(
+            response.starts_with("HTTP/1.1 413 "),
+            "oversize control: {response}"
+        );
+
+        let invalid_host = b"GET /v1/health HTTP/1.1\r\nHost: evil.example:47833\r\n\r\n";
+        let response = tcp_ingress_roundtrip(state, &[invalid_host], false, budget).await;
+        assert!(
+            response.starts_with("HTTP/1.1 403 "),
+            "invalid Host: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_ingress_concurrent_complete_requests() {
+        // Simulate many simultaneous clients without requiring SDK credentials.
+        // All complete requests must respond independently and must not wait
+        // for send-side EOF, even while other sockets are still open.
+        let state = test_state();
+        let mut joins = Vec::new();
+        for _ in 0..40 {
+            let state = Arc::clone(&state);
+            joins.push(tokio::spawn(async move {
+                let complete = tcp_ingress_request("PUT", "/v1/health", Some(0), b"");
+                let response =
+                    tcp_ingress_roundtrip(state, &[&complete], false, Duration::from_secs(8)).await;
+                assert!(response.starts_with("HTTP/1.1 404 "), "{response}");
+            }));
+        }
+        for join in joins {
+            join.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "T7 intentionally waits for the existing 30-second slow-client guard"]
+    async fn tcp_ingress_partial_body_open_send_times_out() {
+        let partial = tcp_ingress_request(
+            "PUT",
+            "/v1/streams/write/diagnostic-invalid-stream/0",
+            Some(2),
+            b"x",
+        );
+        let response = tcp_ingress_roundtrip(
+            test_state(),
+            &[&partial],
+            false,
+            REQUEST_READ_TIMEOUT + Duration::from_secs(5),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 408 "), "T7 {response}");
     }
 
     #[test]
@@ -7225,6 +8298,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn declared_methods_are_bound_to_approved_pairing_and_post_is_authorized() {
+        let state = test_state();
+        let handle = RuntimeHandle {
+            state: Arc::clone(&state),
+        };
+        let identity = ClientIdentity {
+            kind: ClientKind::FigmaPlugin,
+            external_id: "cp1-app".into(),
+            display_name: "Same Label".into(),
+        };
+        let first = serde_json::to_vec(&PairingRequest {
+            application: identity.clone(),
+            client_instance_id: "cp1-first".into(),
+            supported_chunk_methods: Some(vec![ChunkMethod::Put, ChunkMethod::Post]),
+        })
+        .unwrap();
+        let response = handle_request(&state, request("POST", "/v1/pairings/request", &first))
+            .await
+            .unwrap();
+        let pairing: PairingRequestResponse = serde_json::from_slice(&response.body).unwrap();
+        // Pending capability declaration cannot be silently changed by another client request.
+        let incompatible = serde_json::to_vec(&PairingRequest {
+            application: identity.clone(),
+            client_instance_id: "cp1-first".into(),
+            supported_chunk_methods: Some(vec![ChunkMethod::Put]),
+        })
+        .unwrap();
+        let rejected = handle_request(
+            &state,
+            request("POST", "/v1/pairings/request", &incompatible),
+        )
+        .await;
+        assert!(matches!(rejected, Err(ApiError { status: 409, .. })));
+        let approved = handle.approve_pairing(&pairing.pairing_id).unwrap();
+        let settings = handle.list_connection_transport_settings().unwrap();
+        let first_settings = settings
+            .iter()
+            .find(|setting| setting.connection_id == approved.persisted_pairing_id)
+            .unwrap();
+        assert_eq!(first_settings.authorization, "AUTHORIZED");
+        assert_eq!(
+            first_settings.declared_methods,
+            vec![ChunkMethod::Put, ChunkMethod::Post]
+        );
+        assert_eq!(
+            first_settings.allowed_methods,
+            vec![ChunkMethod::Put, ChunkMethod::Post]
+        );
+        assert_eq!(first_settings.effective_method, Some(ChunkMethod::Put));
+        assert_eq!(first_settings.blocked_reasons.get("POST"), None);
+        // Trusted desktop setter can select POST only inside the approved declaration.
+        assert!(handle
+            .set_connection_transport_preference(SetTransportPreference {
+                connection_id: approved.persisted_pairing_id.clone(),
+                method: ChunkMethod::Post,
+                expected_revision: 1
+            })
+            .is_ok());
+        let updated = handle
+            .set_connection_transport_preference(SetTransportPreference {
+                connection_id: approved.persisted_pairing_id.clone(),
+                method: ChunkMethod::Put,
+                expected_revision: 2,
+            })
+            .unwrap();
+        assert_eq!(updated.revision, 3);
+        assert!(handle
+            .set_connection_transport_preference(SetTransportPreference {
+                connection_id: approved.persisted_pairing_id.clone(),
+                method: ChunkMethod::Put,
+                expected_revision: 1
+            })
+            .is_err());
+        assert!(handle
+            .revoke_pairing(&approved.persisted_pairing_id)
+            .unwrap());
+        assert!(handle
+            .set_connection_transport_preference(SetTransportPreference {
+                connection_id: approved.persisted_pairing_id,
+                method: ChunkMethod::Put,
+                expected_revision: 3
+            })
+            .is_err());
+        // A POST-only approval must reject a wrong-method PUT begin
+        // BEFORE file creation, even if a bearer session is valid.
+        let post_only = serde_json::to_vec(&PairingRequest {
+            application: identity,
+            client_instance_id: "cp1-post-only".into(),
+            supported_chunk_methods: Some(vec![ChunkMethod::Post]),
+        })
+        .unwrap();
+        let response = handle_request(&state, request("POST", "/v1/pairings/request", &post_only))
+            .await
+            .unwrap();
+        let pending: PairingRequestResponse = serde_json::from_slice(&response.body).unwrap();
+        let approved_post = handle.approve_pairing(&pending.pairing_id).unwrap();
+        let pending_poll = serde_json::to_vec(&PairingPollRequest {
+            pairing_id: pending.pairing_id,
+        })
+        .unwrap();
+        let response = handle_request(&state, request("POST", "/v1/pairings/poll", &pending_poll))
+            .await
+            .unwrap();
+        let polled: PairingPollResponse = serde_json::from_slice(&response.body).unwrap();
+        let session_body = serde_json::to_vec(&SessionRequest {
+            client_instance_id: "cp1-post-only".into(),
+            pairing_credential: polled.pairing_credential.unwrap(),
+        })
+        .unwrap();
+        let response = handle_request(&state, request("POST", "/v1/sessions", &session_body))
+            .await
+            .unwrap();
+        let session: SessionResponse = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            session.connection_id.as_deref(),
+            Some(approved_post.persisted_pairing_id.as_str())
+        );
+        assert_eq!(session.effective_chunk_method, Some(ChunkMethod::Post));
+        let mut begin = request(
+            "POST",
+            "/v1/streams/write/begin",
+            &serde_json::to_vec(&StreamWriteBeginRequest {
+                chunk_method: ChunkMethod::Put,
+                request_id: "cp1-post-begin".into(),
+                space_id: "cp1-not-authorized".into(),
+                path: "/test.bin".into(),
+                if_match: None,
+                declared_size: Some(10),
+                metadata: None,
+                operation: None,
+            })
+            .unwrap(),
+        );
+        begin
+            .headers
+            .insert("authorization".into(), format!("Bearer {}", session.token));
+        assert!(matches!(
+            handle_request(&state, begin).await,
+            Err(ApiError { status: 403, .. })
+        ));
+        // There is deliberately no public mutation endpoint for transport preference.
+        let unauthorized =
+            handle_request(&state, request("POST", "/v1/pairings/set-transport", b"{}")).await;
+        assert!(matches!(unauthorized, Err(ApiError { status: 404, .. })));
+    }
+
+    #[tokio::test]
     async fn pairing_session_and_cross_application_isolation_work_without_public_admin_http() {
         let state = test_state();
         let handle = RuntimeHandle {
@@ -7238,6 +8458,7 @@ mod tests {
                 display_name: "Plugin A".into(),
             },
             client_instance_id: "instance-a".into(),
+            supported_chunk_methods: None,
         })
         .unwrap();
         let first_response =

@@ -349,6 +349,13 @@ jobs:
               ;;
           esac
 
+      - name: Windows release-mode real-TCP ingress regression
+        if: matrix.os_family == 'windows'
+        run: |
+          cargo test -p vontaqfs-runtime --release tcp_ingress_complete_put_does_not_wait_for_eof -- --test-threads=1
+          cargo test -p vontaqfs-runtime --release tcp_ingress_binary_size_bounds_and_invalid_host -- --test-threads=1
+          cargo test -p vontaqfs-runtime --release tcp_ingress_concurrent_complete_requests -- --test-threads=1
+
       - name: Build, sign and upload release artifacts
         uses: tauri-apps/tauri-action@v1
         env:
@@ -423,12 +430,17 @@ jobs:
       - run: npm run build:sdk
       - name: Verify npm package contents
         run: npm pack --dry-run --workspace @vontaq/fs
+      - id: sdk_release
+        name: Gate npm publication to a same-version SDK release
+        env:
+          PUBLISH_NPM: ${{ vars.PUBLISH_NPM }}
+        run: node scripts/release/sdk-publish-eligibility.mjs
       - name: Report deferred npm publication
-        if: vars.PUBLISH_NPM != 'true'
-        run: echo 'PUBLISH_NPM is not true; GitHub release may proceed and npm publication remains owner-deferred.'
+        if: steps.sdk_release.outputs.publish != 'true'
+        run: echo 'SDK is unchanged or PUBLISH_NPM is not true; GitHub release may proceed and npm publication remains owner-deferred.'
       - id: npm_state
         name: Check immutable npm package publication state
-        if: vars.PUBLISH_NPM == 'true'
+        if: vars.PUBLISH_NPM == 'true' && steps.sdk_release.outputs.publish == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -445,7 +457,7 @@ jobs:
             echo "already_published=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Publish public SDK through npm Trusted Publishing/OIDC
-        if: vars.PUBLISH_NPM == 'true' && steps.npm_state.outputs.already_published != 'true'
+        if: vars.PUBLISH_NPM == 'true' && steps.sdk_release.outputs.publish == 'true' && steps.npm_state.outputs.already_published != 'true'
         run: npm publish --workspace @vontaq/fs --access public
 
   finalize-release:

@@ -10,6 +10,21 @@ export type RuntimeHealth = {
 };
 
 
+export type ChunkMethod='PUT'|'POST';
+export type ConnectionTransportSettings={
+  connectionId:string;
+  displayName:string;
+  authorization:'AUTHORIZED'|'REVOKED';
+  declaredMethods:ChunkMethod[];
+  runtimeMethods:ChunkMethod[];
+  allowedMethods:ChunkMethod[];
+  selectedMethod:ChunkMethod|null;
+  effectiveMethod:ChunkMethod|null;
+  activeStreamCount:number;
+  blockedReasons:Partial<Record<ChunkMethod,'INTEGRATION_UNSUPPORTED'|'RUNTIME_UNSUPPORTED'|'ORGANIZATION_POLICY'|'UNAUTHORIZED'|'UNKNOWN'>>;
+  revision:number;
+};
+
 export type RuntimeEndpointStatus = {
   selectedPort: number | null;
   occupiedPorts: number[];
@@ -176,6 +191,8 @@ export const desktopApi = {
   approvePairing: (requestId: string) => invoke('approve_pairing', { requestId }),
   denyPairing: (requestId: string) => invoke('deny_pairing', { requestId }),
   applications: () => invoke<ApplicationSummary[]>('desktop_applications'),
+  listConnectionTransportSettings:()=>invoke<ConnectionTransportSettings[]>('list_connection_transport_settings'),
+  setConnectionTransportPreference:(connectionId:string,method:ChunkMethod,expectedRevision:number)=>invoke<ConnectionTransportSettings>('set_connection_transport_preference',{input:{connectionId,method,expectedRevision}}),
   revokeDestination: (applicationId: string, destinationId: string) => invoke<boolean>('revoke_desktop_destination', { applicationId, destinationId }),
   deleteExportPreset: (applicationId: string, presetId: string) => invoke<boolean>('delete_desktop_export_preset', { applicationId, presetId }),
   revokePairing: (pairingId: string) => invoke<boolean>('revoke_pairing', { pairingId }),

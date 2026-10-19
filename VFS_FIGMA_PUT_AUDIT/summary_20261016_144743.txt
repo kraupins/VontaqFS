@@ -1,0 +1,12 @@
+﻿VontaqFS Figma PUT / TCP observation
+Started: 2026-10-16T14:47:43.3968952+03:00
+Duration requested: 90 seconds; snapshots: 40
+Port: 47833
+Socket rows: 42
+Figma-owned socket observations: 21
+VFS-owned socket observations: 21
+Health probes: 9; non-200 or failed: 0
+LIMITATION: port/PID evidence alone cannot associate a TCP connection
+with a particular HTTP PUT. It does not prove that request bytes reached VFS.
+Sockets file: C:\Users\kraup\Desktop\Vontaq-Dev\VontaqFS\VFS_FIGMA_PUT_AUDIT\sockets_20261016_144743.csv
+Health file: C:\Users\kraup\Desktop\Vontaq-Dev\VontaqFS\VFS_FIGMA_PUT_AUDIT\health_20261016_144743.csv

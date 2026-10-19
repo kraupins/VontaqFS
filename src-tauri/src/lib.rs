@@ -17,9 +17,10 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use vontaqfs_protocol::HealthResponse;
 use vontaqfs_runtime::{
-    DesktopApplicationSummary, DesktopOperationSummary, DesktopPreferences, DiagnosticsReport,
-    LongOperationSnapshot, PairingApproval, PendingPairingSummary, RuntimeEndpointStatus,
-    RuntimeFoundation, RuntimeHandle, RuntimeHostServices, RuntimeLifecycleStatus, RuntimeServer,
+    ConnectionTransportSettings, DesktopApplicationSummary, DesktopOperationSummary,
+    DesktopPreferences, DiagnosticsReport, LongOperationSnapshot, PairingApproval,
+    PendingPairingSummary, RuntimeEndpointStatus, RuntimeFoundation, RuntimeHandle,
+    RuntimeHostServices, RuntimeLifecycleStatus, RuntimeServer, SetTransportPreference,
     SnapshotRecord, UpdaterConfiguration,
 };
 
@@ -229,6 +230,27 @@ fn pending_pairings(
     runtime: tauri::State<'_, DesktopRuntime>,
 ) -> Result<Vec<PendingPairingSummary>, String> {
     Ok(runtime.handle.pending_pairings())
+}
+
+#[tauri::command]
+fn list_connection_transport_settings(
+    runtime: tauri::State<'_, DesktopRuntime>,
+) -> Result<Vec<ConnectionTransportSettings>, String> {
+    runtime
+        .handle
+        .list_connection_transport_settings()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_connection_transport_preference(
+    runtime: tauri::State<'_, DesktopRuntime>,
+    input: SetTransportPreference,
+) -> Result<ConnectionTransportSettings, String> {
+    runtime
+        .handle
+        .set_connection_transport_preference(input)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1398,7 +1420,11 @@ fn graceful_exit(app: tauri::AppHandle) {
 pub fn run() {
     let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
 
-    #[cfg(not(debug_assertions))]
+    // Diagnostic ingress builds intentionally have no signed updater configuration.
+    // Do not initialize Tauri updater without it: the default local config has no
+    // `plugins.updater` entry and Tauri rejects null at startup.
+    // Production release builds still register the updater exactly as before.
+    #[cfg(all(not(debug_assertions), not(feature = "ingress-trace")))]
     let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
 
     builder
@@ -1464,6 +1490,8 @@ pub fn run() {
             runtime_status,
             runtime_endpoint_status,
             pending_pairings,
+            list_connection_transport_settings,
+            set_connection_transport_preference,
             approve_pairing,
             deny_pairing,
             revoke_pairing,

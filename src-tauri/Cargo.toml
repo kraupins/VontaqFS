@@ -21,3 +21,7 @@ serde.workspace = true
 serde_json.workspace = true
 vontaqfs-runtime = { path = "../crates/runtime" }
 vontaqfs-protocol = { path = "../crates/protocol" }
+
+# Diagnostic build only; normal production bundles do not include tracing.
+[features]
+ingress-trace = ["vontaqfs-runtime/ingress-trace"]

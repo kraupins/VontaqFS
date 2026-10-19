@@ -17,13 +17,13 @@ class Runtime {
   async request(request) {
     const path = new URL(request.url).pathname;
     this.calls.push({ path, request });
-    if (path === '/v1/health') return json({ service:'vontaqfs', runtimeVersion:'0.1.0', protocol:{min:1,max:1}, storageFormatVersion:1, status:'ready', capabilities:['files','spaces','streams','formats'] });
+    if (path === '/v1/health') return json({ service:'vontaqfs', runtimeVersion:'0.2.3', protocol:{min:1,max:1}, storageFormatVersion:1, status:'ready', capabilities:['files','spaces','streams','stream-status','formats'] });
     const body = request.body instanceof Uint8Array ? null : request.body ? JSON.parse(request.body) : {};
     if (path === '/v1/identity/challenge') {
       const key = createHash('sha256').update(CREDENTIAL).digest();
       return json({ mac: createHmac('sha256', key).update(`vontaqfs-runtime-challenge-v1${body.nonce}`).digest('hex') });
     }
-    if (path === '/v1/sessions') return json({ token:TOKEN, expiresAtMs:Date.now()+60_000, applicationId:'app-d2', capabilities:['files','spaces','streams','formats'] });
+    if (path === '/v1/sessions') return json({ token:TOKEN, expiresAtMs:Date.now()+60_000, applicationId:'app-d2', capabilities:['files','spaces','streams','stream-status','formats'] });
     if (!String(request.headers.Authorization ?? '').startsWith('Bearer ')) return err(401,'AUTH_INVALID','missing');
     if (path === '/v1/spaces/open') return json({ id:'space-default', key:body.key, displayName:null, storageClass:'persistent', createdAtMs:1,lastUsedAtMs:1,logicalBytes:0,fileCount:0,formatVersion:1,state:'healthy' });
     if (path === '/v1/formats/register') {
@@ -41,9 +41,10 @@ class Runtime {
       const record=this.files.get(body.path); if(!record) return err(404,'NOT_FOUND','missing');
       return json({ dataBase64:record.bytes.toString('base64'), file:record.info });
     }
+    if (path === '/v1/streams/write/capability') return json({ chunkMethod:'PUT' });
     if (path === '/v1/streams/write/begin') {
-      const id=`stream-w-${this.streams.size+1}`; this.streams.set(id,{ kind:'write', path:body.path, chunks:[], metadata:body.metadata });
-      return json({ streamId:id, maxChunkBytes:512*1024 });
+      const id=`stream-w-${this.streams.size+1}`; assert.equal(body.chunkMethod,'PUT'); this.streams.set(id,{ kind:'write', path:body.path, chunks:[], metadata:body.metadata });
+      return json({ streamId:id, requestId:body.requestId, chunkMethod:'PUT', maxChunkBytes:512*1024 });
     }
     const writeChunk = path.match(/^\/v1\/streams\/write\/([^/]+)\/(\d+)$/);
     if (request.method === 'PUT' && writeChunk) {

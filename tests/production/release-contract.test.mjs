@@ -41,7 +41,7 @@ function collectMarkdown(dir, base = dir) {
 }
 
 test('production documentation set includes release history and Wiki handoff while core public docs stay bilingual', () => {
-  assert.deepEqual(collectMarkdown(root), ['CHANGELOG.md', 'PRIVACY.md', 'README.md', 'README_DEVELOPER.md', 'WIKI_UPDATE_0.2.0.md', 'WIKI_UPDATE_0.2.1.md']);
+  assert.deepEqual(collectMarkdown(root), ['CHANGELOG.md', 'PRIVACY.md', 'README.md', 'README_DEVELOPER.md', 'RELEASE_0.2.3_TRANSPORT.md', 'WIKI_UPDATE_0.2.0.md', 'WIKI_UPDATE_0.2.1.md']);
   for (const body of [clientReadme, developerReadme, privacy]) {
     assert.match(body, /## English/);
     assert.match(body, /## Русский/);

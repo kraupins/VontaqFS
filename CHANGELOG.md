@@ -2,7 +2,54 @@
 
 All notable public changes to VontaqFS are documented here.
 
-**Version guidance:** `0.2.1` is the recommended compatibility baseline for new integrations and the supported baseline for new Figma Plugin integrations. The 0.1.x line was an early preview and 0.2.0 was an integration-preview release. Existing compatible VontaqFS data from those releases remains supported; the 0.2 line continues to use wire protocol v1 and storage/registry format v1.
+**Version guidance:** current release candidate: VontaqFS Runtime/Desktop `0.2.3` and `@vontaq/fs@0.2.3` (coordinated dual PUT/POST transport). Earlier `0.2.1` remains a historical stable Figma adapter baseline; `0.2.2` was a Runtime-only patch. Wire protocol v1 and portable storage format v1 remain unchanged, but internal SQLite registry upgrades to schema v2 and old runtimes cannot open it.
+
+## [0.2.3] - 2026-10-17 (SOURCE CANDIDATE — NOT RELEASE APPROVED)
+
+### Added
+
+- Runtime-authorized per-pairing streaming method selection (`PUT` or binary `POST`), persisted CAS preference and Desktop Settings selector; client capability declaration is not a security attestation.
+- Negotiated `chunk-upload-post` and `stream-status` features in existing protocol v1, method-pinned begin/chunk, stream `status`/`resolve` and durable operation outcome journal.
+- SDK `StreamWriter` strict chunk ACK verification and status reconciliation, serialized writer operations and typed unresolved outcomes; new Figma Bridge method declaration.
+- Bridge persistence status and Meta revision-aware dependent-action barrier for Analysis/Meta/Document State/Local Export.
+
+### Changed
+
+- Server read timeout model uses inbound inactivity rather than a hard 30-second entire-body wall clock; idle stream cleanup protects an active incoming body.
+- Internal registry schema upgraded v1 → v2 for pairing policies and operation journal. Existing pairings retain PUT-only rights until explicit reauthorization; newly authorized dual-method pairings default PUT.
+- Bridge `0.9.4` pins `@vontaq/fs@0.2.3`; co-release Runtime, SDK and Bridge before using POST.
+
+### Fixed
+
+- Missing stream acknowledgements no longer imply confirmed bytes/success in the source implementation; prior confirmed document pointers are intended to remain valid on unresolved writes.
+- Timed Meta save waiting is no longer equated with authoritative save failure.
+
+### Compatibility
+
+- Wire protocol v1 with explicit feature negotiation; portable Storage Format v1, immutable hashes, Figma document pointers, `.Vontaq`, `.vui`, `.vplg`, `.vflow`, Studio export transport and native import/export formats remain unchanged.
+- New Runtime + SDK `0.2.3` required for revised stream-write contract. Old SDK/Runtime combinations are not certified for new writes; capability absence must fail safely rather than silently switching methods.
+- Registry schema v2 is **not downgrade-compatible** with old Runtime; take a secure registry backup before upgrade and restore it with the old binary for rollback.
+- **RELEASE BLOCKED** pending Rust/Tauri/SDK/Bridge builds, native Windows PUT+POST/Figma E2E, security/recovery reviews and explicit acceptance of non-durable Meta draft close risk (D7). Tests were deferred by owner, not passed.
+
+## [0.2.2] - 2026-10-16
+
+### Added
+
+- Windows real-TCP HTTP ingress regression scenarios, source/binary provenance diagnostics and opt-in bounded receive tracing for engineering verification.
+
+### Changed
+
+- Desktop and Runtime patch release metadata are now independent of the unchanged `@vontaq/fs@0.2.1` npm package.
+- The release gate retains synchronized Runtime/Desktop metadata while preventing runtime-only tags from republishing the older SDK.
+
+### Fixed
+
+- Release workflow guard for already-published SDK versions in runtime-only releases. The reported Windows PUT/408 ingress fault remains under investigation; this source snapshot does **not** claim to contain a proven runtime fix.
+
+### Compatibility
+
+- Protocol and storage/registry format remain v1; no migrations or changes to client-session formats.
+- `@vontaq/fs@0.2.1` and Bridge 0.9.3 stay unchanged; desktop 0.2.2 is a candidate gated by the Windows ingress proof and release validation.
 
 ## [0.2.1] - 2026-10-08
 

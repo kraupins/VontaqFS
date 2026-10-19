@@ -4,6 +4,8 @@ import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import {
   ApplicationSummary,
+  type ChunkMethod,
+  type ConnectionTransportSettings,
   DesktopOperationSummary,
   DesktopPreferences,
   DiagnosticsReport,
@@ -652,6 +654,34 @@ function SettingsPage({ preferences, updater, diagnostics, setPreferences, setUp
   setError: (value: string | null) => void;
 }) {
   const { tr, preference, setPreference } = useI18n();
+  const [connections,setConnections]=useState<ConnectionTransportSettings[]>([]);
+  const [connectionId,setConnectionId]=useState('');
+  const [transportLoading,setTransportLoading]=useState(false);
+  const [transportApplying,setTransportApplying]=useState(false);
+  const [transportError,setTransportError]=useState<string|null>(null);
+  const loadTransports=useCallback(async()=>{
+    setTransportLoading(true);
+    try{
+      const records=await desktopApi.listConnectionTransportSettings();
+      setConnections(records);
+      setConnectionId(previous=>records.some(item=>item.connectionId===previous)?previous:(records.find(item=>item.authorization==='AUTHORIZED')?.connectionId||records[0]?.connectionId||''));
+      setTransportError(null);
+    }catch(reason){setTransportError(errorText(reason));}
+    finally{setTransportLoading(false);}
+  },[]);
+  useEffect(()=>{void loadTransports();},[loadTransports]);
+  const activeTransport=connections.find(item=>item.connectionId===connectionId);
+  const changeTransport=async(method:ChunkMethod)=>{
+    if(!activeTransport||transportApplying||activeTransport.allowedMethods.length!==2||activeTransport.authorization!=='AUTHORIZED'||!activeTransport.allowedMethods.includes(method))return;
+    setTransportApplying(true);setTransportError(null);
+    try{
+      const updated=await desktopApi.setConnectionTransportPreference(activeTransport.connectionId,method,activeTransport.revision);
+      setConnections(previous=>previous.map(entry=>entry.connectionId===updated.connectionId?updated:entry));
+      setToast(tr(`Transport method set to ${updated.effectiveMethod}.`,`Метод передачи изменён на ${updated.effectiveMethod}.`));
+    }catch(reason){setTransportError(errorText(reason));await loadTransports();}
+    finally{setTransportApplying(false);}
+  };
+  const transportReason=(reason:string)=>reason==='INTEGRATION_UNSUPPORTED'?tr('Not supported by this integration.','Интеграция не поддерживает этот метод.'):reason==='RUNTIME_UNSUPPORTED'?tr('Not supported by this Runtime.','Runtime не поддерживает этот метод.'):reason==='ORGANIZATION_POLICY'?tr('Restricted by a verified policy.','Ограничено подтверждённой политикой.'):reason==='UNAUTHORIZED'?tr('Connection authorization was revoked.','Авторизация подключения отозвана.'):tr('Availability has not been verified.','Доступность не подтверждена.');
   const toggle = async (kind: 'update' | 'login', value: boolean) => {
     try {
       const next = kind === 'update' ? await desktopApi.setAutomaticUpdateCheck(value) : await desktopApi.setLaunchOnLogin(value);
@@ -673,6 +703,19 @@ function SettingsPage({ preferences, updater, diagnostics, setPreferences, setUp
       <div><h2>{tr('General', 'Общие')}</h2><p>{tr('Runtime lifecycle preferences are stored locally on this device.', 'Настройки запуска runtime хранятся локально на этом устройстве.')}</p></div>
       <SettingToggle label={tr('Launch VontaqFS on login', 'Запускать VontaqFS при входе')} description={tr('Keep the local runtime available after you sign in.', 'Держит локальный runtime доступным после входа в систему.')} checked={preferences?.launchOnLogin ?? false} onChange={(value) => void toggle('login', value)} />
       <label className="setting-row language-setting"><span><strong>{tr('Language', 'Язык')}</strong><small>{tr('Choose the VontaqFS interface language or follow the operating system.', 'Выберите язык интерфейса VontaqFS или используйте язык системы.')}</small></span><select value={preference} onChange={(event: { target: { value: string } }) => setPreference(event.target.value as 'system' | 'en' | 'ru')}><option value="system">{tr('System', 'Системный')}</option><option value="en">English</option><option value="ru">Русский</option></select></label>
+    </section>
+    <section className="settings-card" aria-labelledby="transport-settings-heading">
+      <div className="detail-section-head"><div><h2 id="transport-settings-heading">{tr('Data transfer','Передача данных')}</h2><p>{tr('Advanced connection setting. Only the locally authorized Runtime applies the selected method.','Расширенная настройка подключения. Выбранный метод применяется только авторизованным локальным Runtime.')}</p></div><button className="button secondary small" onClick={()=>void loadTransports()} disabled={transportLoading||transportApplying}>{tr('Refresh','Обновить')}</button></div>
+      {connections.length===0?<p className="muted" role="status">{transportLoading?tr('Loading connections…','Загружаем подключения…'):tr('No authorized connections found.','Нет авторизованных подключений.')}</p>:<>
+        {connections.length>1&&<label className="transport-select-label">{tr('Authorized connection','Авторизованное подключение')}<select value={connectionId} onChange={(event)=>setConnectionId(event.target.value)} disabled={transportApplying}>{connections.map(item=><option key={item.connectionId} value={item.connectionId}>{item.displayName} · {item.connectionId.slice(0,8)}</option>)}</select></label>}
+        {activeTransport&&<div className="transport-setting" aria-live="polite">
+          <div className="transport-title"><strong>{activeTransport.displayName}</strong><small>{activeTransport.authorization==='REVOKED'?tr('Access revoked','Доступ отозван'):tr('Current method','Текущий метод')+': '+(activeTransport.effectiveMethod||tr('Unavailable','Недоступен'))}</small></div>
+          {activeTransport.authorization==='AUTHORIZED'&&activeTransport.allowedMethods.length===2?<fieldset disabled={transportApplying} className="transport-methods"><legend>{tr('Method for new transfers','Метод для новых передач')}</legend>{(['PUT','POST'] as const).map(method=><label key={method} className="transport-method"><input type="radio" name="chunk-method" checked={activeTransport.effectiveMethod===method} onChange={()=>void changeTransport(method)}/><span>{method}</span></label>)}</fieldset>:<p className="muted">{activeTransport.effectiveMethod?tr(`Only ${activeTransport.effectiveMethod} is available for this connection.`,`Для этого подключения доступен только ${activeTransport.effectiveMethod}.`):tr('No permitted transfer method.','Нет разрешённого метода передачи.')}</p>}
+          {(['PUT','POST'] as const).filter(method=>!activeTransport.allowedMethods.includes(method)).map(method=><p key={method} className="muted">{method}: {transportReason(activeTransport.blockedReasons[method]||'UNKNOWN')}</p>)}
+          {activeTransport.activeStreamCount>0&&<p className="muted">{tr('Active streams keep their original method; changes affect only new streams.','Активные потоки сохраняют первоначальный метод; изменение действует только для новых потоков.')}</p>}
+        </div>}
+      </>}
+      {transportError&&<p className="notice error compact" role="alert">{transportError}</p>}
     </section>
     <section className="settings-card"><div><h2>{tr('Updates', 'Обновления')}</h2><p>{tr('Normal update availability is quiet and never interrupts storage work.', 'Проверка обновлений не прерывает работу с хранилищем.')}</p></div><SettingToggle label={tr('Automatically check for updates', 'Автоматически проверять обновления')} description={tr('Enabled by default. Storage continues to work fully offline.', 'Включено по умолчанию. Хранилище продолжает работать полностью офлайн.')} checked={preferences?.automaticUpdateCheck ?? true} onChange={(value) => void toggle('update', value)} /><div className="update-panel"><div><StatusPill value={updater?.phase ?? 'not-checked'} /><p>{updater?.phase === 'available' ? tr(`Version ${updater.availableVersion} is available.`, `Доступна версия ${updater.availableVersion}.`) : updater?.phase === 'downloaded' ? tr(`Version ${updater.availableVersion} is downloaded and ready.`, `Версия ${updater.availableVersion} загружена и готова к установке.`) : updater?.phase === 'not-configured' ? tr('Signed production updater transport is not configured in this build.', 'В этой сборке не настроен production-канал подписанных обновлений.') : updater?.phase === 'up-to-date' ? tr(`VontaqFS ${updater.currentVersion} is up to date.`, `VontaqFS ${updater.currentVersion} уже актуален.`) : tr('Check the signed public release feed when you choose.', 'Проверка выполняется через подписанный публичный release-канал.')}</p></div><div className="button-row"><button className="button secondary" onClick={() => void updateAction('check')} disabled={updater?.phase === 'checking'}><Icon name="refresh" />{tr('Check now', 'Проверить')}</button>{updater?.phase === 'available' && <button className="button primary" onClick={() => void updateAction('download')}>{tr('Download update', 'Скачать обновление')}</button>}{updater?.phase === 'downloaded' && <button className="button primary" onClick={() => void updateAction('install')}>{tr('Install and restart', 'Установить и перезапустить')}</button>}</div></div></section>
     <section className="settings-card"><div className="detail-section-head"><div><h2>{tr('Diagnostics', 'Диагностика')}</h2><p>{tr('Technical information is local and sanitized. User file contents and credentials are excluded.', 'Технические сведения остаются локальными и очищены от содержимого пользовательских файлов и учётных данных.')}</p></div><button className="button secondary" onClick={() => void desktopApi.diagnostics().then(setDiagnostics).catch((reason) => setError(errorText(reason)))}>{tr('Refresh', 'Обновить')}</button></div>{diagnostics && <div className="diagnostic-grid"><div><span>{tr('Registry', 'Реестр')}</span><strong>{diagnostics.storage.registryQuickCheck}</strong></div><div><span>{tr('Applications', 'Приложения')}</span><strong>{diagnostics.storage.applicationCount}</strong></div><div><span>{tr('Spaces', 'Хранилища')}</span><strong>{diagnostics.storage.spaceCount}</strong></div><div><span>{tr('Indexed data', 'Индексированные данные')}</span><strong>{formatBytes(diagnostics.storage.logicalBytes)}</strong></div></div>}<div className="button-row"><button className="button secondary" onClick={() => void desktopApi.exportDiagnostics().then((path) => setToast(tr(`Diagnostic report saved to ${path}`, `Диагностический отчёт сохранён: ${path}`))).catch((reason) => setError(errorText(reason)))}><Icon name="download" />{tr('Export diagnostic report', 'Экспортировать отчёт')}</button></div><details className="technical-details wide"><summary>{tr('Technical details', 'Технические сведения')}</summary>{diagnostics ? <dl><div><dt>Runtime</dt><dd>{diagnostics.runtimeVersion}</dd></div><div><dt>{tr('Protocol', 'Протокол')}</dt><dd>{diagnostics.protocolMin}–{diagnostics.protocolMax}</dd></div><div><dt>{tr('Storage format', 'Формат хранилища')}</dt><dd>{diagnostics.storageFormatVersion}</dd></div><div><dt>{tr('Platform', 'Платформа')}</dt><dd>{diagnostics.os} / {diagnostics.architecture}</dd></div><div><dt>{tr('Active sessions', 'Активные сессии')}</dt><dd>{diagnostics.activeSessions}</dd></div><div><dt>{tr('Selected endpoint', 'Выбранный endpoint')}</dt><dd>{diagnostics.endpoint.selectedPort ? `localhost:${diagnostics.endpoint.selectedPort}` : 'PORT_CONFLICT'}</dd></div><div><dt>{tr('Official endpoints', 'Официальные endpoints')}</dt><dd>{diagnostics.endpoint.officialPorts.map((port) => `localhost:${port}`).join(', ')}</dd></div><div><dt>{tr('Occupied endpoints', 'Занятые endpoints')}</dt><dd>{diagnostics.endpoint.occupiedPorts.length ? diagnostics.endpoint.occupiedPorts.map((port) => `localhost:${port}`).join(', ') : tr('None reported', 'Не обнаружено')}</dd></div></dl> : <p className="muted">{tr('Refresh diagnostics to view technical details.', 'Обновите диагностику, чтобы увидеть технические сведения.')}</p>}</details></section>

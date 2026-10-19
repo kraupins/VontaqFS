@@ -19,13 +19,13 @@ use crate::{
     DirectoryGrantCapability, DirectoryGrantRecord, ExportBookkeepingPolicy, ExportConflictPolicy,
     ExportPresetRecord, ExportPrunePolicy, FileMetadata, FileRecord, ImportConflictPolicy,
     KvRecord, NativeExportMode, NativeExportReport, NativeImportMode, NativeImportReport,
-    PairingRecord, PortableBackupReport, PortableRestoreReport, RepairOutcome, RepairReport,
-    RestoreConflictPolicy, SnapshotRecord, SnapshotRestoreReport, SpaceClearReport,
-    SpaceExportReport, SpaceManifest, SpaceRecord, StorageCategory, StorageClass,
+    PairingRecord, PairingTransportPolicy, PortableBackupReport, PortableRestoreReport,
+    RepairOutcome, RepairReport, RestoreConflictPolicy, SnapshotRecord, SnapshotRestoreReport,
+    SpaceClearReport, SpaceExportReport, SpaceManifest, SpaceRecord, StorageCategory, StorageClass,
     StorageDiagnostics, StorageError, StorageResult,
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const SPACE_FORMAT_VERSION: u32 = 1;
 const MUTATION_RECEIPT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 const MUTATION_RECEIPT_MAX_ROWS: i64 = 10_000;
@@ -116,6 +116,25 @@ pub enum AtomicWriteFault {
     AfterSwap,
 }
 
+/// Private runtime transport journal (not part of portable user data or storage format).
+#[derive(Debug, Clone)]
+pub struct StreamOperationRecord {
+    pub pairing_id: String,
+    pub space_id: String,
+    pub request_id: String,
+    pub stream_id: String,
+    pub method: String,
+    pub path: String,
+    pub declared_size: Option<u64>,
+    pub phase: String,
+    pub state_revision: i64,
+    pub next_seq: u64,
+    pub confirmed_bytes: u64,
+    pub last_chunk_sha256: Option<String>,
+    pub last_chunk_len: u64,
+    pub result: Option<FileRecord>,
+}
+
 impl StorageEngine {
     pub fn open(root: impl AsRef<Path>) -> StorageResult<Self> {
         let root = root.as_ref().to_path_buf();
@@ -131,6 +150,8 @@ impl StorageEngine {
         engine.prune_mutation_receipts()?;
         engine.recover_pending_mutations()?;
         engine.quarantine_orphan_stream_temps()?;
+        engine.recover_stream_operations()?;
+        engine.prune_stream_operations()?;
         engine.recover_native_import_journals()?;
         engine.cleanup_deletion_quarantine()?;
         Ok(engine)
@@ -208,6 +229,27 @@ impl StorageEngine {
         client_instance_id: &str,
         credential_hash: &str,
     ) -> StorageResult<PairingRecord> {
+        self.create_pairing_with_transport(
+            application_id,
+            client_instance_id,
+            credential_hash,
+            &["PUT".into()],
+        )
+    }
+
+    pub fn create_pairing_with_transport(
+        &self,
+        application_id: &str,
+        client_instance_id: &str,
+        credential_hash: &str,
+        declared_methods: &[String],
+    ) -> StorageResult<PairingRecord> {
+        let declared_methods = normalize_chunk_methods(declared_methods)?;
+        let selected_method = if declared_methods.len() == 1 {
+            declared_methods[0].as_str()
+        } else {
+            "PUT"
+        };
         validate_client_instance_id(client_instance_id)?;
         validate_credential_hash(credential_hash)?;
         let now = now_ms();
@@ -233,6 +275,10 @@ impl StorageEngine {
         tx.execute(
             "INSERT INTO pairings(id,application_id,client_instance_id,credential_hash,created_at_ms,last_used_at_ms,revoked_at_ms) VALUES(?1,?2,?3,?4,?5,NULL,NULL)",
             params![record.id, record.application_id, record.client_instance_id, record.credential_hash, record.created_at_ms],
+        )?;
+        tx.execute(
+            "INSERT INTO pairing_transport_policies(pairing_id,declared_methods,selected_method,revision,updated_at_ms) VALUES(?1,?2,?3,1,?4)",
+            params![record.id, serde_json::to_string(&declared_methods)?, selected_method, now],
         )?;
         tx.commit()?;
         Ok(record)
@@ -314,6 +360,286 @@ impl StorageEngine {
             params![now_ms(), pairing_id],
         )?;
         Ok(changed > 0)
+    }
+
+    /// The policy is bound to the persisted pairing ID, never an application display name.
+    pub fn pairing_transport_policy(
+        &self,
+        pairing_id: &str,
+    ) -> StorageResult<Option<PairingTransportPolicy>> {
+        validate_opaque_id(pairing_id)?;
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let raw: Option<(String, String, i64, i64)> = conn.query_row(
+            "SELECT declared_methods,selected_method,revision,updated_at_ms FROM pairing_transport_policies WHERE pairing_id=?1",
+            params![pairing_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional()?;
+        raw.map(|(methods, selected_method, revision, updated_at_ms)| {
+            let declared_methods: Vec<String> = serde_json::from_str(&methods)?;
+            Ok(PairingTransportPolicy {
+                pairing_id: pairing_id.to_owned(),
+                declared_methods,
+                selected_method,
+                revision,
+                updated_at_ms,
+            })
+        })
+        .transpose()
+    }
+
+    /// Persist selection with a single SQL transaction; stale UI cannot overwrite newer revision.
+    /// Runtime must additionally restrict the method to its authoritative allowed intersection.
+    pub fn set_pairing_transport_method(
+        &self,
+        pairing_id: &str,
+        method: &str,
+        expected_revision: i64,
+    ) -> StorageResult<PairingTransportPolicy> {
+        validate_opaque_id(pairing_id)?;
+        if !matches!(method, "PUT" | "POST") || expected_revision < 1 {
+            return Err(StorageError::RequestInvalid(
+                "invalid method or expected revision".into(),
+            ));
+        }
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction()?;
+        let existing: Option<(String, i64)> = tx.query_row(
+            "SELECT t.declared_methods,t.revision FROM pairing_transport_policies t JOIN pairings p ON p.id=t.pairing_id WHERE t.pairing_id=?1 AND p.revoked_at_ms IS NULL",
+            params![pairing_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let (declared_json, revision) =
+            existing.ok_or_else(|| StorageError::NotFound("authorized pairing".into()))?;
+        if revision != expected_revision {
+            return Err(StorageError::Conflict(
+                "transport policy revision changed".into(),
+            ));
+        }
+        let declared_methods: Vec<String> = serde_json::from_str(&declared_json)?;
+        if !declared_methods.iter().any(|declared| declared == method) {
+            return Err(StorageError::RequestInvalid(
+                "method is not declared by pairing".into(),
+            ));
+        }
+        let updated_at_ms = now_ms();
+        let next_revision = revision
+            .checked_add(1)
+            .ok_or_else(|| StorageError::Conflict("revision limit".into()))?;
+        let updated = tx.execute(
+            "UPDATE pairing_transport_policies SET selected_method=?1,revision=?2,updated_at_ms=?3 WHERE pairing_id=?4 AND revision=?5",
+            params![method, next_revision, updated_at_ms, pairing_id, revision],
+        )?;
+        if updated != 1 {
+            return Err(StorageError::Conflict(
+                "transport policy revision changed".into(),
+            ));
+        }
+        tx.commit()?;
+        Ok(PairingTransportPolicy {
+            pairing_id: pairing_id.into(),
+            declared_methods,
+            selected_method: method.into(),
+            revision: next_revision,
+            updated_at_ms,
+        })
+    }
+
+    /// Terminal journal outcomes outlive core's 24h mutation-receipt window.
+    /// Unresolved records are never automatically evicted; a full journal blocks new
+    /// streams instead of losing the evidence needed for safe reconciliation.
+    fn prune_stream_operations(&self) -> StorageResult<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        conn.execute("DELETE FROM stream_operations WHERE phase IN ('COMMITTED','ABORTED','EXPIRED_FENCED') AND updated_at_ms<?1",params![now_ms()-48*60*60*1000_i64])?;
+        Ok(())
+    }
+
+    /// Never reuse a stream request identity or allow unresolved committed-path replacements.
+    pub fn begin_stream_operation(&self, op: &StreamOperationRecord) -> StorageResult<()> {
+        validate_opaque_id(&op.pairing_id)?;
+        validate_opaque_id(&op.space_id)?;
+        validate_request_id(&op.request_id)?;
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        conn.execute("DELETE FROM stream_operations WHERE phase IN ('COMMITTED','ABORTED','EXPIRED_FENCED') AND updated_at_ms<?1",params![now_ms()-48*60*60*1000_i64])?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM stream_operations", [], |row| {
+            row.get(0)
+        })?;
+        if count >= 20_000 {
+            return Err(StorageError::StorageUnavailable(
+                "stream outcome journal is at its safety capacity".into(),
+            ));
+        }
+        let blocked: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM stream_operations WHERE space_id=?1 AND logical_path=?2 AND phase IN ('COMMITTING','UNCERTAIN','RECONCILING'))",
+            params![op.space_id,op.path], |row| row.get(0))?;
+        if blocked {
+            return Err(StorageError::Conflict(
+                "stream path has unresolved durable outcome".into(),
+            ));
+        }
+        conn.execute("INSERT INTO stream_operations(pairing_id,space_id,request_id,stream_id,chunk_method,logical_path,declared_size,phase,state_revision,next_seq,confirmed_bytes,last_chunk_len,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,'OPEN',1,0,0,0,?8)",
+            params![op.pairing_id,op.space_id,op.request_id,op.stream_id,op.method,op.path,op.declared_size.map(|v|v as i64),now_ms()])?;
+        Ok(())
+    }
+
+    pub fn advance_stream_chunk(&self, op: &StreamOperationRecord) -> StorageResult<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let updated = conn.execute("UPDATE stream_operations SET next_seq=?1,confirmed_bytes=?2,last_chunk_sha256=?3,last_chunk_len=?4,state_revision=state_revision+1,updated_at_ms=?5 WHERE stream_id=?6 AND pairing_id=?7 AND phase='OPEN' AND next_seq=?8",
+            params![op.next_seq as i64,op.confirmed_bytes as i64,op.last_chunk_sha256,op.last_chunk_len as i64,now_ms(),op.stream_id,op.pairing_id,(op.next_seq-1) as i64])?;
+        if updated != 1 {
+            return Err(StorageError::Conflict(
+                "durable stream sequence changed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// COMMITTING is persisted BEFORE invoking core commit (which creates the receipt).
+    pub fn finish_stream_operation(
+        &self,
+        stream_id: &str,
+        pairing_id: &str,
+        expected_phase: &str,
+        phase: &str,
+        result: Option<&FileRecord>,
+    ) -> StorageResult<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let result_json = result.map(serde_json::to_string).transpose()?;
+        let updated = conn.execute("UPDATE stream_operations SET phase=?1,result_json=COALESCE(?2,result_json),state_revision=state_revision+1,updated_at_ms=?3 WHERE stream_id=?4 AND pairing_id=?5 AND phase=?6",
+            params![phase,result_json,now_ms(),stream_id,pairing_id,expected_phase])?;
+        if updated != 1 {
+            return Err(StorageError::Conflict(
+                "stream journal transition rejected".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn resolve_stream_operation(
+        &self,
+        pairing_id: &str,
+        space_id: &str,
+        request_id: &str,
+    ) -> StorageResult<Option<StreamOperationRecord>> {
+        validate_opaque_id(pairing_id)?;
+        validate_opaque_id(space_id)?;
+        validate_request_id(request_id)?;
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        // Keep the SQLite result layout local to this lookup; it is not a public data contract.
+        type StreamOperationRow = (
+            String,
+            String,
+            Option<i64>,
+            String,
+            i64,
+            i64,
+            i64,
+            Option<String>,
+            i64,
+            Option<String>,
+        );
+        let value: Option<StreamOperationRow> = conn.query_row(
+            "SELECT stream_id,chunk_method,declared_size,phase,state_revision,next_seq,confirmed_bytes,last_chunk_sha256,last_chunk_len,result_json FROM stream_operations WHERE pairing_id=?1 AND space_id=?2 AND request_id=?3",
+            params![pairing_id,space_id,request_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?))) .optional()?;
+        let path: Option<String> = conn.query_row("SELECT logical_path FROM stream_operations WHERE pairing_id=?1 AND space_id=?2 AND request_id=?3", params![pairing_id,space_id,request_id],|row|row.get(0)).optional()?;
+        let Some((
+            stream_id,
+            method,
+            declared_size,
+            mut phase,
+            mut revision,
+            next_seq,
+            bytes,
+            sha,
+            chunk_len,
+            result_json,
+        )) = value
+        else {
+            return Ok(None);
+        };
+        let path = path.ok_or_else(|| StorageError::Internal("missing journal path".into()))?;
+        let mut result: Option<FileRecord> =
+            result_json.map(|v| serde_json::from_str(&v)).transpose()?;
+        if phase == "COMMITTING" || phase == "UNCERTAIN" {
+            if let Some(receipt_result) =
+                receipt::<FileRecord>(&conn, space_id, request_id, &file_write_operation(&path))?
+            {
+                // The core receipt was recovered and committed to registry after atomic swap.
+                result = Some(receipt_result.clone());
+                conn.execute("UPDATE stream_operations SET phase='COMMITTED',result_json=?1,state_revision=state_revision+1,updated_at_ms=?2 WHERE stream_id=?3 AND phase IN ('COMMITTING','UNCERTAIN')", params![serde_json::to_string(&receipt_result)?,now_ms(),stream_id])?;
+                phase = "COMMITTED".to_owned();
+                revision += 1;
+            }
+            // An in-flight COMMITTING operation may not have published its receipt yet.
+            // After a crash, recover_stream_operations() has already marked it UNCERTAIN.
+            // Never infer abort from absence of a receipt while commit can still finish.
+        }
+        Ok(Some(StreamOperationRecord {
+            pairing_id: pairing_id.into(),
+            space_id: space_id.into(),
+            request_id: request_id.into(),
+            stream_id,
+            method,
+            path,
+            declared_size: declared_size.map(|n| n as u64),
+            phase,
+            state_revision: revision,
+            next_seq: next_seq as u64,
+            confirmed_bytes: bytes as u64,
+            last_chunk_sha256: sha,
+            last_chunk_len: chunk_len as u64,
+            result,
+        }))
+    }
+
+    pub fn resolve_stream_by_id(
+        &self,
+        pairing_id: &str,
+        stream_id: &str,
+    ) -> StorageResult<Option<StreamOperationRecord>> {
+        validate_opaque_id(pairing_id)?;
+        let lookup: Option<(String, String)> = {
+            let conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            conn.query_row("SELECT space_id,request_id FROM stream_operations WHERE pairing_id=?1 AND stream_id=?2",params![pairing_id,stream_id],|row|Ok((row.get(0)?,row.get(1)?))).optional()?
+        };
+        match lookup {
+            Some((space, request)) => self.resolve_stream_operation(pairing_id, &space, &request),
+            None => Ok(None),
+        }
+    }
+
+    /// At startup temp files have already been quarantined by core recovery.
+    /// Only pre-commit OPEN streams can be conclusively fenced; COMMITTING is unresolved.
+    fn recover_stream_operations(&self) -> StorageResult<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        conn.execute("UPDATE stream_operations SET phase='EXPIRED_FENCED',state_revision=state_revision+1,updated_at_ms=?1 WHERE phase='OPEN'",params![now_ms()])?;
+        conn.execute("UPDATE stream_operations SET phase='UNCERTAIN',state_revision=state_revision+1,updated_at_ms=?1 WHERE phase='COMMITTING'",params![now_ms()])?;
+        Ok(())
     }
 
     pub fn get_space(&self, space_id: &str) -> StorageResult<Option<SpaceRecord>> {
@@ -5025,6 +5351,49 @@ fn open_registry(path: &Path) -> StorageResult<Connection> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;",
     )?;
+    // Keep a verified v1 snapshot before upgrading the registry. SQLite VACUUM
+    // INTO takes a consistent snapshot even if the source uses WAL pages.
+    let has_schema: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_schema != 0 {
+        let old_version: i64 =
+            conn.query_row("SELECT version FROM schema_meta LIMIT 1", [], |row| {
+                row.get(0)
+            })?;
+        if old_version == 1 {
+            let backups = path
+                .parent()
+                .expect("registry path has parent")
+                .join("registry-backups");
+            fs::create_dir_all(&backups)?;
+            let backup = backups.join(format!(
+                "registry-{}-pre-v2-{}.sqlite3",
+                now_ms(),
+                Uuid::new_v4()
+            ));
+            if let Err(error) = conn.execute(
+                "VACUUM INTO ?1",
+                params![backup.to_string_lossy().to_string()],
+            ) {
+                let _ = fs::remove_file(&backup);
+                return Err(error.into());
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&backup, fs::Permissions::from_mode(0o600))?;
+            }
+            verify_registry_file(&backup)?;
+            rotate_registry_backups(
+                path.parent()
+                    .and_then(Path::parent)
+                    .expect("runtime root has parent"),
+            )?;
+        }
+    }
     migrate(&conn)?;
     Ok(conn)
 }
@@ -5078,10 +5447,70 @@ fn migrate(conn: &Connection) -> StorageResult<()> {
     let version: i64 = conn.query_row("SELECT version FROM schema_meta LIMIT 1", [], |row| {
         row.get(0)
     })?;
-    if version != SCHEMA_VERSION {
+    if version != 1 && version != SCHEMA_VERSION {
         return Err(StorageError::SchemaUnsupported(version));
     }
+    // Registry schema v2 prevents old runtimes from silently ignoring transport
+    // authorization after rollback. Portable Storage Format remains v1.
+    // Additive registry metadata, NOT a new portable storage format. DDL and legacy
+    // PUT-only rows are committed atomically so a crash can replay migration safely.
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE IF NOT EXISTS stream_operations(
+           pairing_id TEXT NOT NULL REFERENCES pairings(id),
+           space_id TEXT NOT NULL REFERENCES spaces(id),
+           request_id TEXT NOT NULL,
+           stream_id TEXT NOT NULL UNIQUE,
+           chunk_method TEXT NOT NULL CHECK(chunk_method IN ('PUT','POST')),
+           logical_path TEXT NOT NULL,
+           declared_size INTEGER,
+           phase TEXT NOT NULL,
+           state_revision INTEGER NOT NULL DEFAULT 1,
+           next_seq INTEGER NOT NULL DEFAULT 0,
+           confirmed_bytes INTEGER NOT NULL DEFAULT 0,
+           last_chunk_sha256 TEXT,
+           last_chunk_len INTEGER NOT NULL DEFAULT 0,
+           result_json TEXT,
+           updated_at_ms INTEGER NOT NULL,
+           PRIMARY KEY(pairing_id,space_id,request_id));
+         CREATE INDEX IF NOT EXISTS stream_operations_active_path ON stream_operations(space_id,logical_path,phase);
+         CREATE TABLE IF NOT EXISTS pairing_transport_policies(
+           pairing_id TEXT PRIMARY KEY REFERENCES pairings(id) ON DELETE CASCADE,
+           declared_methods TEXT NOT NULL,
+           selected_method TEXT NOT NULL CHECK(selected_method IN ('PUT','POST')),
+           revision INTEGER NOT NULL CHECK(revision>=1),
+           updated_at_ms INTEGER NOT NULL);
+         INSERT OR IGNORE INTO pairing_transport_policies(pairing_id,declared_methods,selected_method,revision,updated_at_ms)
+           SELECT id,'[\"PUT\"]','PUT',1,created_at_ms FROM pairings;
+         UPDATE schema_meta SET version=2 WHERE version=1;
+         COMMIT;"
+    )?;
     Ok(())
+}
+
+fn normalize_chunk_methods(input: &[String]) -> StorageResult<Vec<String>> {
+    if input.is_empty()
+        || input.len() > 2
+        || input
+            .iter()
+            .any(|method| !matches!(method.as_str(), "PUT" | "POST"))
+    {
+        return Err(StorageError::RequestInvalid(
+            "supportedChunkMethods must contain PUT and/or POST".into(),
+        ));
+    }
+    let mut methods = Vec::new();
+    for method in ["PUT", "POST"] {
+        if input.iter().any(|value| value == method) {
+            methods.push(method.to_owned());
+        }
+    }
+    if methods.len() != input.len() {
+        return Err(StorageError::RequestInvalid(
+            "duplicate chunk method declaration".into(),
+        ));
+    }
+    Ok(methods)
 }
 
 fn verify_registry_connection(conn: &Connection) -> StorageResult<()> {
@@ -6688,6 +7117,162 @@ mod tests {
     }
 
     #[test]
+    fn cp1_transport_policy_rejects_invalid_declarations_and_is_pairing_scoped() {
+        let root = temp_root("cp1-transport-policy");
+        let engine = StorageEngine::open(&root).unwrap();
+        let app = engine
+            .register_application(ApplicationKind::FigmaPlugin, "cp1.plugin", "Duplicate Name")
+            .unwrap();
+        assert!(matches!(
+            engine.create_pairing_with_transport(&app.id, "invalid", &"a".repeat(64), &[]),
+            Err(StorageError::RequestInvalid(_))
+        ));
+        assert!(matches!(
+            engine.create_pairing_with_transport(
+                &app.id,
+                "invalid",
+                &"a".repeat(64),
+                &["PUT".into(), "PUT".into()]
+            ),
+            Err(StorageError::RequestInvalid(_))
+        ));
+        assert!(matches!(
+            engine.create_pairing_with_transport(
+                &app.id,
+                "invalid",
+                &"a".repeat(64),
+                &["PATCH".into()]
+            ),
+            Err(StorageError::RequestInvalid(_))
+        ));
+        let first = engine
+            .create_pairing_with_transport(
+                &app.id,
+                "first",
+                &"a".repeat(64),
+                &["POST".into(), "PUT".into()],
+            )
+            .unwrap();
+        let second = engine
+            .create_pairing_with_transport(&app.id, "second", &"b".repeat(64), &["PUT".into()])
+            .unwrap();
+        let initial = engine.pairing_transport_policy(&first.id).unwrap().unwrap();
+        assert_eq!(initial.declared_methods, vec!["PUT", "POST"]);
+        assert_eq!(initial.selected_method, "PUT");
+        assert_eq!(initial.revision, 1);
+        let updated = engine
+            .set_pairing_transport_method(&first.id, "POST", 1)
+            .unwrap();
+        assert_eq!(updated.selected_method, "POST");
+        assert_eq!(updated.revision, 2);
+        assert!(matches!(
+            engine.set_pairing_transport_method(&first.id, "PUT", 1),
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(matches!(
+            engine.set_pairing_transport_method(&second.id, "POST", 1),
+            Err(StorageError::RequestInvalid(_))
+        ));
+        assert_eq!(
+            engine
+                .pairing_transport_policy(&second.id)
+                .unwrap()
+                .unwrap()
+                .selected_method,
+            "PUT"
+        );
+        drop(engine);
+        let reopened = StorageEngine::open(&root).unwrap();
+        assert_eq!(
+            reopened
+                .pairing_transport_policy(&first.id)
+                .unwrap()
+                .unwrap(),
+            updated
+        );
+        assert!(reopened.revoke_pairing(&first.id).unwrap());
+        assert!(matches!(
+            reopened.set_pairing_transport_method(&first.id, "PUT", 2),
+            Err(StorageError::NotFound(_))
+        ));
+        let replacement = reopened
+            .create_pairing(&app.id, "first", &"c".repeat(64))
+            .unwrap();
+        assert_ne!(replacement.id, first.id);
+        assert_eq!(
+            reopened
+                .pairing_transport_policy(&replacement.id)
+                .unwrap()
+                .unwrap()
+                .selected_method,
+            "PUT"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp1_old_registry_pairings_migrate_to_put_without_credential_loss() {
+        let root = temp_root("cp1-migrate");
+        let engine = StorageEngine::open(&root).unwrap();
+        let app = engine
+            .register_application(ApplicationKind::FigmaPlugin, "cp1.legacy", "Legacy")
+            .unwrap();
+        let legacy = engine
+            .create_pairing(&app.id, "legacy", &"d".repeat(64))
+            .unwrap();
+        drop(engine);
+        // Simulate the old pre-CP1 registry: schema_meta and pairings exist, policy table doesn't.
+        let db = root.join("runtime/registry.sqlite3");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "DROP TABLE pairing_transport_policies; UPDATE schema_meta SET version=1;",
+        )
+        .unwrap();
+        drop(conn);
+        let reopened = StorageEngine::open(&root).unwrap();
+        let backups = fs::read_dir(root.join("runtime/registry-backups"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("-pre-v2-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        let old_conn = Connection::open(&backups[0]).unwrap();
+        let original_version: i64 = old_conn
+            .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(original_version, 1);
+        drop(old_conn);
+        assert_eq!(
+            reopened
+                .pairing_by_id(&legacy.id)
+                .unwrap()
+                .unwrap()
+                .credential_hash,
+            "d".repeat(64)
+        );
+        let policy = reopened
+            .pairing_transport_policy(&legacy.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(policy.declared_methods, vec!["PUT"]);
+        assert_eq!(policy.selected_method, "PUT");
+        let conn = Connection::open(&db).unwrap();
+        let schema: i64 = conn
+            .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(schema, 2);
+        drop(conn);
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn pairing_credentials_are_persisted_as_hash_records_and_revoke_cleanly() {
         let root = temp_root("pairing");
         let engine = StorageEngine::open(&root).unwrap();
@@ -6985,7 +7570,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, 1);
+        assert_eq!(schema_version, 2);
         assert_eq!(
             fs::read(&persistent_manifest_path).unwrap(),
             manifest_before
@@ -7095,18 +7680,18 @@ mod tests {
         }
         {
             let conn = Connection::open(root.join("runtime/registry.sqlite3")).unwrap();
-            conn.execute("UPDATE schema_meta SET version=2", [])
+            conn.execute("UPDATE schema_meta SET version=3", [])
                 .unwrap();
         }
         assert!(matches!(
             StorageEngine::open(&root),
-            Err(StorageError::SchemaUnsupported(2))
+            Err(StorageError::SchemaUnsupported(3))
         ));
         let conn = Connection::open(root.join("runtime/registry.sqlite3")).unwrap();
         let version: i64 = conn
             .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let corrupt_copies = fs::read_dir(root.join("runtime"))
             .unwrap()
             .filter_map(Result::ok)

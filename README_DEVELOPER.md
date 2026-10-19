@@ -2,11 +2,11 @@
 
 VontaqFS is a local-first desktop storage runtime. Applications connect through the public TypeScript package `@vontaq/fs`; filesystem paths, pairing credentials and runtime internals stay behind the SDK/runtime boundary.
 
-**Recommended baseline:** use `@vontaq/fs@0.2.1` or newer for new integrations. Version 0.2.1 is the stabilized compatibility baseline for the supported Figma Plugin host path. Earlier 0.1.x and 0.2.0 releases remain compatible with their existing persisted data and protocol contracts, but they do not contain the complete 0.2.1 Figma host integration.
+**Current coordinated release candidate:** use `@vontaq/fs@0.2.3` with VontaqFS Runtime/Desktop `0.2.3` for new dual-method streaming. Version 0.2.1 is the stabilized compatibility baseline for the supported Figma Plugin host path. Earlier 0.1.x and 0.2.0 releases remain compatible with their existing persisted data and protocol contracts, but they do not contain the complete 0.2.1 Figma host integration.
 
 VontaqFS — локальный desktop-runtime хранения данных. Приложения подключаются через публичный TypeScript-пакет `@vontaq/fs`; физические пути файловой системы, pairing credentials и внутреннее устройство runtime не входят в обычный API клиента.
 
-**Рекомендуемая базовая версия:** для новых интеграций используйте `@vontaq/fs@0.2.1` или новее. Версия 0.2.1 — стабилизированная база совместимости для поддерживаемой интеграции с Figma Plugin. Релизы 0.1.x и 0.2.0 сохраняют совместимость со своими существующими данными и protocol contracts, но не содержат полного Figma host path из 0.2.1.
+**Текущий согласованный release candidate:** используйте `@vontaq/fs@0.2.3` с Runtime/Desktop `0.2.3` для PUT/POST streaming. Версия 0.2.1 — стабилизированная база совместимости для поддерживаемой интеграции с Figma Plugin. Релизы 0.1.x и 0.2.0 сохраняют совместимость со своими существующими данными и protocol contracts, но не содержат полного Figma host path из 0.2.1.
 
 ---
 
@@ -30,10 +30,10 @@ A compatible VontaqFS Desktop application must be installed and running on the u
 For a new Figma Plugin integration, pin the supported baseline explicitly while adopting the host adapter:
 
 ```bash
-npm install @vontaq/fs@^0.2.1
+npm install @vontaq/fs@0.2.3
 ```
 
-Updating from 0.1.x or 0.2.0 to 0.2.1 does not require a destructive VFS data migration: wire protocol v1, storage/registry format v1, pairing identity and existing persisted spaces/files remain compatible.
+The historical 0.1.x/0.2.0 → 0.2.1 migration preserved both storage and registry v1. **This 0.2.3 candidate advances internal registry to v2**, while portable storage remains v1; back up the registry before upgrade.
 
 ### 2. Connection and pairing
 
@@ -570,10 +570,10 @@ import { createFigmaConnectOptions } from '@vontaq/fs/figma';
 Для новой интеграции с Figma Plugin при подключении host adapter рекомендуется явно использовать стабилизированную базовую версию:
 
 ```bash
-npm install @vontaq/fs@^0.2.1
+npm install @vontaq/fs@0.2.3
 ```
 
-Переход с 0.1.x или 0.2.0 на 0.2.1 не требует destructive migration данных VFS: wire protocol v1, storage/registry format v1, pairing identity и существующие spaces/files остаются совместимыми.
+Исторический переход 0.1.x/0.2.0 → 0.2.1 сохранял storage/registry v1. **Этот кандидат 0.2.3 обновляет внутреннюю registry до v2**, сохраняя переносимый Storage Format v1; перед обновлением сделайте резервную копию registry.
 
 ### 2. Подключение и pairing
 
@@ -1059,13 +1059,22 @@ await fs.close();
 - module format: ESM
 - package Node engine metadata: Node.js 18+
 - production runtime endpoint pool: `localhost:47833`–`localhost:47836`
-- package/product version in this release: `0.2.1`
+- current source candidate (not released): SDK/Runtime/Desktop `0.2.3` (Bridge `0.9.4`)
 - recommended baseline for new Figma Plugin integrations: `>=0.2.1`
 - 0.1.x and 0.2.0: historical preview/integration releases; existing compatible data is preserved, but the stabilized public Figma Plugin host path starts at 0.2.1
 - protocol range in this release: v1
-- storage/registry format in this release: v1
+- portable user storage format: v1; private SQLite registry schema: v2 (requires backup for downgrade)
 - package includes compiled JavaScript, TypeScript declarations, source maps, this guide, `CHANGELOG.md` and the VontaqFS license
 
 For exact compile-time types and constants, the installed package declarations are the source of truth.
 
 Для точных TypeScript-типов, констант и сигнатур источником истины являются declarations установленного пакета.
+
+
+## Development candidate — explicit dual-method chunk transport (2026-10-17, NOT RELEASED)
+
+The code in the attached development archive introduces explicit `supportedChunkMethods: ['PUT','POST']` at first pairing approval. A persisted per-connection Runtime policy chooses exactly one method; existing pairings migrate as PUT-only. The authorized user chooses between the supported methods in VontaqFS Desktop → Settings → Data transfer, with revision-based CAS; changing the preference affects **new streams only**. The SDK pins the method from begin to commit, validates ACK identity/sequence/bytes, and queries Runtime stream status after ambiguous responses. A missing response is **not** proof of failure. No automatic PUT-to-POST fallback exists.
+
+The protocol uses version **v1 with explicit feature negotiation** (`chunk-upload-post`, `stream-status`); GET `/v1/streams/write/{streamId}/status`, POST `/v1/streams/write/resolve`, POST `/v1/streams/write/capability`, and POST `/v1/streams/write/{streamId}/{seq}/chunk` are development-only additions requiring the matching Runtime/SDK pair. Chunk media is **application/octet-stream**, not JSON or Base64. A health capability alone does not grant the method: Runtime enforces approved pairing declaration and local selected preference. The SDK calls the authenticated capability endpoint before each begin.
+
+**Compatibility & release warning:** Source release metadata is prepared for SDK/Runtime 0.2.3 and Bridge 0.9.4, but these builds are not validated or published by this archive. Internal registry schema v2 is distinct from portable Storage Format v1. Downgrades require restoring a verified registry backup, not changing the schema number. Old binaries cannot operate on a v2 registry. Real Windows/Figma E2E, native security, recovery and migration testing have not been performed in this implementation handoff. Do not enable production delivery without the checklist in `../CP7_VALIDATION_HANDOFF.md` and explicit owner acceptance of non-durable unsaved Meta drafts. Corporate IT transfer restrictions must be respected.

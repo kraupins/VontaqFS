@@ -24,6 +24,8 @@ export const VONTAQ_FS_CAPABILITY_IDS = {
   kv: 'kv',
   spaces: 'spaces',
   streams: 'streams',
+  streamStatus: 'stream-status',
+  chunkUploadPost: 'chunk-upload-post',
   events: 'events',
   formats: 'formats',
   operations: 'operations',
@@ -50,6 +52,7 @@ export type ClientKind = 'figma-plugin' | 'figma-widget' | 'other-supported-clie
 export type StorageClass = 'persistent' | 'cache' | 'temporary';
 export type StorageCategory = 'user-data' | 'generated' | 'index' | 'backup' | 'snapshot' | 'custom';
 export type PairingStatus = 'pending' | 'approved' | 'denied' | 'expired';
+export type ChunkMethod = 'PUT' | 'POST';
 
 export type ProgressPresentation = 'silent' | 'client' | 'vontaqfs';
 export type OperationStatus = 'queued' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
@@ -191,6 +194,8 @@ export interface SessionResponse {
   token: string;
   expiresAtMs: number;
   applicationId: string;
+  connectionId?: string;
+  effectiveChunkMethod?: ChunkMethod;
   capabilities: readonly string[];
 }
 
@@ -387,7 +392,28 @@ export interface RuntimeErrorResponse {
 
 export interface StreamWriteBeginResponse {
   streamId: string;
+  requestId: string;
+  chunkMethod: ChunkMethod;
   maxChunkBytes: number;
+}
+
+export type StreamPhase = 'OPEN' | 'COMMITTING' | 'COMMITTED' | 'ABORTING' | 'ABORTED' | 'EXPIRED_FENCED' | 'RECONCILING' | 'UNCERTAIN';
+export interface StreamOutcome {
+  connectionId: string;
+  requestId: string;
+  streamId: string;
+  chunkMethod: ChunkMethod;
+  phase: StreamPhase;
+  nextSeq: number;
+  confirmedBytes: number;
+  declaredSize?: number | null;
+  lastAcceptedChunk?: { seq: number; length: number; sha256: string } | null;
+  result?: FileInfo | null;
+  stateRevision: number;
+  canContinue: boolean;
+  canRetry: boolean;
+  canRequestCancel: boolean;
+  canCheckStatus: boolean;
 }
 
 export interface StreamChunkAck {

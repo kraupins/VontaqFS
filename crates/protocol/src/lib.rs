@@ -32,6 +32,8 @@ pub const READ_MANY_MAX_ITEMS: usize = 64;
 pub const READ_MANY_MAX_ITEM_BYTES: usize = DIRECT_PAYLOAD_TARGET_BYTES;
 pub const READ_MANY_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
+pub const CAPABILITY_POST_CHUNKS: &str = "chunk-upload-post";
+pub const CAPABILITY_STREAM_STATUS: &str = "stream-status";
 pub const CAPABILITY_BULK_READ: &str = "bulk-read";
 pub const CAPABILITY_SPACE_CLEAR: &str = "space-clear";
 pub const CAPABILITY_DESTINATION_PICKER_HINTS: &str = "destination-picker-hints";
@@ -87,6 +89,8 @@ impl HealthResponse {
                 "kv".into(),
                 "spaces".into(),
                 "streams".into(),
+                CAPABILITY_POST_CHUNKS.into(),
+                CAPABILITY_STREAM_STATUS.into(),
                 "events".into(),
                 "formats".into(),
                 "operations".into(),
@@ -131,6 +135,29 @@ pub struct ClientIdentity {
 pub struct PairingRequest {
     pub application: ClientIdentity,
     pub client_instance_id: String,
+    #[serde(default)]
+    pub supported_chunk_methods: Option<Vec<ChunkMethod>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ChunkMethod {
+    #[serde(rename = "PUT")]
+    Put,
+    #[serde(rename = "POST")]
+    Post,
+}
+
+fn default_chunk_method() -> ChunkMethod {
+    ChunkMethod::Put
+}
+
+impl ChunkMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Put => "PUT",
+            Self::Post => "POST",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -200,6 +227,10 @@ pub struct SessionResponse {
     pub token: String,
     pub expires_at_ms: i64,
     pub application_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_chunk_method: Option<ChunkMethod>,
     pub capabilities: Vec<String>,
 }
 
@@ -433,6 +464,8 @@ pub struct SmallFileWriteRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamWriteBeginRequest {
+    #[serde(default = "default_chunk_method")]
+    pub chunk_method: ChunkMethod,
     pub request_id: String,
     pub space_id: String,
     pub path: String,
@@ -445,6 +478,8 @@ pub struct StreamWriteBeginRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamWriteBeginResponse {
+    pub chunk_method: ChunkMethod,
+    pub request_id: String,
     pub stream_id: String,
     pub max_chunk_bytes: usize,
 }

@@ -47,3 +47,6 @@ jobs:
         run: |
           cargo test -p vontaqfs-core --lib
           cargo test -p vontaqfs-runtime --lib
+      - name: Windows x64 release-profile real-TCP ingress regression (T1-T6, T8-T9)
+        if: runner.os == 'Windows'
+        run: cargo test -p vontaqfs-runtime --release tcp_ingress_complete_put_does_not_wait_for_eof -- --test-threads=1

@@ -115,6 +115,16 @@ pub struct PairingRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct PairingTransportPolicy {
+    pub pairing_id: String,
+    pub declared_methods: Vec<String>,
+    pub selected_method: String,
+    pub revision: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct SpaceRecord {
     pub id: String,
     pub owner_application_id: String,

@@ -268,3 +268,12 @@ button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px 
   outline: 2px solid currentColor;
   outline-offset: 2px;
 }
+
+/* Trusted per-pairing transport control, consistent with existing settings tokens. */
+.transport-select-label{display:grid;gap:7px;margin-top:14px;font-size:11px;color:var(--muted)}
+.transport-select-label select{width:100%;border:1px solid var(--line);border-radius:8px;padding:9px;background:var(--surface,#14171d);color:var(--text,#fff)}
+.transport-setting{margin-top:12px;display:grid;gap:10px}
+.transport-title{display:grid;gap:3px}.transport-title strong{font-size:12px}.transport-title small{color:var(--muted);font-size:10px}
+.transport-methods{border:0;padding:0;display:flex;gap:14px;margin:0;min-width:0}.transport-methods legend{color:var(--muted);font-size:11px;margin-bottom:9px}
+.transport-method{display:flex;gap:7px;align-items:center;font-size:12px;cursor:pointer}.transport-method input{accent-color:var(--accent-2)}
+@media(prefers-reduced-motion:reduce){.transport-setting,.transport-method{transition:none}}

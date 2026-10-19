@@ -23,6 +23,7 @@ import {
   type BatchOperation,
   type BatchReport,
   type ClientIdentity,
+  type ChunkMethod,
   type DestinationGrant,
   type DirectoryGrantCapability,
   type DirectoryExportLayout,
@@ -67,6 +68,7 @@ import {
   type WriteTreeReport,
   type StreamReadBeginResponse,
   type StreamWriteBeginResponse,
+  type StreamOutcome,
 } from './protocol.js';
 
 const CLIENT_INSTANCE_KEY = 'vontaqfs.client-instance.v1';
@@ -131,6 +133,8 @@ export interface PairingRequiredEvent {
 
 export interface VontaqFSConnectOptions {
   application: ClientIdentity;
+  /** Declared at first pairing approval, NOT a local transport preference or permission override. */
+  supportedChunkMethods?: readonly ChunkMethod[];
   stateStore: ClientStateStore;
   /** Development/test-only endpoint override. Published plugins should use official discovery. */
   developmentEndpoint?: string;
@@ -269,6 +273,8 @@ export interface VontaqFSWriter {
   write(chunk: Uint8Array): Promise<void>;
   commit(): Promise<FileInfo>;
   abort(): Promise<void>;
+  /** Authoritative stream status; never treat an unreachable status as FAILED. */
+  status(): Promise<StreamOutcome>;
 }
 
 export interface VontaqFSReader {
@@ -361,6 +367,7 @@ export class FetchTransport implements VontaqFSTransport {
 
 interface ConnectionSettings {
   application: ClientIdentity;
+  supportedChunkMethods: readonly ChunkMethod[];
   stateStore: ClientStateStore;
   endpoint: string;
   discoveryEndpoints: readonly string[];
@@ -424,6 +431,7 @@ class RuntimeConnection {
   get requestTimeoutMs(): number { return this.settings.requestTimeoutMs; }
   secureId(prefix: string): string { return secureId(this.settings.secureRandom, prefix); }
   get sessionCapabilityIds(): readonly string[] { return this.session.capabilities; }
+  get effectiveChunkMethod(): ChunkMethod | undefined { return this.session.effectiveChunkMethod; }
 
   requireCapability(capability: string): void {
     if (!this.session.capabilities.includes(capability)) {
@@ -451,8 +459,17 @@ class RuntimeConnection {
     return this.withSession(token => requestJson<T>(this.settings, path, body, token, 'mutation', false));
   }
 
-  putBinaryJson<T>(path: string, bytes: Uint8Array): Promise<T> {
-    return this.withSession(token => requestBinaryJson<T>(this.settings, path, bytes, token));
+  sendChunk<T>(path: string, bytes: Uint8Array, method: ChunkMethod): Promise<T> {
+    return this.withSession(token => requestBinaryJson<T>(this.settings, path, bytes, token, method));
+  }
+
+  getJson<T>(path: string): Promise<T> {
+    return this.withSession(token => retryTransport(this.settings,path,true,async () => {
+      const response=await this.settings.transport.request({ method:'GET',url:`${this.settings.endpoint}${path}`,
+        headers:{ Authorization:`Bearer ${token}` },...requestTiming(this.settings,'operational') });
+      if(response.status < 200 || response.status >= 300) throw decodeRuntimeError(response);
+      return JSON.parse(responseText(response)) as T;
+    }));
   }
 
   getBinary(path: string): Promise<Uint8Array> {
@@ -664,7 +681,8 @@ class OperationObserver {
 class StreamWriter implements VontaqFSWriter {
   private readonly hasher = new IncrementalSha256();
   private sequence = 0;
-  private state: 'open' | 'committed' | 'aborted' = 'open';
+  private state: 'open' | 'committed' | 'aborted' | 'uncertain' = 'open';
+  private busy = false;
   private committedFile?: FileInfo;
   private checksum?: string;
   private written = 0;
@@ -672,43 +690,133 @@ class StreamWriter implements VontaqFSWriter {
   constructor(
     private readonly connection: RuntimeConnection,
     readonly streamId: string,
+    private readonly requestId: string,
+    private readonly method: ChunkMethod,
+    private readonly targetPath: string,
+    private readonly declaredSize: number | undefined,
     private readonly maxChunkBytes: number,
     private readonly operation?: OperationObserver,
   ) {}
 
   get bytesWritten(): number { return this.written; }
 
-  async write(chunk: Uint8Array): Promise<void> {
-    if (this.state !== 'open' || this.checksum) throw new VontaqFSError('STREAM_EXPIRED', 'Cannot write after stream commit has started.');
-    if (!(chunk instanceof Uint8Array)) throw new TypeError('writer.write() requires Uint8Array data.');
-    for (let offset = 0; offset < chunk.byteLength; offset += this.maxChunkBytes) {
-      const view = chunk.subarray(offset, Math.min(chunk.byteLength, offset + this.maxChunkBytes));
-      await this.connection.putBinaryJson<StreamChunkAck>(`/v1/streams/write/${encodeURIComponent(this.streamId)}/${this.sequence}`, view);
-      this.hasher.update(view);
-      this.written += view.byteLength;
-      this.sequence += 1;
+  private exclusive(): () => void {
+    if (this.busy) throw new VontaqFSError('CONFLICT','Concurrent writer operations are not allowed.');
+    this.busy = true;
+    return () => { this.busy = false; };
+  }
+
+  private uncertain(message: string): never {
+    this.state = 'uncertain';
+    throw new VontaqFSError('STREAM_OUTCOME_UNCERTAIN',message,{streamId:this.streamId,requestId:this.requestId,method:this.method});
+  }
+
+  private async observeStatus(): Promise<StreamOutcome> {
+    const outcome = await this.connection.getJson<StreamOutcome>(`/v1/streams/write/${encodeURIComponent(this.streamId)}/status`);
+    if (outcome.streamId !== this.streamId || outcome.requestId !== this.requestId || outcome.chunkMethod !== this.method ||
+        !Number.isSafeInteger(outcome.nextSeq) || !Number.isSafeInteger(outcome.confirmedBytes) || !Number.isSafeInteger(outcome.stateRevision)) {
+      this.uncertain('Runtime returned inconsistent stream status.');
     }
+    return outcome;
+  }
+
+  async status(): Promise<StreamOutcome> {
+    const done=this.exclusive();
+    try { return await this.observeStatus(); }
+    finally { done(); }
+  }
+
+  private validateAck(ack: StreamChunkAck, bytes: number): boolean {
+    return ack != null && ack.streamId === this.streamId &&
+      Number.isSafeInteger(ack.acceptedSeq) && ack.acceptedSeq === this.sequence &&
+      Number.isSafeInteger(ack.nextSeq) && ack.nextSeq === this.sequence + 1 &&
+      Number.isSafeInteger(ack.receivedBytes) && ack.receivedBytes === this.written + bytes;
+  }
+
+  private async writeOne(view: Uint8Array): Promise<void> {
+    const seq=this.sequence;
+    const path = `/v1/streams/write/${encodeURIComponent(this.streamId)}/${seq}${this.method==='POST'?'/chunk':''}`;
+    const hasher = new IncrementalSha256(); hasher.update(view); const expectedHash=hasher.digestHex();
+    let acknowledged = false;
+    try {
+      const ack=await this.connection.sendChunk<StreamChunkAck>(path,view,this.method);
+      acknowledged=this.validateAck(ack,view.byteLength);
+    } catch (error) {
+      if (isVontaqFSError(error) && !['TRANSPORT_ERROR','TRANSPORT_TIMEOUT','TRANSPORT_CANCELLED','RUNTIME_DISCONNECTED','STREAM_SEQUENCE_INVALID','CONFLICT','RATE_LIMITED','STORAGE_UNAVAILABLE'].includes(error.code)) throw error;
+      // Malformed ACK and dropped responses both require server-authoritative status.
+    }
+    if (!acknowledged) {
+      let outcome: StreamOutcome;
+      try { outcome = await this.observeStatus(); }
+      catch { this.uncertain('Chunk acknowledgement and runtime status are unavailable.'); }
+      if (outcome.phase !== 'OPEN') this.uncertain(`Cannot resume chunk while stream is ${outcome.phase}.`);
+      if (outcome.nextSeq === seq+1 && outcome.confirmedBytes === this.written+view.byteLength &&
+          outcome.lastAcceptedChunk?.seq === seq && outcome.lastAcceptedChunk.length === view.byteLength &&
+          outcome.lastAcceptedChunk.sha256.toLowerCase() === expectedHash) {
+        acknowledged=true;
+      } else if (outcome.nextSeq === seq && outcome.confirmedBytes === this.written && outcome.canContinue) {
+        // Only the exact same method, streamId, sequence and bytes may be retried.
+        try { acknowledged=this.validateAck(await this.connection.sendChunk<StreamChunkAck>(path,view,this.method),view.byteLength); }
+        catch { this.uncertain('Exact chunk retry has no authoritative acknowledgement.'); }
+      }
+      if (!acknowledged) this.uncertain('Chunk acknowledgement disagrees with runtime state.');
+    }
+    this.hasher.update(view);
+    this.written += view.byteLength;
+    this.sequence += 1;
+  }
+
+  async write(chunk: Uint8Array): Promise<void> {
+    const done=this.exclusive();
+    try {
+      if(this.state!=='open' || this.checksum) throw new VontaqFSError('STREAM_EXPIRED','Cannot write after stream commit started.');
+      if(!(chunk instanceof Uint8Array)) throw new TypeError('writer.write() requires Uint8Array data.');
+      for(let offset=0;offset<chunk.byteLength;offset+=this.maxChunkBytes)
+        await this.writeOne(chunk.subarray(offset,Math.min(chunk.byteLength,offset+this.maxChunkBytes)));
+    } finally { done(); }
   }
 
   async commit(): Promise<FileInfo> {
-    if (this.state === 'committed' && this.committedFile) return this.committedFile;
-    if (this.state !== 'open') throw new VontaqFSError('STREAM_EXPIRED', 'Cannot commit an aborted stream.');
-    this.checksum ??= this.hasher.digestHex();
-    const file = await this.connection.post<FileInfo>(`/v1/streams/write/${encodeURIComponent(this.streamId)}/commit`, { sha256: this.checksum }, 'mutation');
-    this.state = 'committed';
-    this.committedFile = file;
-    await this.operation?.finish();
-    return file;
+    const done=this.exclusive();
+    try {
+      if(this.state==='committed' && this.committedFile) return this.committedFile;
+      if(this.state!=='open') throw new VontaqFSError('STREAM_OUTCOME_UNCERTAIN','Writer is not in a safe state for commit.');
+      if(this.declaredSize !== undefined && this.written!==this.declaredSize)
+        throw new VontaqFSError('STREAM_SEQUENCE_INVALID','Confirmed bytes differ from declared size.');
+      this.checksum ??= this.hasher.digestHex();
+      let file: FileInfo | undefined;
+      try { file=await this.connection.postNonRetryingMutation<FileInfo>(`/v1/streams/write/${encodeURIComponent(this.streamId)}/commit`,{sha256:this.checksum}); }
+      catch (error) {
+        if (isVontaqFSError(error) && !['TRANSPORT_ERROR','TRANSPORT_TIMEOUT','TRANSPORT_CANCELLED','RUNTIME_DISCONNECTED','STORAGE_UNAVAILABLE','CONFLICT'].includes(error.code)) throw error;
+        let outcome: StreamOutcome;
+        try { outcome=await this.observeStatus(); }
+        catch { this.uncertain('Commit response lost and runtime status cannot be confirmed.'); }
+        if(outcome.phase!=='COMMITTED' || !outcome.result) this.uncertain(`Commit outcome is ${outcome.phase}; durable result not confirmed.`);
+        file=outcome.result;
+      }
+      if(!file || file.path!==this.targetPath || file.size!==this.written || file.etag.toLowerCase()!==this.checksum.toLowerCase())
+        this.uncertain('Commit result does not match target, confirmed bytes and digest.');
+      this.state='committed';this.committedFile=file;
+      await this.operation?.finish();
+      return file;
+    } finally { done(); }
   }
 
   async abort(): Promise<void> {
-    if (this.state !== 'open') return;
-    this.state = 'aborted';
+    const done=this.exclusive();
     try {
-      await this.connection.post<void>(`/v1/streams/write/${encodeURIComponent(this.streamId)}/abort`, {}, 'mutation');
-    } finally {
+      if(this.state==='aborted') return;
+      if(this.state==='committed') throw new VontaqFSError('CONFLICT','Committed file cannot be rolled back by abort.');
+      try { await this.connection.postNonRetryingMutation<void>(`/v1/streams/write/${encodeURIComponent(this.streamId)}/abort`,{}); }
+      catch {
+        let outcome: StreamOutcome;
+        try { outcome=await this.observeStatus(); }
+        catch { this.uncertain('Cancel requested, but authoritative abort status is unavailable.'); }
+        if(!['ABORTED','EXPIRED_FENCED'].includes(outcome.phase)) this.uncertain('Cancel requested; stream may still have been committed.');
+      }
+      this.state='aborted';
       await this.operation?.finish();
-    }
+    } finally { done(); }
   }
 }
 
@@ -834,7 +942,7 @@ class SpaceFiles implements FileAPI {
       }
       return await writer.commit();
     } catch (error) {
-      await bestEffortAbort(writer);
+      if (!isVontaqFSError(error) || error.code !== 'STREAM_OUTCOME_UNCERTAIN') await bestEffortAbort(writer);
       throw error;
     }
   }
@@ -871,7 +979,7 @@ class SpaceFiles implements FileAPI {
       for (const part of textSlices(value, TEXT_ENCODER_WINDOW_CODE_UNITS)) await writer.write(utf8Encode(part));
       return await writer.commit();
     } catch (error) {
-      await bestEffortAbort(writer);
+      if (!isVontaqFSError(error) || error.code !== 'STREAM_OUTCOME_UNCERTAIN') await bestEffortAbort(writer);
       throw error;
     }
   }
@@ -901,7 +1009,7 @@ class SpaceFiles implements FileAPI {
       if (!writer) return this.writeFile(path, concatenate(buffered, bufferedBytes), options);
       return await writer.commit();
     } catch (error) {
-      if (writer) await bestEffortAbort(writer);
+      if (writer) if (!isVontaqFSError(error) || error.code !== 'STREAM_OUTCOME_UNCERTAIN') await bestEffortAbort(writer);
       throw error;
     }
   }
@@ -936,13 +1044,32 @@ class SpaceFiles implements FileAPI {
     const observer = new OperationObserver(this.connection, options);
     observer.start();
     try {
-      const response = await this.connection.post<StreamWriteBeginResponse>('/v1/streams/write/begin', {
-        requestId: this.connection.secureId('request'), spaceId: this.spaceId, path,
+      this.connection.requireCapability('stream-status');
+      const capability = await this.connection.post<{chunkMethod:ChunkMethod|null}>('/v1/streams/write/capability',{},'read');
+      const method = capability.chunkMethod;
+      if(method !== 'PUT' && method !== 'POST') throw new VontaqFSError('CAPABILITY_UNAVAILABLE','Runtime has not confirmed a permitted stream method.');
+      if(method === 'POST') this.connection.requireCapability('chunk-upload-post');
+      const requestId = this.connection.secureId('request');
+      // Non-retrying begin: reconcile a lost acknowledgement by stable requestId.
+      let response: StreamWriteBeginResponse;
+      try { response = await this.connection.postNonRetryingMutation<StreamWriteBeginResponse>('/v1/streams/write/begin', {
+        requestId,chunkMethod:method,spaceId:this.spaceId,path,
         ifMatch: options.ifMatch ?? null, declaredSize: options.declaredSize ?? null,
         metadata: normalizeFileMetadata(options.metadata), operation: observer.request,
-      }, 'mutation');
-      const maxChunkBytes = Math.min(VONTAQ_FS_STREAM_CHUNK_MAX_BYTES, Math.max(1, response.maxChunkBytes));
-      return new StreamWriter(this.connection, response.streamId, maxChunkBytes, observer);
+      }); } catch(error) {
+        if(isVontaqFSError(error) && !['TRANSPORT_ERROR','TRANSPORT_TIMEOUT','RUNTIME_DISCONNECTED'].includes(error.code)) throw error;
+        let outcome: StreamOutcome;
+        try { outcome = await this.connection.post<StreamOutcome>('/v1/streams/write/resolve',{spaceId:this.spaceId,requestId},'read'); }
+        catch { throw new VontaqFSError('STREAM_OUTCOME_UNCERTAIN','Begin response missing and request outcome could not be resolved.',{requestId,method}); }
+        if(outcome.chunkMethod!==method || outcome.requestId!==requestId || !outcome.canContinue || outcome.phase!=='OPEN')
+          throw new VontaqFSError('STREAM_OUTCOME_UNCERTAIN','Resolved begin is not safely writable.',{requestId,phase:outcome.phase});
+        response={streamId:outcome.streamId,requestId,chunkMethod:method,maxChunkBytes:VONTAQ_FS_STREAM_CHUNK_MAX_BYTES};
+      }
+      if(response.chunkMethod!==method || response.requestId!==requestId || !response.streamId ||
+          !Number.isSafeInteger(response.maxChunkBytes) || response.maxChunkBytes<1)
+        throw new VontaqFSError('STREAM_OUTCOME_UNCERTAIN','Begin ACK did not confirm the requested method and identity.');
+      const maxChunkBytes = Math.min(VONTAQ_FS_STREAM_CHUNK_MAX_BYTES, response.maxChunkBytes);
+      return new StreamWriter(this.connection,response.streamId,requestId,method,path,options.declaredSize,maxChunkBytes,observer);
     } catch (error) {
       await observer.finish();
       throw error;
@@ -1413,8 +1540,14 @@ export class VontaqFS {
       throw new TypeError('VontaqFS.connect() requires application identity and a client-local stateStore. Figma plugins can use createFigmaConnectOptions().');
     }
     const explicitRequestTimeout = options.requestTimeoutMs !== undefined;
+    const methods = options.supportedChunkMethods ?? ['PUT'];
+    if (methods.length === 0 || methods.length > 2 ||
+        methods.some((method) => method !== 'PUT' && method !== 'POST') || new Set(methods).size !== methods.length) {
+      throw new TypeError('supportedChunkMethods must be a nonempty set of PUT and/or POST');
+    }
     const settings: ConnectionSettings = {
       application: options.application,
+      supportedChunkMethods: [...methods],
       stateStore: options.stateStore,
       endpoint: '',
       discoveryEndpoints: options.developmentEndpoint ? [normalizeEndpoint(options.developmentEndpoint)] : [...VONTAQ_FS_ENDPOINTS],
@@ -1739,6 +1872,7 @@ function validateHealth(health: RuntimeStatus): void {
 async function pair(settings: ConnectionSettings, clientInstanceId: string): Promise<string> {
   const initial = await requestJson<PairingRequestResponse>(settings, '/v1/pairings/request', {
     application: settings.application, clientInstanceId,
+    supportedChunkMethods: settings.supportedChunkMethods,
   }, undefined, 'mutation');
   await settings.onPairingRequired?.({ pairingId: initial.pairingId, expiresAtMs: initial.expiresAtMs, application: settings.application });
   const timeoutAt = Math.min(initial.expiresAtMs, settings.pairingTimeoutMs === undefined ? Number.POSITIVE_INFINITY : Date.now() + Math.max(0, settings.pairingTimeoutMs));
@@ -1778,10 +1912,10 @@ async function requestJson<T>(settings: ConnectionSettings, path: string, body: 
   });
 }
 
-async function requestBinaryJson<T>(settings: ConnectionSettings, path: string, bytes: Uint8Array, token: string): Promise<T> {
-  return retryTransport(settings, path, true, async () => {
+async function requestBinaryJson<T>(settings: ConnectionSettings, path: string, bytes: Uint8Array, token: string, method: ChunkMethod): Promise<T> {
+  return retryTransport(settings, path, false, async () => {
     const response = await settings.transport.request({
-      method: 'PUT', url: `${settings.endpoint}${path}`,
+      method, url: `${settings.endpoint}${path}`,
       headers: { 'Content-Type': 'application/octet-stream', Authorization: `Bearer ${token}` },
       body: bytes, ...requestTiming(settings, 'operational'),
     });

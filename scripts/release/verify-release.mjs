@@ -31,15 +31,28 @@ const semver = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 if (!semver.test(version)) throw new Error(`Release gate: invalid root SemVer ${JSON.stringify(version)}.`);
 
 for (const [label, actual] of [
-  ['SDK package', sdkPackage.version],
   ['Desktop package', desktopPackage.version],
   ['Tauri config', tauri.version],
   ['Cargo workspace', workspaceVersion()],
   ['package-lock root', lockfile?.packages?.['']?.version],
-  ['package-lock SDK workspace', lockfile?.packages?.['packages/sdk']?.version],
   ['package-lock Desktop workspace', lockfile?.packages?.['apps/desktop']?.version],
 ]) {
   if (String(actual || '') !== version) throw new Error(`Release gate: ${label} version ${JSON.stringify(actual)} does not match ${version}.`);
+}
+
+// SDK publishing is independent from a Runtime-only SemVer patch. Both the
+// package and npm lock must agree; SDK may not lead the Runtime.
+const sdkVersion = String(sdkPackage.version || '');
+if (!semver.test(sdkVersion)) throw new Error(`Release gate: invalid SDK SemVer ${JSON.stringify(sdkVersion)}.`);
+if (String(lockfile?.packages?.['packages/sdk']?.version || '') !== sdkVersion) {
+  throw new Error('Release gate: SDK package and npm workspace lock versions disagree.');
+}
+const stableCore = value => value.split(/[+-]/, 1)[0].split('.').map(Number);
+const sdkParts = stableCore(sdkVersion);
+const runtimeParts = stableCore(version);
+for (let i = 0; i < 3; i++) {
+  if (sdkParts[i] > runtimeParts[i]) throw new Error('Release gate: SDK version cannot exceed Runtime version.');
+  if (sdkParts[i] < runtimeParts[i]) break;
 }
 
 const tag = args.get('tag') || process.env.GITHUB_REF_NAME || '';
@@ -101,4 +114,4 @@ if (process.env.GITHUB_REPOSITORY) {
   if (repository.toLowerCase() !== expected) throw new Error(`Release gate: SDK repository ${repository} does not match workflow repository ${expected}.`);
 }
 
-process.stdout.write(`${JSON.stringify({ ok: true, version, tag: tag || null }, null, 2)}\n`);
+process.stdout.write(`${JSON.stringify({ ok: true, version, sdkVersion, tag: tag || null }, null, 2)}\n`);

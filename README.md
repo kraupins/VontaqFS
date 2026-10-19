@@ -17,6 +17,10 @@ VontaqFS is a local-first desktop storage runtime for compatible Vontaq/Figma in
 
 VontaqFS does not bypass Figma security, read hidden Figma Desktop data, inject code into Figma, extract credentials, or automatically upload your stored files to Vontaq.
 
+### PUT / POST transfer (0.2.3 source candidate)
+
+Authorized connections may declare support for PUT, POST, or both. VontaqFS Desktop Settings → Data transfer lets the local user choose **one permitted method for each pairing**; the server enforces the choice for new streams. Existing streams keep their method. No hidden automatic fallback, organization-policy bypass or data transfer without approval is provided. Existing pairings stay PUT-only until explicitly re-paired. Runtime and SDK 0.2.3 plus Bridge 0.9.4 must be deployed together for this feature. This source candidate is not release-approved; see `../CP7_VALIDATION_HANDOFF.md` when using the complete development bundle.
+
 ### First start
 
 1. Install and start VontaqFS.

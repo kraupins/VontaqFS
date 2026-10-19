@@ -9,11 +9,12 @@ pub use model::{
     DirectoryGrantCapability, DirectoryGrantRecord, ExportBookkeepingPolicy, ExportConflictPolicy,
     ExportPresetRecord, ExportPrunePolicy, FileMetadata, FileRecord, ImportConflictPolicy,
     KvRecord, NativeExportMode, NativeExportReport, NativeImportMode, NativeImportReport,
-    PairingRecord, PortableBackupReport, PortableRestoreReport, RepairOutcome, RepairReport,
-    RestoreConflictPolicy, SnapshotRecord, SnapshotRestoreReport, SpaceClearReport,
-    SpaceExportReport, SpaceRecord, StorageCategory, StorageClass, StorageDiagnostics,
+    PairingRecord, PairingTransportPolicy, PortableBackupReport, PortableRestoreReport,
+    RepairOutcome, RepairReport, RestoreConflictPolicy, SnapshotRecord, SnapshotRestoreReport,
+    SpaceClearReport, SpaceExportReport, SpaceRecord, StorageCategory, StorageClass,
+    StorageDiagnostics,
 };
 pub use path::LogicalPath;
-pub use storage::{AtomicWriteFault, StorageEngine};
+pub use storage::{AtomicWriteFault, StorageEngine, StreamOperationRecord};
 
 pub(crate) use model::SpaceManifest;

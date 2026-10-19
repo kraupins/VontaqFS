@@ -20,6 +20,8 @@ class RetrySafeRuntime {
     this.dropFirstChunkAck = false;
     this.alwaysDropChunkAck = false;
     this.dropFirstCommitResponse = false;
+    this.failStatus = false;
+    this.dropNextChunkBeforeAccept = false;
     this.committed = null;
     this.disconnect = false;
     this.failOperationalOnly = false;
@@ -37,12 +39,31 @@ class RetrySafeRuntime {
       const mac = createHmac('sha256', key).update(`vontaqfs-runtime-challenge-v1${body.nonce}`).digest('hex');
       return json({ mac });
     }
-    if (path === '/v1/sessions') return json({ token: TOKEN, expiresAtMs: Date.now() + 60_000, applicationId: 'app-1', capabilities: ['files', 'streams'] });
+    if (path === '/v1/sessions') return json({ token: TOKEN, expiresAtMs: Date.now() + 60_000, applicationId: 'app-1', capabilities: ['files', 'streams', 'stream-status'] });
     if (path === '/v1/spaces/open') return json({ id: 'space-default', key: body.key, storageClass: 'persistent', createdAtMs: 1, lastUsedAtMs: 1, logicalBytes: 0, fileCount: 0, formatVersion: 1, state: 'healthy' });
     if (path === '/v1/fs/stat') return json({ file: null });
+    if (path === '/v1/streams/write/capability') return json({ chunkMethod: 'PUT' });
     if (path === '/v1/streams/write/begin') {
-      this.stream = { id: 'stream-1', nextSeq: 0, chunks: new Map(), hash: createHash('sha256'), size: 0, path: body.path };
-      return json({ streamId: this.stream.id, maxChunkBytes: 1024 });
+      assert.equal(body.chunkMethod, 'PUT');
+      this.stream = {
+        id: 'stream-1', requestId: body.requestId, method: body.chunkMethod,
+        nextSeq: 0, chunks: new Map(), hash: createHash('sha256'), size: 0, path: body.path,
+        lastAcceptedChunk: undefined, stateRevision: 1,
+      };
+      return json({ streamId: this.stream.id, requestId: body.requestId, chunkMethod: body.chunkMethod, maxChunkBytes: 1024 });
+    }
+    if (request.method === 'GET' && path === '/v1/streams/write/stream-1/status') {
+      if (this.failStatus) throw new Error('authoritative status unavailable');
+      return json({
+        connectionId: 'pairing-1', streamId: this.stream.id, requestId: this.stream.requestId,
+        chunkMethod: this.stream.method, phase: this.committed ? 'COMMITTED' : 'OPEN',
+        nextSeq: this.stream.nextSeq, confirmedBytes: this.stream.size,
+        lastAcceptedChunk: this.stream.lastAcceptedChunk,
+        stateRevision: this.stream.stateRevision,
+        canContinue: !this.committed, canRetry: !this.committed,
+        canRequestCancel: !this.committed, canCheckStatus: true,
+        ...(this.committed ? { result: this.committed } : {}),
+      });
     }
     if (request.method === 'PUT' && path.startsWith('/v1/streams/write/')) {
       const parts = path.split('/');
@@ -50,12 +71,18 @@ class RetrySafeRuntime {
       const seq = Number(parts[5]);
       assert.equal(streamId, this.stream.id);
       const bytes = new Uint8Array(request.body.buffer, request.body.byteOffset, request.body.byteLength);
+      if (this.dropNextChunkBeforeAccept) {
+        this.dropNextChunkBeforeAccept = false;
+        throw new Error('connection failed before runtime accepted chunk');
+      }
       if (seq === this.stream.nextSeq) {
         const copy = Uint8Array.from(bytes);
         this.stream.chunks.set(seq, copy);
         this.stream.hash.update(copy);
         this.stream.size += copy.byteLength;
+        this.stream.lastAcceptedChunk = { seq, length: copy.byteLength, sha256: createHash('sha256').update(copy).digest('hex') };
         this.stream.nextSeq += 1;
+        this.stream.stateRevision += 1;
         if (this.alwaysDropChunkAck || this.dropFirstChunkAck) {
           this.dropFirstChunkAck = false;
           throw new Error('ACK lost after runtime accepted chunk');
@@ -73,6 +100,7 @@ class RetrySafeRuntime {
       const checksum = this.stream.hash.digest('hex');
       assert.equal(body.sha256, checksum);
       this.committed = { path: this.stream.path, version: 1, etag: checksum, size: this.stream.size, updatedAtMs: 1 };
+      this.stream.stateRevision += 1;
       if (this.dropFirstCommitResponse) {
         this.dropFirstCommitResponse = false;
         throw new Error('commit response lost after commit');
@@ -86,7 +114,7 @@ class RetrySafeRuntime {
 
 function json(value) { return { status: 200, body: JSON.stringify(value) }; }
 function runtimeError(status, code, message) { return { status, body: JSON.stringify({ error: { code, message } }) }; }
-function health() { return { service: 'vontaqfs', runtimeVersion: '0.2.1', protocol: { min: 1, max: 1 }, storageFormatVersion: 1, status: 'ready', capabilities: ['files', 'streams'] }; }
+function health() { return { service: 'vontaqfs', runtimeVersion: '0.2.3', protocol: { min: 1, max: 1 }, storageFormatVersion: 1, status: 'ready', capabilities: ['files', 'streams', 'stream-status'] }; }
 function connect(runtime, retryCount = 1) {
   return VontaqFS.connect({
     application: { kind: 'figma-plugin', externalId: 'stream-retry-test', displayName: 'Stream retry test' },
@@ -99,37 +127,50 @@ function connect(runtime, retryCount = 1) {
   });
 }
 
-test('lost chunk ACK retransmits the same stream id, sequence and bytes; local state advances only after ACK', async () => {
+test('lost chunk ACK is reconciled using server chunk proof without duplicate upload', async () => {
   const runtime = new RetrySafeRuntime();
   runtime.dropFirstChunkAck = true;
   const fs = await connect(runtime, 1);
   const writer = await fs.files.createWriter('/retry.bin');
-  const bytes = Uint8Array.of(1, 2, 3, 4);
-  await writer.write(bytes);
+  await writer.write(Uint8Array.of(1, 2, 3, 4));
   assert.equal(writer.bytesWritten, 4);
-  const puts = runtime.calls.filter(call => call.method === 'PUT');
-  assert.equal(puts.length, 2);
-  assert.equal(new URL(`http://x${puts[0].path}`).pathname, puts[1].path);
-  assert.deepEqual([...puts[0].body], [...puts[1].body]);
+  assert.equal(runtime.calls.filter(call => call.method === 'PUT').length, 1);
+  assert.ok(runtime.calls.some(call => call.method === 'GET' && call.path.endsWith('/status')));
   assert.equal(runtime.stream.nextSeq, 1);
 });
 
-test('retry exhaustion leaves writer sequence/byte state unadvanced so caller can retry same chunk', async () => {
+test('lost request before acceptance retries same chunk after authoritative status', async () => {
   const runtime = new RetrySafeRuntime();
-  runtime.alwaysDropChunkAck = true;
+  runtime.dropNextChunkBeforeAccept = true;
   const fs = await connect(runtime, 0);
-  const writer = await fs.files.createWriter('/retry-later.bin');
-  const bytes = Uint8Array.of(9, 8, 7);
-  await assert.rejects(() => writer.write(bytes), error => error instanceof VontaqFSError && error.code === 'TRANSPORT_ERROR');
-  assert.equal(writer.bytesWritten, 0);
-  assert.equal(runtime.stream.nextSeq, 1, 'runtime accepted the uncertain first delivery');
-  runtime.alwaysDropChunkAck = false;
+  const writer = await fs.files.createWriter('/resend.bin');
+  const bytes = Uint8Array.of(3, 2, 1);
   await writer.write(bytes);
+  const puts = runtime.calls.filter(call => call.method === 'PUT');
+  assert.equal(puts.length, 2);
+  assert.equal(puts[0].path, puts[1].path);
+  assert.deepEqual([...puts[0].body], [...puts[1].body]);
   assert.equal(writer.bytesWritten, 3);
-  assert.equal(runtime.stream.nextSeq, 1, 'duplicate retry must not advance runtime sequence twice');
+  assert.equal(runtime.stream.nextSeq, 1);
 });
 
-test('lost commit response retries the same stream commit identity and checksum and returns cached result', async () => {
+test('lost ACK with unavailable status becomes UNCERTAIN and cannot be retried blindly', async () => {
+  const runtime = new RetrySafeRuntime();
+  runtime.dropFirstChunkAck = true;
+  runtime.failStatus = true;
+  const fs = await connect(runtime, 0);
+  const writer = await fs.files.createWriter('/uncertain.bin');
+  const bytes = Uint8Array.of(9, 8, 7);
+  await assert.rejects(() => writer.write(bytes), error => error instanceof VontaqFSError && error.code === 'STREAM_OUTCOME_UNCERTAIN');
+  assert.equal(writer.bytesWritten, 0);
+  assert.equal(runtime.stream.nextSeq, 1, 'runtime may have accepted the unacknowledged chunk');
+  runtime.failStatus = false;
+  assert.equal((await writer.status()).nextSeq, 1, 'server evidence remains queryable');
+  await assert.rejects(() => writer.write(bytes), error => error instanceof VontaqFSError && error.code === 'STREAM_EXPIRED');
+  assert.equal(runtime.calls.filter(call => call.method === 'PUT').length, 1);
+});
+
+test('lost commit response is resolved from authoritative COMMITTED status without second commit', async () => {
   const runtime = new RetrySafeRuntime();
   runtime.dropFirstCommitResponse = true;
   const fs = await connect(runtime, 1);
@@ -137,11 +178,10 @@ test('lost commit response retries the same stream commit identity and checksum 
   await writer.write(Uint8Array.of(5, 6));
   const file = await writer.commit();
   assert.equal(file.path, '/commit.bin');
-  const commits = runtime.calls.filter(call => call.path.endsWith('/commit'));
-  assert.equal(commits.length, 2);
-  assert.equal(commits[0].path, commits[1].path);
-  assert.equal(commits[0].body, commits[1].body);
-  assert.deepEqual(await writer.commit(), file, 'local duplicate commit returns committed result without another RPC');
+  assert.equal(runtime.calls.filter(call => call.path.endsWith('/commit')).length, 1);
+  assert.ok(runtime.calls.some(call => call.method === 'GET' && call.path.endsWith('/status')));
+  assert.deepEqual(await writer.commit(), file);
+  assert.equal(runtime.calls.filter(call => call.path.endsWith('/commit')).length, 1);
 });
 
 test('connected operation failure stays TRANSPORT_ERROR when health still proves runtime is reachable', async () => {

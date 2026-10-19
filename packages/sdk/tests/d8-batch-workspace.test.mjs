@@ -7,12 +7,12 @@ const CREDENTIAL='9'.repeat(64), TOKEN='a'.repeat(64);
 class Store{constructor(){this.map=new Map([['vontaqfs.client-instance.v1','client-d8'],['vontaqfs.pairing-credential.v1',CREDENTIAL]])}async get(k){return this.map.get(k)??null}async set(k,v){this.map.set(k,v)}}
 
 class D8Runtime{
-  constructor(capabilities=['files','kv','spaces','streams','operations','batch','storage-category','system-progress-window','snapshots','saved-directories','export-presets']){this.capabilities=capabilities;this.calls=[];this.streams=new Map()}
+  constructor(capabilities=['files','kv','spaces','streams','stream-status','operations','batch','storage-category','system-progress-window','snapshots','saved-directories','export-presets']){this.capabilities=capabilities;this.calls=[];this.streams=new Map()}
   async request(request){
     const path=new URL(request.url).pathname;
     const body=typeof request.body==='string'&&request.body?JSON.parse(request.body):{};
     this.calls.push({method:request.method,path,body});
-    if(path==='/v1/health')return json({service:'vontaqfs',runtimeVersion:'0.1.0',protocol:{min:1,max:1},storageFormatVersion:1,status:'ready',capabilities:this.capabilities});
+    if(path==='/v1/health')return json({service:'vontaqfs',runtimeVersion:'0.2.3',protocol:{min:1,max:1},storageFormatVersion:1,status:'ready',capabilities:this.capabilities});
     if(path==='/v1/identity/challenge'){const key=createHash('sha256').update(CREDENTIAL).digest();return json({mac:createHmac('sha256',key).update(`vontaqfs-runtime-challenge-v1${body.nonce}`).digest('hex')})}
     if(path==='/v1/sessions')return json({token:TOKEN,expiresAtMs:Date.now()+60000,applicationId:'app-d8',capabilities:this.capabilities});
     if(path==='/v1/spaces/open')return json(space(body.key,body.storageClass,body.storageCategory));
@@ -26,8 +26,9 @@ class D8Runtime{
       return json({results,completedItems:results.length,failedItems:0,cancelled:false});
     }
     if(path==='/v1/fs/stat')return json({file:null});
+    if(path==='/v1/streams/write/capability')return json({chunkMethod:'PUT'});
     if(path==='/v1/streams/write/begin'){
-      const id=`stream-${this.streams.size+1}`;this.streams.set(id,{path:body.path,size:0,hash:createHash('sha256'),seq:0});return json({streamId:id,maxChunkBytes:512*1024});
+      const id=`stream-${this.streams.size+1}`;assert.equal(body.chunkMethod,'PUT');this.streams.set(id,{path:body.path,size:0,hash:createHash('sha256'),seq:0});return json({streamId:id,requestId:body.requestId,chunkMethod:'PUT',maxChunkBytes:512*1024});
     }
     if(path.startsWith('/v1/streams/write/')&&request.method==='PUT'){
       const parts=path.split('/'), id=parts[4], seq=Number(parts[5]), stream=this.streams.get(id);assert.equal(seq,stream.seq);stream.hash.update(request.body);stream.size+=request.body.byteLength;stream.seq+=1;return json({streamId:id,acceptedSeq:seq,nextSeq:stream.seq,receivedBytes:stream.size});
