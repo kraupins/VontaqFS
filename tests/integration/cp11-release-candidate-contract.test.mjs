@@ -52,14 +52,14 @@ test('CP11 public SDK exposes the required generic primitives without Bridge-spe
   for (const token of ['openSpace', 'readonly files', 'readonly kv', 'createReader', 'createWriter', 'watch']) {
     assert.ok(sdk.includes(token), `missing SDK primitive ${token}`);
   }
-  assert.doesNotMatch(sdk, /CanonicalProjectAnalysis|BridgeAnalysisResume|vontaq-bridge/i);
-  assert.doesNotMatch(figma, /CanonicalProjectAnalysis|BridgeAnalysisResume|vontaq-bridge/i);
+  assert.doesNotMatch(sdk, /ProprietaryInternalProject|PrivateResumeImplementation|private-consumer-brand/i);
+  assert.doesNotMatch(figma, /ProprietaryInternalProject|PrivateResumeImplementation|private-consumer-brand/i);
 });
 
 test('CP11 example consumes only the public SDK surface and the fixed loopback contract', () => {
   assert.match(example, /from '@vontaq\/fs'/);
   assert.match(example, /from '@vontaq\/fs\/figma'/);
-  assert.doesNotMatch(example, /\.\.\/\.\.\/Bridge|vontaq-bridge|47831|47832/);
+  assert.doesNotMatch(example, /\.\.\/\.\.\/Bridge|private-consumer-brand|47831|47832/);
   assert.equal(exampleTsconfig.compilerOptions.strict, true);
   assert.equal(exampleTsconfig.compilerOptions.paths['@vontaq/fs'][0], '../../packages/sdk/src/index.ts');
 });

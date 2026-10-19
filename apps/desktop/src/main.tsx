@@ -25,6 +25,7 @@ type Page = 'overview' | 'applications' | 'settings';
 type ConfirmState =
   | { kind: 'revoke'; pairingId: string; appName: string }
   | { kind: 'delete'; space: SpaceSummary; appName: string }
+  | { kind: 'delete-application'; application: ApplicationSummary }
   | { kind: 'clear-cache'; space: SpaceSummary }
   | { kind: 'revoke-destination'; applicationId: string; destinationId: string; label: string }
   | { kind: 'delete-preset'; applicationId: string; presetId: string; name: string }
@@ -289,11 +290,16 @@ function App() {
         const next = await desktopApi.operationStatus(operation.id);
         if (!next) return;
         setOperations((current) => ({ ...current, [next.id]: next }));
-        if (['completed', 'failed', 'cancelled'].includes(next.status)) void refresh();
+        if (['completed', 'failed', 'cancelled'].includes(next.status)) {
+          if (next.status === 'failed') setActionError(next.error?.message || tr('Storage operation failed', 'Ошибка операции с хранилищем'));
+          if (next.status === 'completed' && next.kind === 'delete-application') setToast(tr('Application and all managed data removed', 'Приложение и все управляемые данные удалены'));
+          if (next.status === 'completed' && next.kind === 'delete-space') setToast(tr('Storage deleted', 'Хранилище удалено'));
+          void refresh();
+        }
       })).catch((reason) => setActionError(errorText(reason)));
     }, 450);
     return () => window.clearInterval(timer);
-  }, [operations, refresh]);
+  }, [operations, refresh, tr]);
 
   useEffect(() => {
     let dispose: (() => void) | undefined;
@@ -361,6 +367,9 @@ function App() {
     } else if (current.kind === 'delete') {
       const operation = await startOperation(() => desktopApi.deleteSpace(current.space.id));
       if (operation) setSpaceOperationIds((value) => ({ ...value, [current.space.id]: operation.id }));
+    } else if (current.kind === 'delete-application') {
+      const operation = await startOperation(() => desktopApi.deleteApplication(current.application.application.id));
+      if (operation) setToast(tr('Application removal started. External exported files will be kept.', 'Удаление приложения запущено. Экспортированные вне VontaqFS файлы сохранятся.'));
     } else if (current.kind === 'clear-cache') {
       const operation = await startOperation(() => desktopApi.clearCache(current.space.id));
       if (operation) setSpaceOperationIds((value) => ({ ...value, [current.space.id]: operation.id }));
@@ -510,6 +519,13 @@ function ApplicationDetail({ app, startOperation, onConfirm, onRefresh, onRestor
         <div><h2>{app.application.displayName}</h2><p>{localizedToken(app.application.kind, language)} · {tr('added', 'добавлено')} {formatDate(app.application.createdAtMs, language)}</p></div>
         <StatusPill value={app.activeSessions > 0 ? 'running' : 'neutral'} label={app.activeSessions > 0 ? tr('Connected', 'Подключено') : tr('Not connected', 'Не подключено')} />
       </div>
+
+      <section className="detail-section application-delete-zone">
+        <div className="detail-section-head">
+          <div><h3>{tr('Remove application', 'Удалить приложение')}</h3><p>{tr('Permanently remove this application identity, all VontaqFS-managed storage, pairings and saved directory permissions. This does not uninstall the external application/plugin or delete already exported OS files. Disconnect active sessions first.', 'Навсегда удалить запись приложения, все управляемые VontaqFS хранилища, сопряжения и разрешения на сохранённые папки. Само внешнее приложение/плагин не деинсталлируется; ранее экспортированные файлы остаются. Сначала отключите активные сессии.')}</p></div>
+          <button className="button danger-ghost small" onClick={() => onConfirm({ kind: 'delete-application', application: app })}><Icon name="trash" />{tr('Remove application completely', 'Полностью удалить приложение')}</button>
+        </div>
+      </section>
 
       {activePairings.length === 0 && app.spaces.length > 0 && <div className="notice neutral"><strong>{tr('Access revoked — data kept', 'Доступ отозван — данные сохранены')}</strong><span>{tr('Stored data remains on this device. A new user-approved pairing is required before the application can access it again.', 'Сохранённые данные остаются на этом устройстве. Для повторного доступа приложению потребуется новое подтверждённое пользователем сопряжение.')}</span></div>}
 
@@ -729,10 +745,27 @@ function SettingToggle({ label, description, checked, onChange }: { label: strin
 
 function ConfirmationModal({ state, deletePhrase, setDeletePhrase, onCancel, onConfirm }: { state: Exclude<ConfirmState, null>; deletePhrase: string; setDeletePhrase: (value: string) => void; onCancel: () => void; onConfirm: () => void }) {
   const { tr, language } = useI18n();
-  const isDelete = state.kind === 'delete';
-  const title = state.kind === 'revoke' ? tr(`Revoke ${state.appName}?`, `Отозвать доступ у ${state.appName}?`) : state.kind === 'delete' ? tr(`Delete ${state.space.displayName || state.space.key}?`, `Удалить ${state.space.displayName || state.space.key}?`) : state.kind === 'clear-cache' ? tr('Clear cache?', 'Очистить кэш?') : state.kind === 'revoke-destination' ? tr(`Revoke ${state.label}?`, `Отозвать доступ к ${state.label}?`) : state.kind === 'delete-preset' ? tr(`Remove ${state.name}?`, `Удалить ${state.name}?`) : tr('Quit VontaqFS?', 'Выйти из VontaqFS?');
-  const body = state.kind === 'revoke' ? tr('The application will lose access immediately. Its stored data will remain on this device.', 'Приложение сразу потеряет доступ. Его сохранённые данные останутся на этом устройстве.') : state.kind === 'delete' ? tr(`This permanently deletes this ${state.space.storageClass} storage and its local files. Revoking access is a separate action.`, `Это навсегда удалит хранилище «${localizedToken(state.space.storageClass, language)}» и его локальные файлы. Отзыв доступа — отдельное действие.`) : state.kind === 'clear-cache' ? tr('This removes disposable cache data only. Persistent storage is not affected.', 'Будут удалены только временные данные кэша. Постоянное хранилище не затрагивается.') : state.kind === 'revoke-destination' ? tr('This removes the application’s saved access to that external directory. Files already exported there remain untouched.', 'Сохранённый доступ приложения к внешней папке будет удалён. Уже экспортированные файлы останутся на месте.') : state.kind === 'delete-preset' ? tr('This removes only the saved export preset. Its directory grant and exported files are not deleted.', 'Будет удалён только профиль экспорта. Разрешение на папку и экспортированные файлы останутся.') : tr(`${state.sessions} active session${state.sessions === 1 ? ' is' : 's are'} connected. Quitting will end those sessions after the runtime drains active work.`, `Активных сессий: ${state.sessions}. Выход завершит их после окончания текущих операций.`);
-  const confirmLabel = state.kind === 'revoke' ? tr('Revoke access', 'Отозвать доступ') : state.kind === 'delete' ? tr('Delete storage permanently', 'Удалить хранилище навсегда') : state.kind === 'clear-cache' ? tr('Clear cache', 'Очистить кэш') : state.kind === 'revoke-destination' ? tr('Revoke directory access', 'Отозвать доступ к папке') : state.kind === 'delete-preset' ? tr('Remove preset', 'Удалить профиль') : tr('Quit VontaqFS', 'Выйти из VontaqFS');
+  const isDelete = state.kind === 'delete' || state.kind === 'delete-application';
+  const title = state.kind === 'revoke' ? tr(`Revoke ${state.appName}?`, `Отозвать доступ у ${state.appName}?`)
+    : state.kind === 'delete' ? tr(`Delete ${state.space.displayName || state.space.key}?`, `Удалить ${state.space.displayName || state.space.key}?`)
+    : state.kind === 'delete-application' ? tr(`Remove ${state.application.application.displayName} completely?`, `Полностью удалить ${state.application.application.displayName}?`)
+    : state.kind === 'clear-cache' ? tr('Clear cache?', 'Очистить кэш?')
+    : state.kind === 'revoke-destination' ? tr(`Revoke ${state.label}?`, `Отозвать доступ к ${state.label}?`)
+    : state.kind === 'delete-preset' ? tr(`Remove ${state.name}?`, `Удалить ${state.name}?`)
+    : tr('Quit VontaqFS?', 'Выйти из VontaqFS?');
+  const body = state.kind === 'revoke' ? tr('The application will lose access immediately. Its stored data will remain on this device.', 'Приложение сразу потеряет доступ. Его сохранённые данные останутся на этом устройстве.')
+    : state.kind === 'delete' ? tr(`This permanently deletes this ${state.space.storageClass} storage and its local files. Revoking access is a separate action.`, `Это навсегда удалит хранилище «${localizedToken(state.space.storageClass, language)}» и его локальные файлы. Отзыв доступа — отдельное действие.`)
+    : state.kind === 'delete-application' ? tr(`This permanently deletes ${state.application.spaces.length} storage(s) and all local VontaqFS data, pairings, directory grants, export presets, and format registrations for this identity. External exported files and the installed plugin/application are NOT removed. Close its active connections first.`, `Будет навсегда удалено хранилищ: ${state.application.spaces.length}, а также все локальные данные VontaqFS, сопряжения, разрешения на папки, профили экспорта и регистрации форматов этого приложения. Экспортированные наружу файлы и установленный плагин/приложение НЕ удаляются. Сначала закройте активные подключения.`)
+    : state.kind === 'clear-cache' ? tr('This removes disposable cache data only. Persistent storage is not affected.', 'Будут удалены только временные данные кэша. Постоянное хранилище не затрагивается.')
+    : state.kind === 'revoke-destination' ? tr('This removes the application’s saved access to that external directory. Files already exported there remain untouched.', 'Сохранённый доступ приложения к внешней папке будет удалён. Уже экспортированные файлы останутся на месте.')
+    : state.kind === 'delete-preset' ? tr('This removes only the saved export preset. Its directory grant and exported files are not deleted.', 'Будет удалён только профиль экспорта. Разрешение на папку и экспортированные файлы останутся.')
+    : tr(`${state.sessions} active session${state.sessions === 1 ? ' is' : 's are'} connected. Quitting will end those sessions after the runtime drains active work.`, `Активных сессий: ${state.sessions}. Выход завершит их после окончания текущих операций.`);
+  const confirmLabel = state.kind === 'revoke' ? tr('Revoke access', 'Отозвать доступ')
+    : state.kind === 'delete' ? tr('Delete storage permanently', 'Удалить хранилище навсегда')
+    : state.kind === 'delete-application' ? tr('Remove application and data permanently', 'Удалить приложение и данные навсегда')
+    : state.kind === 'clear-cache' ? tr('Clear cache', 'Очистить кэш')
+    : state.kind === 'revoke-destination' ? tr('Revoke directory access', 'Отозвать доступ к папке')
+    : state.kind === 'delete-preset' ? tr('Remove preset', 'Удалить профиль') : tr('Quit VontaqFS', 'Выйти из VontaqFS');
   return <div className="modal-backdrop" role="presentation"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><h2 id="confirm-title">{title}</h2><p>{body}</p>{isDelete && <label className="delete-confirm"><span>{tr('Type', 'Введите')} <strong>DELETE</strong> {tr('to confirm', 'для подтверждения')}</span><input autoFocus value={deletePhrase} onChange={(event: { target: { value: string } }) => setDeletePhrase(event.target.value)} placeholder="DELETE" /></label>}<div className="modal-actions"><button className="button secondary" onClick={onCancel}>{tr('Cancel', 'Отмена')}</button><button className={isDelete ? 'button danger' : 'button primary'} onClick={onConfirm} disabled={isDelete && deletePhrase !== 'DELETE'}>{confirmLabel}</button></div></section></div>;
 }
 

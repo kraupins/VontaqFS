@@ -789,6 +789,17 @@ fn start_clear_cache_space(
 }
 
 #[tauri::command]
+fn start_delete_application(
+    runtime: tauri::State<'_, DesktopRuntime>,
+    application_id: String,
+) -> Result<LongOperationSnapshot, String> {
+    runtime
+        .handle
+        .start_delete_application(application_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn start_delete_space(
     runtime: tauri::State<'_, DesktopRuntime>,
     space_id: String,
@@ -1530,6 +1541,7 @@ pub fn run() {
             open_main_window,
             start_clear_cache_space,
             start_delete_space,
+            start_delete_application,
             diagnostics_report,
             export_diagnostics,
             export_diagnostics_default,

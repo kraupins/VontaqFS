@@ -678,6 +678,52 @@ class OperationObserver {
   }
 }
 
+/** Internal high-level UTF-8 coalescer. Explicit StreamWriter.write() retains its ACK contract.
+ * Holds at most one target-size buffer; each flushed buffer is owned until ACK.
+ * The exact direct/stream threshold is checked before beginning a stream.
+ */
+class HighLevelWriteAccumulator {
+  private readonly pending = new Uint8Array(VONTAQ_FS_STREAM_CHUNK_BYTES);
+  private used = 0;
+  private writer?: VontaqFSWriter;
+
+  constructor(
+    private readonly files: SpaceFiles,
+    private readonly path: string,
+    private readonly options: FileWriteOptions,
+  ) {}
+
+  async append(bytes: Uint8Array): Promise<void> {
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      if (this.used === this.pending.byteLength) {
+        this.writer ??= await this.files.createWriter(this.path, this.options);
+        // write() resolves after the Runtime ACK; do not mutate pending before then.
+        await this.writer.write(this.pending);
+        this.used = 0;
+      }
+      const count = Math.min(bytes.byteLength - offset, this.pending.byteLength - this.used);
+      this.pending.set(bytes.subarray(offset, offset + count), this.used);
+      this.used += count;
+      offset += count;
+    }
+  }
+
+  async commit(): Promise<FileInfo> {
+    if (!this.writer) {
+      return this.files.writeFile(this.path, this.pending.subarray(0, this.used), this.options);
+    }
+    if (this.used > 0) await this.writer.write(this.pending.subarray(0, this.used));
+    return this.writer.commit();
+  }
+
+  async abortUnlessUncertain(error: unknown): Promise<void> {
+    if (this.writer && (!isVontaqFSError(error) || error.code !== 'STREAM_OUTCOME_UNCERTAIN')) {
+      await bestEffortAbort(this.writer);
+    }
+  }
+}
+
 class StreamWriter implements VontaqFSWriter {
   private readonly hasher = new IncrementalSha256();
   private sequence = 0;
@@ -971,15 +1017,14 @@ class SpaceFiles implements FileAPI {
 
   async writeText(path: string, value: string, options: FileWriteOptions = {}): Promise<FileInfo> {
     if (typeof value !== 'string') throw new TypeError('writeText() requires a string.');
-    if (value.length <= VONTAQ_FS_DIRECT_PAYLOAD_TARGET_BYTES / 4) {
-      return this.writeFile(path, utf8Encode(value), options);
-    }
-    const writer = await this.createWriter(path, options);
+    const accumulator = new HighLevelWriteAccumulator(this, path, options);
     try {
-      for (const part of textSlices(value, TEXT_ENCODER_WINDOW_CODE_UNITS)) await writer.write(utf8Encode(part));
-      return await writer.commit();
+      for (const part of textSlices(value, TEXT_ENCODER_WINDOW_CODE_UNITS)) {
+        await accumulator.append(utf8Encode(part));
+      }
+      return await accumulator.commit();
     } catch (error) {
-      if (!isVontaqFSError(error) || error.code !== 'STREAM_OUTCOME_UNCERTAIN') await bestEffortAbort(writer);
+      await accumulator.abortUnlessUncertain(error);
       throw error;
     }
   }
@@ -989,27 +1034,14 @@ class SpaceFiles implements FileAPI {
   }
 
   async writeJSON(path: string, value: unknown, options: FileWriteOptions = {}): Promise<FileInfo> {
-    const buffered: Uint8Array[] = [];
-    let bufferedBytes = 0;
-    let writer: VontaqFSWriter | undefined;
+    const accumulator = new HighLevelWriteAccumulator(this, path, options);
     try {
-      for (const fragment of jsonFragments(value)) {
-        const bytes = utf8Encode(fragment);
-        if (!writer && bufferedBytes + bytes.byteLength <= VONTAQ_FS_DIRECT_PAYLOAD_TARGET_BYTES) {
-          buffered.push(bytes);
-          bufferedBytes += bytes.byteLength;
-          continue;
-        }
-        if (!writer) {
-          writer = await this.createWriter(path, options);
-          for (const bufferedChunk of buffered) await writer.write(bufferedChunk);
-        }
-        await writer.write(bytes);
-      }
-      if (!writer) return this.writeFile(path, concatenate(buffered, bufferedBytes), options);
-      return await writer.commit();
+      // Preserve the existing streaming JSON serializer (including its supported
+      // toJSON, escaping and cycle semantics). Never materialize the whole object.
+      for (const fragment of jsonFragments(value)) await accumulator.append(utf8Encode(fragment));
+      return await accumulator.commit();
     } catch (error) {
-      if (writer) if (!isVontaqFSError(error) || error.code !== 'STREAM_OUTCOME_UNCERTAIN') await bestEffortAbort(writer);
+      await accumulator.abortUnlessUncertain(error);
       throw error;
     }
   }

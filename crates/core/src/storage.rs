@@ -147,13 +147,15 @@ impl StorageEngine {
             root,
             connection: Mutex::new(connection),
         };
+        // Restore directories staged by a crashed deletion before touching per-space
+        // journal recovery (which otherwise sees their paths as missing).
+        engine.cleanup_deletion_quarantine()?;
         engine.prune_mutation_receipts()?;
         engine.recover_pending_mutations()?;
         engine.quarantine_orphan_stream_temps()?;
         engine.recover_stream_operations()?;
         engine.prune_stream_operations()?;
         engine.recover_native_import_journals()?;
-        engine.cleanup_deletion_quarantine()?;
         Ok(engine)
     }
 
@@ -893,6 +895,61 @@ impl StorageEngine {
         file.seek(SeekFrom::Start(offset))?;
         let mut out = Vec::with_capacity(length);
         file.take(length as u64).read_to_end(&mut out)?;
+        Ok(out)
+    }
+
+    /// Open a checked, pinned file handle for a single stream reader. The
+    /// runtime must still authorize each request and compare registry
+    /// (etag, version, size) before and after reading: this handle alone is
+    /// never proof that the current pathname has the same identity.
+    pub fn open_stream_read_file(&self, space_id: &str, raw_path: &str) -> StorageResult<File> {
+        let logical = LogicalPath::parse(raw_path)?;
+        if logical.as_str() == "/" {
+            return Err(StorageError::PathInvalid(
+                "cannot read space root as a file".into(),
+            ));
+        }
+        let data_root = self.space_data_root(space_id)?;
+        let target = data_root.join(logical.relative());
+        ensure_no_symlink_escape(&data_root, &target)?;
+        File::open(&target).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound(logical.as_str().into())
+            } else {
+                error.into()
+            }
+        })
+    }
+
+    /// Independent-offset I/O: concurrent readers never mutate a shared
+    /// file cursor. Reads cannot escape the already validated open handle.
+    pub fn read_open_stream_range(
+        file: &File,
+        offset: u64,
+        length: usize,
+    ) -> StorageResult<Vec<u8>> {
+        let mut out = vec![0u8; length];
+        let mut total = 0usize;
+        while total < length {
+            let at = offset
+                .checked_add(total as u64)
+                .ok_or_else(|| StorageError::PathInvalid("read offset overflow".into()))?;
+            #[cfg(unix)]
+            let read = std::os::unix::fs::FileExt::read_at(file, &mut out[total..], at)?;
+            #[cfg(windows)]
+            let read = std::os::windows::fs::FileExt::seek_read(file, &mut out[total..], at)?;
+            #[cfg(not(any(unix, windows)))]
+            let read = {
+                let mut cloned = file.try_clone()?;
+                cloned.seek(SeekFrom::Start(at))?;
+                cloned.read(&mut out[total..])?
+            };
+            if read == 0 {
+                break;
+            }
+            total += read;
+        }
+        out.truncate(total);
         Ok(out)
     }
 
@@ -1805,65 +1862,175 @@ impl StorageEngine {
         self.space_data_root(space_id)
     }
 
+    /// Delete only a locally managed space. External exports are never touched.
+    /// Both standalone and application removal use the same FK-complete registry cleanup.
     pub fn delete_space(&self, space_id: &str) -> StorageResult<(u64, u64)> {
         let space = self
             .get_space(space_id)?
             .ok_or_else(|| StorageError::NotFound("space".into()))?;
-        let source = self.root.join("spaces").join(space_id);
-        if let Ok(metadata) = fs::symlink_metadata(&source) {
-            if is_link_like(&metadata) {
-                return Err(StorageError::StorageUnavailable(
-                    "managed space root is a link/reparse point".into(),
-                ));
-            }
-        }
-        let quarantine_root = self.root.join("runtime/deletion-quarantine");
-        fs::create_dir_all(&quarantine_root)?;
-        let quarantine = quarantine_root.join(format!("{}-{}", space_id, Uuid::new_v4()));
-        if source.exists() {
-            fs::rename(&source, &quarantine)?;
-        }
-
+        let moved = self.quarantine_space_root(space_id)?;
         let db_result = (|| -> StorageResult<()> {
             let mut conn = self
                 .connection
                 .lock()
                 .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
             let tx = conn.transaction()?;
-            tx.execute("DELETE FROM grants WHERE space_id=?1", params![space_id])?;
-            tx.execute("DELETE FROM snapshot_file_entries WHERE snapshot_id IN (SELECT id FROM snapshots WHERE space_id=?1)", params![space_id])?;
-            tx.execute("DELETE FROM snapshot_kv_entries WHERE snapshot_id IN (SELECT id FROM snapshots WHERE space_id=?1)", params![space_id])?;
-            tx.execute("DELETE FROM snapshots WHERE space_id=?1", params![space_id])?;
-            tx.execute(
-                "DELETE FROM kv_entries WHERE space_id=?1",
-                params![space_id],
-            )?;
-            tx.execute(
-                "DELETE FROM file_entries WHERE space_id=?1",
-                params![space_id],
-            )?;
-            tx.execute(
-                "DELETE FROM pending_mutations WHERE space_id=?1",
-                params![space_id],
-            )?;
-            tx.execute(
-                "DELETE FROM mutation_receipts WHERE space_id=?1",
-                params![space_id],
-            )?;
-            tx.execute("DELETE FROM spaces WHERE id=?1", params![space_id])?;
+            delete_space_registry_rows(&tx, space_id)?;
             tx.commit()?;
             Ok(())
         })();
         if let Err(error) = db_result {
-            if quarantine.exists() && !source.exists() {
-                let _ = fs::rename(&quarantine, &source);
+            if let Some(quarantine) = moved.as_ref() {
+                let source = self.root.join("spaces").join(space_id);
+                if let Err(restore_error) = fs::rename(quarantine, source) {
+                    return Err(StorageError::StorageUnavailable(format!(
+                        "deletion failed: {error}; managed data is preserved in deletion-quarantine but restore failed: {restore_error}"
+                    )));
+                }
             }
             return Err(error);
         }
-        if quarantine.exists() {
-            fs::remove_dir_all(&quarantine)?;
+        if let Some(quarantine) = moved {
+            // After a successful registry commit, quarantine is disposable and will also
+            // be collected on startup if filesystem removal is interrupted.
+            fs::remove_dir_all(quarantine)?;
         }
         Ok((space.logical_bytes, space.file_count))
+    }
+
+    /// Remove one application identity, all its managed spaces, pairings, formats,
+    /// destination grants and presets. Does not delete OS files exported to destinations.
+    /// A single registry transaction prevents a half-removed application on SQL errors.
+    /// Caller must fence live sessions/streams and lock all of this application's spaces.
+    pub fn delete_application_data(&self, application_id: &str) -> StorageResult<(u64, u64, u64)> {
+        self.get_application(application_id)?
+            .ok_or_else(|| StorageError::NotFound("application".into()))?;
+        let spaces = self
+            .list_all_spaces()?
+            .into_iter()
+            .filter(|space| space.owner_application_id == application_id)
+            .collect::<Vec<_>>();
+        let pending: i64 = self.connection.lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?
+            .query_row("SELECT COUNT(*) FROM stream_operations WHERE pairing_id IN (SELECT id FROM pairings WHERE application_id=?1) AND phase NOT IN ('COMMITTED','ABORTED','EXPIRED_FENCED')",
+                params![application_id], |row| row.get(0))?;
+        if pending != 0 {
+            return Err(StorageError::Conflict(
+                "application has unresolved stream operations".into(),
+            ));
+        }
+        let mut moved = Vec::<(String, PathBuf)>::new();
+        // Stage all managed directories before making any durable registry changes.
+        for space in &spaces {
+            match self.quarantine_space_root(&space.id) {
+                Ok(Some(path)) => moved.push((space.id.clone(), path)),
+                Ok(None) => {}
+                Err(error) => {
+                    restore_quarantined_spaces(&self.root, &moved)?;
+                    return Err(error);
+                }
+            }
+        }
+        let db_result = (|| -> StorageResult<()> {
+            let mut conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            let tx = conn.transaction()?;
+            // Do not discard an uncertain stream outcome, even if it belongs to a
+            // space shared with another application via grants.
+            let pending: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM stream_operations WHERE pairing_id IN (SELECT id FROM pairings WHERE application_id=?1) AND phase NOT IN ('COMMITTED','ABORTED','EXPIRED_FENCED')",
+                params![application_id], |row| row.get(0))?;
+            if pending > 0 {
+                return Err(StorageError::Conflict(
+                    "application has unresolved stream operations".into(),
+                ));
+            }
+            for space in &spaces {
+                delete_space_registry_rows(&tx, &space.id)?;
+            }
+            tx.execute(
+                "DELETE FROM grants WHERE subject_application_id=?1",
+                params![application_id],
+            )?;
+            tx.execute("DELETE FROM stream_operations WHERE pairing_id IN (SELECT id FROM pairings WHERE application_id=?1)", params![application_id])?;
+            tx.execute("DELETE FROM pairing_transport_policies WHERE pairing_id IN (SELECT id FROM pairings WHERE application_id=?1)", params![application_id])?;
+            tx.execute(
+                "DELETE FROM pairings WHERE application_id=?1",
+                params![application_id],
+            )?;
+            tx.execute(
+                "DELETE FROM export_presets WHERE application_id=?1",
+                params![application_id],
+            )?;
+            tx.execute(
+                "DELETE FROM directory_grants WHERE application_id=?1",
+                params![application_id],
+            )?;
+            tx.execute(
+                "DELETE FROM application_formats WHERE application_id=?1",
+                params![application_id],
+            )?;
+            tx.execute(
+                "DELETE FROM application_mutation_receipts WHERE application_id=?1",
+                params![application_id],
+            )?;
+            let affected = tx.execute(
+                "DELETE FROM applications WHERE id=?1",
+                params![application_id],
+            )?;
+            if affected != 1 {
+                return Err(StorageError::NotFound("application".into()));
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = db_result {
+            restore_quarantined_spaces(&self.root, &moved)?;
+            return Err(error);
+        }
+        // A post-commit cleanup failure must remain observable to the caller;
+        // startup cleanup can safely retry for deleted registry identities.
+        for (_, quarantine) in moved {
+            fs::remove_dir_all(quarantine)?;
+        }
+        Ok((
+            spaces.len() as u64,
+            spaces.iter().map(|space| space.logical_bytes).sum(),
+            spaces.iter().map(|space| space.file_count).sum(),
+        ))
+    }
+
+    fn quarantine_space_root(&self, space_id: &str) -> StorageResult<Option<PathBuf>> {
+        validate_opaque_id(space_id)?;
+        // Fail before a filesystem rename when an unresolved durable ACK/commit
+        // still owns the path; the SQL transaction checks again before commit.
+        let pending: i64 = self.connection.lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?
+            .query_row("SELECT COUNT(*) FROM stream_operations WHERE space_id=?1 AND phase NOT IN ('COMMITTED','ABORTED','EXPIRED_FENCED')",
+                params![space_id], |row| row.get(0))?;
+        if pending != 0 {
+            return Err(StorageError::Conflict(
+                "storage has unresolved stream operations".into(),
+            ));
+        }
+        let source = self.root.join("spaces").join(space_id);
+        match fs::symlink_metadata(&source) {
+            Ok(meta) if is_link_like(&meta) || !meta.is_dir() => {
+                return Err(StorageError::StorageUnavailable(
+                    "managed space root is not a safe directory".into(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let quarantine_root = self.root.join("runtime/deletion-quarantine");
+        fs::create_dir_all(&quarantine_root)?;
+        let quarantine = quarantine_root.join(format!("{}-{}", space_id, Uuid::new_v4()));
+        fs::rename(&source, &quarantine)?;
+        Ok(Some(quarantine))
     }
 
     pub fn list_kv_entries(&self, space_id: &str) -> StorageResult<Vec<KvRecord>> {
@@ -4081,11 +4248,31 @@ impl StorageEngine {
         let root = self.root.join("runtime/deletion-quarantine");
         fs::create_dir_all(&root)?;
         for entry in fs::read_dir(&root)?.filter_map(Result::ok) {
-            let metadata = fs::symlink_metadata(entry.path())?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            // A crash can happen between directory staging and the registry commit.
+            // Restore data if the space still exists in the durable registry.
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(id) = name.get(..36) {
+                if Uuid::parse_str(id).is_ok()
+                    && name.as_bytes().get(36) == Some(&b'-')
+                    && self.get_space(id)?.is_some()
+                {
+                    let original = self.root.join("spaces").join(id);
+                    if !original.exists() && metadata.is_dir() && !is_link_like(&metadata) {
+                        fs::rename(&path, original)?;
+                        continue;
+                    }
+                    // Never destroy quarantined data when the registry still owns it.
+                    return Err(StorageError::StorageUnavailable(format!(
+                        "quarantined managed space {id} needs manual recovery"
+                    )));
+                }
+            }
             if metadata.is_dir() && !is_link_like(&metadata) {
-                fs::remove_dir_all(entry.path())?;
+                fs::remove_dir_all(path)?;
             } else {
-                fs::remove_file(entry.path())?;
+                fs::remove_file(path)?;
             }
         }
         Ok(())
@@ -7021,6 +7208,60 @@ fn atomic_replace(source: &Path, target: &Path) -> StorageResult<()> {
     Ok(())
 }
 
+/// Registry rows must be removed in FK order. In particular, durable stream
+/// receipts reference spaces and prevent deleting them until explicitly resolved.
+fn delete_space_registry_rows(tx: &Transaction<'_>, space_id: &str) -> StorageResult<()> {
+    let pending: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM stream_operations WHERE space_id=?1 AND phase NOT IN ('COMMITTED','ABORTED','EXPIRED_FENCED')",
+        params![space_id], |row| row.get(0))?;
+    if pending != 0 {
+        return Err(StorageError::Conflict(
+            "storage has unresolved stream operations".into(),
+        ));
+    }
+    tx.execute(
+        "DELETE FROM stream_operations WHERE space_id=?1",
+        params![space_id],
+    )?;
+    tx.execute("DELETE FROM grants WHERE space_id=?1", params![space_id])?;
+    tx.execute("DELETE FROM snapshot_file_entries WHERE snapshot_id IN (SELECT id FROM snapshots WHERE space_id=?1)", params![space_id])?;
+    tx.execute("DELETE FROM snapshot_kv_entries WHERE snapshot_id IN (SELECT id FROM snapshots WHERE space_id=?1)", params![space_id])?;
+    tx.execute("DELETE FROM snapshots WHERE space_id=?1", params![space_id])?;
+    tx.execute(
+        "DELETE FROM kv_entries WHERE space_id=?1",
+        params![space_id],
+    )?;
+    tx.execute(
+        "DELETE FROM file_entries WHERE space_id=?1",
+        params![space_id],
+    )?;
+    tx.execute(
+        "DELETE FROM pending_mutations WHERE space_id=?1",
+        params![space_id],
+    )?;
+    tx.execute(
+        "DELETE FROM mutation_receipts WHERE space_id=?1",
+        params![space_id],
+    )?;
+    tx.execute("DELETE FROM spaces WHERE id=?1", params![space_id])?;
+    Ok(())
+}
+
+fn restore_quarantined_spaces(root: &Path, moved: &[(String, PathBuf)]) -> StorageResult<()> {
+    for (space_id, quarantined) in moved.iter().rev() {
+        if quarantined.exists() {
+            let original = root.join("spaces").join(space_id);
+            if original.exists() {
+                return Err(StorageError::StorageUnavailable(format!(
+                    "cannot restore managed space {space_id}; directory already exists; quarantined data retained"
+                )));
+            }
+            fs::rename(quarantined, original)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7043,6 +7284,132 @@ mod tests {
             )
             .unwrap();
         (app, space)
+    }
+
+    #[test]
+    fn deletion_cleans_terminal_stream_journal_and_keeps_other_spaces() {
+        let root = temp_root("delete-stream-fk");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (app, doomed) = fixture(&engine);
+        let survivor = engine
+            .open_space(&app.id, "survivor", StorageClass::Persistent, None)
+            .unwrap();
+        engine
+            .write_file(&survivor.id, "/keep.txt", b"safe", None, "keep-file")
+            .unwrap();
+        let pairing = engine
+            .create_pairing(&app.id, "client-one", &"a".repeat(64))
+            .unwrap();
+        let stream_id = Uuid::new_v4().to_string();
+        {
+            let conn = engine.connection.lock().unwrap();
+            conn.execute("INSERT INTO stream_operations(pairing_id,space_id,request_id,stream_id,chunk_method,logical_path,phase,updated_at_ms) VALUES(?1,?2,?3,?4,'PUT','/file','COMMITTED',?5)",
+                params![pairing.id, doomed.id, "request-one", stream_id, now_ms()]).unwrap();
+        }
+        engine.delete_space(&doomed.id).unwrap();
+        assert!(engine.get_space(&doomed.id).unwrap().is_none());
+        assert_eq!(
+            engine.read_file(&survivor.id, "/keep.txt").unwrap(),
+            b"safe"
+        );
+        assert!(engine
+            .resolve_stream_operation(&pairing.id, &doomed.id, "request-one")
+            .unwrap()
+            .is_none());
+        drop(engine);
+        StorageEngine::open(&root).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deletion_refuses_open_journal_and_restores_quarantine_on_restart() {
+        let root = temp_root("delete-crash-restore");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (app, space) = fixture(&engine);
+        engine
+            .write_file(&space.id, "/safe.txt", b"present", None, "safe-write")
+            .unwrap();
+        let pairing = engine
+            .create_pairing(&app.id, "client-one", &"b".repeat(64))
+            .unwrap();
+        let stream_id = Uuid::new_v4().to_string();
+        {
+            let conn = engine.connection.lock().unwrap();
+            conn.execute("INSERT INTO stream_operations(pairing_id,space_id,request_id,stream_id,chunk_method,logical_path,phase,updated_at_ms) VALUES(?1,?2,?3,?4,'PUT','/file','OPEN',?5)",
+                params![pairing.id, space.id, "open-request", stream_id, now_ms()]).unwrap();
+        }
+        assert!(matches!(
+            engine.delete_space(&space.id),
+            Err(StorageError::Conflict(_))
+        ));
+        assert_eq!(
+            engine.read_file(&space.id, "/safe.txt").unwrap(),
+            b"present"
+        );
+        engine
+            .finish_stream_operation(&stream_id, &pairing.id, "OPEN", "EXPIRED_FENCED", None)
+            .unwrap();
+        let staged = engine.quarantine_space_root(&space.id).unwrap().unwrap();
+        assert!(staged.exists());
+        drop(engine); // simulate crash before SQL commit
+        let reopened = StorageEngine::open(&root).unwrap();
+        assert_eq!(
+            reopened.read_file(&space.id, "/safe.txt").unwrap(),
+            b"present"
+        );
+        assert!(!staged.exists());
+        reopened.delete_space(&space.id).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn full_application_deletion_removes_own_registry_rows_not_other_apps() {
+        let root = temp_root("delete-app-complete");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (app, first) = fixture(&engine);
+        let second = engine
+            .open_space(&app.id, "second", StorageClass::Cache, None)
+            .unwrap();
+        let other = engine
+            .register_application(
+                ApplicationKind::FigmaPlugin,
+                "another-plugin",
+                "Another Plugin",
+            )
+            .unwrap();
+        let other_space = engine
+            .open_space(&other.id, "other", StorageClass::Persistent, None)
+            .unwrap();
+        engine
+            .write_file(&first.id, "/own.txt", b"mine", None, "own-file")
+            .unwrap();
+        engine
+            .write_file(&other_space.id, "/keep.txt", b"other", None, "other-file")
+            .unwrap();
+        let pairing = engine
+            .create_pairing(&app.id, "client-one", &"c".repeat(64))
+            .unwrap();
+        {
+            let conn = engine.connection.lock().unwrap();
+            conn.execute("INSERT INTO application_formats(application_id,id,display_name,opaque,created_at_ms,updated_at_ms) VALUES(?1,'binary','Binary',1,1,1)",params![app.id]).unwrap();
+            conn.execute("INSERT INTO directory_grants(id,application_id,label,physical_path,capability,created_at_ms) VALUES(?1,?2,'Outside','/external', 'read',1)",params![Uuid::new_v4().to_string(),app.id]).unwrap();
+            conn.execute("INSERT INTO grants(id,space_id,subject_application_id,capability,created_at_ms) VALUES(?1,?2,?3,'read',1)",params![Uuid::new_v4().to_string(),other_space.id,app.id]).unwrap();
+            conn.execute("INSERT INTO stream_operations(pairing_id,space_id,request_id,stream_id,chunk_method,logical_path,phase,updated_at_ms) VALUES(?1,?2,'done',?3,'PUT','/own.txt','COMMITTED',1)",params![pairing.id,first.id,Uuid::new_v4().to_string()]).unwrap();
+        }
+        let (count, _, _) = engine.delete_application_data(&app.id).unwrap();
+        assert_eq!(count, 2);
+        assert!(engine.get_application(&app.id).unwrap().is_none());
+        assert!(engine.get_space(&first.id).unwrap().is_none());
+        assert!(engine.get_space(&second.id).unwrap().is_none());
+        assert!(engine.pairings_for_application(&app.id).unwrap().is_empty());
+        assert_eq!(
+            engine.read_file(&other_space.id, "/keep.txt").unwrap(),
+            b"other"
+        );
+        drop(engine);
+        let reopened = StorageEngine::open(&root).unwrap();
+        assert_eq!(reopened.list_applications().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

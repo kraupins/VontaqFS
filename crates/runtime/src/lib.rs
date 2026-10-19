@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     fs::{File, OpenOptions},
     io::Write,
@@ -389,7 +389,10 @@ impl RuntimeHandle {
             .state
             .write_streams
             .lock()
-            .map_err(|_| RuntimeAdminError::Internal("stream mutex poisoned".into()))?;
+            .map_err(|_| RuntimeAdminError::Internal("stream mutex poisoned".into()))?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut result = Vec::new();
         for app in applications {
             for pairing in app.pairings {
@@ -466,9 +469,14 @@ impl RuntimeHandle {
                     selected_method,
                     effective_method,
                     active_stream_count: streams
-                        .values()
-                        .filter(|stream| {
-                            stream.pairing_id == pairing.id && stream.committed.is_none()
+                        .iter()
+                        .filter(|handle| {
+                            handle
+                                .lock()
+                                .map(|stream| {
+                                    stream.pairing_id == pairing.id && stream.committed.is_none()
+                                })
+                                .unwrap_or(true)
                         })
                         .count(),
                     blocked_reasons,
@@ -522,6 +530,15 @@ impl RuntimeHandle {
             return Err(RuntimeAdminError::AlreadyDecided);
         }
 
+        // Preserve the application's deletion fence through pairing creation.
+        let deleting = self.state.deleting_applications.lock().map_err(|_| {
+            RuntimeAdminError::Internal("application deletion mutex poisoned".into())
+        })?;
+        if deleting.contains(&entry.application_id) {
+            return Err(RuntimeAdminError::Internal(
+                "application deletion is in progress".into(),
+            ));
+        }
         let credential = random_secret_hex(32);
         let credential_hash = sha256_hex(credential.as_bytes());
         let previous_pairings = self
@@ -538,6 +555,7 @@ impl RuntimeHandle {
                 .map(|method| method.as_str().to_owned())
                 .collect::<Vec<_>>(),
         )?;
+        drop(deleting);
         if !previous_pairings.is_empty() {
             let previous_ids = previous_pairings
                 .into_iter()
@@ -580,46 +598,55 @@ impl RuntimeHandle {
     pub fn revoke_pairing(&self, persisted_pairing_id: &str) -> Result<bool, RuntimeAdminError> {
         let revoked = self.state.storage.revoke_pairing(persisted_pairing_id)?;
         if revoked {
-            // Synchronous stream mutex serializes against in-flight chunk/commit.
-            let mut writes = self
+            // Revoke the persistent pairing first, then fence each stream without
+            // holding the global map mutex across file deletion or journal updates.
+            let handles = self
                 .state
                 .write_streams
                 .lock()
-                .map_err(|_| RuntimeAdminError::Internal("stream mutex poisoned".into()))?;
-            let ids = writes
+                .map_err(|_| RuntimeAdminError::Internal("stream mutex poisoned".into()))?
                 .iter()
-                .filter(|(_, v)| v.pairing_id == persisted_pairing_id)
-                .map(|(k, _)| k.clone())
+                .map(|(id, handle)| (id.clone(), Arc::clone(handle)))
                 .collect::<Vec<_>>();
-            for id in ids {
-                if let Some(mut stream) = writes.remove(&id) {
-                    let mut safe_to_unlock = stream.committed.is_some();
-                    if stream.committed.is_none() {
-                        stream.file.take();
-                        if self
-                            .state
-                            .storage
-                            .abort_stream_temp(&stream.space_id, &stream.temp_path)
-                            .is_ok()
-                        {
-                            let _ = self.state.storage.finish_stream_operation(
-                                &id,
-                                persisted_pairing_id,
-                                "OPEN",
-                                "EXPIRED_FENCED",
-                                None,
-                            );
-                            safe_to_unlock = true;
-                        }
+            for (id, handle) in handles {
+                let mut stream = handle
+                    .lock()
+                    .map_err(|_| RuntimeAdminError::Internal("per-stream mutex poisoned".into()))?;
+                if stream.pairing_id != persisted_pairing_id {
+                    continue;
+                }
+                if !self
+                    .state
+                    .remove_current_write_stream(&id, &handle)
+                    .map_err(|_| RuntimeAdminError::Internal("stream map mutex poisoned".into()))?
+                {
+                    continue;
+                }
+                let mut safe_to_unlock = stream.committed.is_some();
+                if stream.committed.is_none() {
+                    stream.file.take();
+                    if self
+                        .state
+                        .storage
+                        .abort_stream_temp(&stream.space_id, &stream.temp_path)
+                        .is_ok()
+                    {
+                        let _ = self.state.storage.finish_stream_operation(
+                            &id,
+                            persisted_pairing_id,
+                            "OPEN",
+                            "EXPIRED_FENCED",
+                            None,
+                        );
+                        safe_to_unlock = true;
                     }
-                    if safe_to_unlock {
-                        if let Ok(mut paths) = self.state.active_write_paths.lock() {
-                            paths.remove(&write_path_key(&stream.space_id, &stream.path));
-                        }
+                }
+                if safe_to_unlock {
+                    if let Ok(mut paths) = self.state.active_write_paths.lock() {
+                        paths.remove(&write_path_key(&stream.space_id, &stream.path));
                     }
                 }
             }
-            drop(writes);
             let revoked_tokens = {
                 let mut sessions =
                     self.state.sessions.lock().map_err(|_| {
@@ -1463,6 +1490,14 @@ impl RuntimeHandle {
                 .begin_operation("delete-space", "deleting-storage", false)?;
         let operation_id = snapshot.id.clone();
         self.state.lock_space_exclusive(&space_id, &operation_id)?;
+        if self.state.has_active_stream_for_space(&space_id) {
+            self.state.unlock_space_exclusive(&space_id, &operation_id);
+            self.state
+                .fail_operation(&operation_id, "storage has active streams".into());
+            return Err(RuntimeAdminError::Internal(
+                "storage has active streams".into(),
+            ));
+        }
         let state = Arc::clone(&self.state);
         tokio::spawn(async move {
             let storage = Arc::clone(&state.storage);
@@ -1475,6 +1510,166 @@ impl RuntimeHandle {
                 Err(error) => state.fail_operation(&operation_id, format!("operation worker failed: {error}")),
             }
             state.unlock_space_exclusive(&space_id, &operation_id);
+        });
+        Ok(snapshot)
+    }
+
+    /// Privileged Desktop-only full removal. This is intentionally not a public
+    /// loopback endpoint; a disconnected plugin cannot delete another identity.
+    pub fn start_delete_application(
+        &self,
+        application_id: String,
+    ) -> Result<LongOperationSnapshot, RuntimeAdminError> {
+        self.state.prune_ephemeral();
+        self.state
+            .storage
+            .get_application(&application_id)?
+            .ok_or(RuntimeAdminError::NotFound)?;
+        let spaces = self
+            .state
+            .storage
+            .list_all_spaces()?
+            .into_iter()
+            .filter(|space| space.owner_application_id == application_id)
+            .collect::<Vec<_>>();
+        // Serialize registration of new sessions/pairings with the deletion fence.
+        let mut deleting = self.state.deleting_applications.lock().map_err(|_| {
+            RuntimeAdminError::Internal("application deletion mutex poisoned".into())
+        })?;
+        if !deleting.insert(application_id.clone()) {
+            return Err(RuntimeAdminError::Internal(
+                "application deletion already running".into(),
+            ));
+        }
+        let preflight = (|| -> Result<(), RuntimeAdminError> {
+            let pairings = self
+                .state
+                .storage
+                .pairings_for_application(&application_id)?;
+            let sessions = self
+                .state
+                .sessions
+                .lock()
+                .map_err(|_| RuntimeAdminError::Internal("session mutex poisoned".into()))?;
+            if sessions
+                .values()
+                .any(|s| s.application_id == application_id)
+            {
+                return Err(RuntimeAdminError::Internal(
+                    "application is connected; disconnect its active sessions before permanent deletion".into()
+                ));
+            }
+            drop(sessions);
+            if spaces
+                .iter()
+                .any(|space| self.state.has_active_stream_for_space(&space.id))
+            {
+                return Err(RuntimeAdminError::Internal(
+                    "application has active storage streams".into(),
+                ));
+            }
+            if !pairings.is_empty() {
+                let ids = pairings
+                    .iter()
+                    .map(|pairing| pairing.id.as_str())
+                    .collect::<HashSet<_>>();
+                let handles = self
+                    .state
+                    .write_streams
+                    .lock()
+                    .map_err(|_| RuntimeAdminError::Internal("stream map mutex poisoned".into()))?
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for handle in handles {
+                    if ids.contains(
+                        handle
+                            .lock()
+                            .map_err(|_| {
+                                RuntimeAdminError::Internal("stream mutex poisoned".into())
+                            })?
+                            .pairing_id
+                            .as_str(),
+                    ) {
+                        return Err(RuntimeAdminError::Internal(
+                            "application has active streams".into(),
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = preflight {
+            deleting.remove(&application_id);
+            return Err(error);
+        }
+        let (snapshot, _cancel) =
+            match self
+                .state
+                .begin_operation("delete-application", "deleting-application", false)
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    deleting.remove(&application_id);
+                    return Err(error);
+                }
+            };
+        let id = snapshot.id.clone();
+        let lock_result = (|| -> Result<(), RuntimeAdminError> {
+            let mut locks = self.state.exclusive_spaces.lock().map_err(|_| {
+                RuntimeAdminError::Internal("exclusive-space mutex poisoned".into())
+            })?;
+            if spaces.iter().any(|space| locks.contains_key(&space.id)) {
+                return Err(RuntimeAdminError::Internal(
+                    "application storage has an active maintenance operation".into(),
+                ));
+            }
+            for space in &spaces {
+                locks.insert(space.id.clone(), id.clone());
+            }
+            Ok(())
+        })();
+        if let Err(error) = lock_result {
+            deleting.remove(&application_id);
+            self.state.fail_operation(&id, error.to_string());
+            return Err(error);
+        }
+        if spaces
+            .iter()
+            .any(|space| self.state.has_active_stream_for_space(&space.id))
+        {
+            for space in &spaces {
+                self.state.unlock_space_exclusive(&space.id, &id);
+            }
+            deleting.remove(&application_id);
+            self.state.fail_operation(
+                &id,
+                "application acquired a stream during deletion preflight".into(),
+            );
+            return Err(RuntimeAdminError::Internal(
+                "application has active storage streams".into(),
+            ));
+        }
+        drop(deleting);
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            let storage = Arc::clone(&state.storage);
+            let work_id = application_id.clone();
+            let outcome =
+                tokio::task::spawn_blocking(move || storage.delete_application_data(&work_id))
+                    .await;
+            match outcome {
+                Ok(Ok((count, bytes, files))) => state.complete_operation(&id, "complete",
+                    Some(serde_json::json!({"applicationId":application_id.clone(),"removedSpaces":count,"removedBytes":bytes,"removedFiles":files}))),
+                Ok(Err(error)) => state.fail_operation(&id, error.to_string()),
+                Err(error) => state.fail_operation(&id, format!("application deletion worker failed: {error}")),
+            }
+            for space in &spaces {
+                state.unlock_space_exclusive(&space.id, &id);
+            }
+            if let Ok(mut deleting) = state.deleting_applications.lock() {
+                deleting.remove(&application_id);
+            }
         });
         Ok(snapshot)
     }
@@ -1882,7 +2077,7 @@ struct RuntimeState {
     request_slots: Arc<Semaphore>,
     bulk_slots: Arc<Semaphore>,
     pairing_bulk_slots: Mutex<HashMap<String, Arc<Semaphore>>>,
-    write_streams: Mutex<HashMap<String, WriteStreamState>>,
+    write_streams: Mutex<HashMap<String, Arc<Mutex<WriteStreamState>>>>,
     active_upload_receives: Mutex<HashMap<String, usize>>,
     read_streams: Mutex<HashMap<String, ReadStreamState>>,
     active_write_paths: Mutex<HashMap<String, String>>,
@@ -1897,6 +2092,7 @@ struct RuntimeState {
     log_path: PathBuf,
     operations: Mutex<HashMap<String, LongOperationEntry>>,
     exclusive_spaces: Mutex<HashMap<String, String>>,
+    deleting_applications: Mutex<HashSet<String>>,
     active_destinations: Mutex<HashMap<String, String>>,
     global_maintenance: Mutex<Option<String>>,
     endpoint_status: RuntimeEndpointStatus,
@@ -1936,6 +2132,7 @@ impl RuntimeState {
             log_path: root.join("runtime/logs/runtime.log"),
             operations: Mutex::new(HashMap::new()),
             exclusive_spaces: Mutex::new(HashMap::new()),
+            deleting_applications: Mutex::new(HashSet::new()),
             active_destinations: Mutex::new(HashMap::new()),
             global_maintenance: Mutex::new(None),
             endpoint_status,
@@ -2028,24 +2225,28 @@ impl RuntimeState {
         if let Ok(mut writes) = self.write_streams.lock() {
             expired.extend(writes.drain());
         }
-        if let Ok(mut paths) = self.active_write_paths.lock() {
-            for (stream_id, mut stream) in expired {
-                stream.file.take();
-                let safe = stream.committed.is_some()
-                    || self
-                        .storage
-                        .abort_stream_temp(&stream.space_id, &stream.temp_path)
-                        .is_ok();
-                if safe {
-                    if stream.committed.is_none() {
-                        let _ = self.storage.finish_stream_operation(
-                            &stream_id,
-                            &stream.pairing_id,
-                            "OPEN",
-                            "EXPIRED_FENCED",
-                            None,
-                        );
-                    }
+        for (stream_id, handle) in expired {
+            let Ok(mut stream) = handle.lock() else {
+                continue;
+            };
+            stream.file.take();
+            let safe = stream.committed.is_some()
+                || self
+                    .storage
+                    .abort_stream_temp(&stream.space_id, &stream.temp_path)
+                    .is_ok();
+            if safe {
+                if stream.committed.is_none() {
+                    let _ = self.storage.finish_stream_operation(
+                        &stream_id,
+                        &stream.pairing_id,
+                        "OPEN",
+                        "EXPIRED_FENCED",
+                        None,
+                    );
+                }
+                // Lock order is per-stream -> active paths everywhere.
+                if let Ok(mut paths) = self.active_write_paths.lock() {
                     paths.remove(&write_path_key(&stream.space_id, &stream.path));
                 }
             }
@@ -2528,10 +2729,69 @@ impl RuntimeState {
             }
         }
     }
+    // The map protects lookup/removal only. Never hold its mutex while waiting for
+    // a stream mutex, doing disk I/O, or advancing the durable SQLite journal.
+    fn write_stream_handle(&self, id: &str) -> Result<Arc<Mutex<WriteStreamState>>, ApiError> {
+        self.write_streams
+            .lock()
+            .map_err(|_| ApiError::internal())?
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::new(
+                    404,
+                    ErrorCode::StreamNotFound,
+                    "write stream not found or expired",
+                )
+            })
+    }
+
+    // Called with the per-stream mutex held, so removal cannot race a write,
+    // commit, or abort that has already obtained the handle.
+    fn is_current_write_stream(
+        &self,
+        id: &str,
+        handle: &Arc<Mutex<WriteStreamState>>,
+    ) -> Result<bool, ApiError> {
+        Ok(self
+            .write_streams
+            .lock()
+            .map_err(|_| ApiError::internal())?
+            .get(id)
+            .is_some_and(|current| Arc::ptr_eq(current, handle)))
+    }
+
+    fn remove_current_write_stream(
+        &self,
+        id: &str,
+        handle: &Arc<Mutex<WriteStreamState>>,
+    ) -> Result<bool, ApiError> {
+        let mut writes = self
+            .write_streams
+            .lock()
+            .map_err(|_| ApiError::internal())?;
+        if !writes
+            .get(id)
+            .is_some_and(|current| Arc::ptr_eq(current, handle))
+        {
+            return Ok(false);
+        }
+        writes.remove(id);
+        Ok(true)
+    }
+
     fn has_active_stream_for_space(&self, space_id: &str) -> bool {
         self.write_streams
             .lock()
-            .map(|streams| streams.values().any(|s| s.space_id == space_id))
+            .map(|streams| streams.values().cloned().collect::<Vec<_>>())
+            .map(|handles| {
+                handles.iter().any(|handle| {
+                    handle
+                        .lock()
+                        .map(|stream| stream.space_id == space_id)
+                        .unwrap_or(true)
+                })
+            })
             .unwrap_or(true)
             || self
                 .read_streams
@@ -2672,58 +2932,63 @@ impl RuntimeState {
                 !samples.is_empty()
             });
         }
-        let mut expired_writes = Vec::new();
-        // The receive guard lives from HTTP headers through chunk dispatch, even for a
-        // slowly arriving binary body. Lock order active_upload_receives -> write_streams.
-        if let (Ok(active), Ok(mut writes)) = (
-            self.active_upload_receives.lock(),
-            self.write_streams.lock(),
-        ) {
-            let ids = writes
-                .iter()
-                .filter(|(id, stream)| {
-                    stream.last_activity_ms <= now - STREAM_IDLE_TIMEOUT_MS
-                        && !active.contains_key(*id)
-                })
-                .map(|(id, _)| id.clone())
-                .collect::<Vec<_>>();
-            for id in ids {
-                if let Some(stream) = writes.remove(&id) {
-                    expired_writes.push((id, stream));
-                }
+        // Snapshot handles under the map mutex; the per-stream mutex fences
+        // expiry against all in-flight write/commit/abort operations.
+        let handles = self
+            .write_streams
+            .lock()
+            .map(|writes| {
+                writes
+                    .iter()
+                    .map(|(id, handle)| (id.clone(), Arc::clone(handle)))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (id, handle) in handles {
+            // active_upload_receives precedes the per-stream mutex. Keep this
+            // guard until removal so a body arriving between checks cannot expire.
+            let Ok(active) = self.active_upload_receives.lock() else {
+                continue;
+            };
+            if active.contains_key(&id) {
+                continue;
             }
-        }
-        if !expired_writes.is_empty() {
-            if let Ok(mut paths) = self.active_write_paths.lock() {
-                for (stream_id, mut stream) in expired_writes {
-                    stream.file.take();
-                    let cleanup = if stream.committed.is_none() {
-                        self.storage
-                            .abort_stream_temp(&stream.space_id, &stream.temp_path)
-                    } else {
-                        Ok(())
-                    };
-                    if cleanup.is_ok() {
-                        paths.remove(&write_path_key(&stream.space_id, &stream.path));
-                        if stream.committed.is_none() {
-                            let _ = self.storage.finish_stream_operation(
-                                &stream_id,
-                                &stream.pairing_id,
-                                "OPEN",
-                                "EXPIRED_FENCED",
-                                None,
-                            );
-                        }
-                    }
-                    if cleanup.is_ok() {
-                        if let Some(operation_id) = stream.operation_id.as_deref() {
-                            self.fail_operation_code(
-                                operation_id,
-                                "STREAM_EXPIRED",
-                                "stream expired after confirmed idle cleanup".into(),
-                            );
-                        }
-                    }
+            let Ok(mut stream) = handle.lock() else {
+                continue;
+            };
+            if stream.last_activity_ms > now - STREAM_IDLE_TIMEOUT_MS {
+                continue;
+            }
+            if self.remove_current_write_stream(&id, &handle).ok() != Some(true) {
+                continue;
+            }
+            drop(active);
+            stream.file.take();
+            let cleanup = if stream.committed.is_none() {
+                self.storage
+                    .abort_stream_temp(&stream.space_id, &stream.temp_path)
+            } else {
+                Ok(())
+            };
+            if cleanup.is_ok() {
+                if let Ok(mut paths) = self.active_write_paths.lock() {
+                    paths.remove(&write_path_key(&stream.space_id, &stream.path));
+                }
+                if stream.committed.is_none() {
+                    let _ = self.storage.finish_stream_operation(
+                        &id,
+                        &stream.pairing_id,
+                        "OPEN",
+                        "EXPIRED_FENCED",
+                        None,
+                    );
+                }
+                if let Some(operation_id) = stream.operation_id.as_deref() {
+                    self.fail_operation_code(
+                        operation_id,
+                        "STREAM_EXPIRED",
+                        "stream expired after confirmed idle cleanup".into(),
+                    );
                 }
             }
         }
@@ -3192,6 +3457,9 @@ struct ReadStreamState {
     space_id: String,
     path: String,
     etag: String,
+    version: u64,
+    // One OS handle per reader; no open/seek on every chunk.
+    file: Arc<File>,
     next_seq: u64,
     size: u64,
     last_activity_ms: i64,
@@ -3772,6 +4040,14 @@ async fn handle_request(
                 .find_active_pairing_by_credential_hash(&input.client_instance_id, &credential_hash)
                 .map_err(ApiError::from_storage)?
                 .ok_or_else(ApiError::auth_invalid)?;
+            state.prune_ephemeral();
+            let deleting = state
+                .deleting_applications
+                .lock()
+                .map_err(|_| ApiError::internal())?;
+            if deleting.contains(&pairing.application_id) {
+                return Err(ApiError::auth_invalid());
+            }
             state
                 .storage
                 .touch_pairing(&pairing.id)
@@ -3796,7 +4072,7 @@ async fn handle_request(
                 }
                 _ => None,
             };
-            state.prune_ephemeral();
+
             let token = random_secret_hex(32);
             let expires_at_ms = now_ms() + SESSION_TTL_MS;
             {
@@ -3817,6 +4093,7 @@ async fn handle_request(
                     },
                 );
             }
+            drop(deleting);
             HttpResponse::json(
                 200,
                 &SessionResponse {
@@ -4133,48 +4410,53 @@ async fn handle_request(
             }
             state.prune_ephemeral();
             {
-                let writes = state
+                let handles = state
                     .write_streams
                     .lock()
-                    .map_err(|_| ApiError::internal())?;
-                if let Some((stream_id, stream)) = writes.iter().find(|(_, stream)| {
-                    stream.pairing_id == session.pairing_id && stream.request_id == input.request_id
-                }) {
-                    let requested_metadata = input.metadata.as_ref().map(to_core_file_metadata);
-                    let requested_operation_id = input
-                        .operation
-                        .as_ref()
-                        .map(|operation| operation.id.as_str());
-                    if stream.space_id != input.space_id
-                        || stream.path != input.path
-                        || stream.if_match != input.if_match
-                        || stream.declared_size != input.declared_size
-                        || stream.metadata != requested_metadata
-                        || stream.chunk_method != input.chunk_method
-                        || stream.operation_id.as_deref() != requested_operation_id
-                    {
-                        return Err(ApiError::new(
-                            409,
-                            ErrorCode::Conflict,
-                            "requestId is already bound to a different stream mutation",
-                        ));
+                    .map_err(|_| ApiError::internal())?
+                    .iter()
+                    .map(|(id, handle)| (id.clone(), Arc::clone(handle)))
+                    .collect::<Vec<_>>();
+                let mut active = 0;
+                for (stream_id, handle) in handles {
+                    let stream = handle.lock().map_err(|_| ApiError::internal())?;
+                    if stream.pairing_id != session.pairing_id {
+                        continue;
                     }
-                    return HttpResponse::json(
-                        200,
-                        &StreamWriteBeginResponse {
-                            chunk_method: stream.chunk_method,
-                            request_id: stream.request_id.clone(),
-                            stream_id: stream_id.clone(),
-                            max_chunk_bytes: MAX_STREAM_CHUNK_BYTES,
-                        },
-                    );
+                    if stream.request_id == input.request_id {
+                        let requested_metadata = input.metadata.as_ref().map(to_core_file_metadata);
+                        let requested_operation_id = input
+                            .operation
+                            .as_ref()
+                            .map(|operation| operation.id.as_str());
+                        if stream.space_id != input.space_id
+                            || stream.path != input.path
+                            || stream.if_match != input.if_match
+                            || stream.declared_size != input.declared_size
+                            || stream.metadata != requested_metadata
+                            || stream.chunk_method != input.chunk_method
+                            || stream.operation_id.as_deref() != requested_operation_id
+                        {
+                            return Err(ApiError::new(
+                                409,
+                                ErrorCode::Conflict,
+                                "requestId is already bound to a different stream mutation",
+                            ));
+                        }
+                        return HttpResponse::json(
+                            200,
+                            &StreamWriteBeginResponse {
+                                chunk_method: stream.chunk_method,
+                                request_id: stream.request_id.clone(),
+                                stream_id,
+                                max_chunk_bytes: MAX_STREAM_CHUNK_BYTES,
+                            },
+                        );
+                    }
+                    if stream.committed.is_none() {
+                        active += 1;
+                    }
                 }
-                let active = writes
-                    .values()
-                    .filter(|stream| {
-                        stream.pairing_id == session.pairing_id && stream.committed.is_none()
-                    })
-                    .count();
                 if active >= MAX_STREAM_WRITES_PER_SESSION {
                     return Err(ApiError::new(
                         429,
@@ -4305,7 +4587,7 @@ async fn handle_request(
             }
             match state.write_streams.lock() {
                 Ok(mut streams) => {
-                    streams.insert(stream_id.clone(), stream);
+                    streams.insert(stream_id.clone(), Arc::new(Mutex::new(stream)));
                 }
                 Err(_) => {
                     drop(stream);
@@ -4338,6 +4620,31 @@ async fn handle_request(
                 .stat_file(&input.space_id, &input.path)
                 .map_err(ApiError::from_storage)?
                 .ok_or_else(|| ApiError::new(404, ErrorCode::NotFound, "file not found"))?;
+            let file = Arc::new(
+                state
+                    .storage
+                    .open_stream_read_file(&input.space_id, &input.path)
+                    .map_err(ApiError::from_storage)?,
+            );
+            let confirmed = state
+                .storage
+                .stat_file(&input.space_id, &input.path)
+                .map_err(ApiError::from_storage)?;
+            if !confirmed.as_ref().is_some_and(|current| {
+                current.etag == metadata.etag
+                    && current.version == metadata.version
+                    && current.size == metadata.size
+            }) || file
+                .metadata()
+                .map(|disk| disk.len() != metadata.size)
+                .unwrap_or(true)
+            {
+                return Err(ApiError::new(
+                    409,
+                    ErrorCode::Conflict,
+                    "file changed while opening the stream reader",
+                ));
+            }
             let operation = if let Some(requested) = input.operation.as_ref() {
                 Some(state.begin_application_operation(
                     &session.application_id,
@@ -4366,6 +4673,8 @@ async fn handle_request(
                         space_id: input.space_id,
                         path: input.path,
                         etag: metadata.etag.clone(),
+                        version: metadata.version,
+                        file,
                         next_seq: 0,
                         size: metadata.size,
                         last_activity_ms: now_ms(),
@@ -6386,170 +6695,43 @@ async fn handle_write_stream_route(
             )
         })?;
         let _bulk = state.acquire_bulk(&session.pairing_id).await?;
-        let mut streams = state
-            .write_streams
-            .lock()
-            .map_err(|_| ApiError::internal())?;
-        let stream = streams.get_mut(stream_id).ok_or_else(|| {
-            ApiError::new(
-                404,
-                ErrorCode::StreamNotFound,
-                "write stream not found or expired",
-            )
-        })?;
-        if stream.pairing_id != session.pairing_id {
-            return Err(ApiError::new(
-                403,
-                ErrorCode::PermissionDenied,
-                "stream belongs to another session",
-            ));
-        }
-        let wire_method = if request.method == "PUT" {
-            ChunkMethod::Put
-        } else {
-            ChunkMethod::Post
-        };
-        if stream.chunk_method != wire_method {
-            return Err(ApiError::new(
-                403,
-                ErrorCode::PermissionDenied,
-                "stream method differs from pinned begin method",
-            ));
-        }
-        if stream.committed.is_some() {
-            return Err(ApiError::new(
-                409,
-                ErrorCode::StreamSequenceInvalid,
-                "stream is already committed",
-            ));
-        }
-        if let Some(operation_id) = stream.operation_id.as_deref() {
-            if state.operation_cancelled(operation_id) {
-                state.cancelled_operation(operation_id);
+        let stream_id = stream_id.to_owned();
+        let state = Arc::clone(state);
+        tokio::task::spawn_blocking(move || {
+            let stream_id = stream_id.as_str();
+            let stream_handle = state.write_stream_handle(stream_id)?;
+            let mut stream = stream_handle.lock().map_err(|_| ApiError::internal())?;
+            if !state.is_current_write_stream(stream_id, &stream_handle)? {
                 return Err(ApiError::new(
-                    409,
-                    ErrorCode::Conflict,
-                    "operation was cancelled",
-                ));
-            }
-        }
-        let chunk_hash = sha256_hex(&request.body);
-        if seq.checked_add(1) == Some(stream.next_seq)
-            && stream.last_chunk_sha256.as_deref() == Some(chunk_hash.as_str())
-            && stream.last_chunk_len == request.body.len()
-        {
-            stream.last_activity_ms = now_ms();
-            return HttpResponse::json(
-                200,
-                &StreamChunkAck {
-                    stream_id: stream_id.to_owned(),
-                    accepted_seq: seq,
-                    next_seq: stream.next_seq,
-                    received_bytes: stream.received_bytes,
-                },
-            );
-        }
-        if seq != stream.next_seq {
-            return Err(ApiError::new(
-                409,
-                ErrorCode::StreamSequenceInvalid,
-                format!(
-                    "expected stream sequence {}, received {seq}",
-                    stream.next_seq
-                ),
-            ));
-        }
-        let next_size = stream
-            .received_bytes
-            .saturating_add(request.body.len() as u64);
-        if next_size > MAX_MANAGED_FILE_BYTES {
-            return Err(ApiError::new(
-                413,
-                ErrorCode::FileTooLarge,
-                "stream exceeds the 16 GiB safety ceiling",
-            ));
-        }
-        if stream
-            .declared_size
-            .is_some_and(|declared| next_size > declared)
-        {
-            return Err(ApiError::new(
-                409,
-                ErrorCode::StreamSequenceInvalid,
-                "stream exceeded declared size",
-            ));
-        }
-        state
-            .storage
-            .ensure_write_capacity(&stream.space_id, request.body.len() as u64)
-            .map_err(ApiError::from_storage)?;
-        let file = stream.file.as_mut().ok_or_else(|| {
-            ApiError::new(
-                409,
-                ErrorCode::StreamSequenceInvalid,
-                "stream is not writable",
-            )
-        })?;
-        file.write_all(&request.body).map_err(|_| {
-            ApiError::new(
-                503,
-                ErrorCode::StorageUnavailable,
-                "failed to write stream chunk",
-            )
-        })?;
-        stream.hasher.update(&request.body);
-        stream.received_bytes = next_size;
-        stream.last_chunk_sha256 = Some(chunk_hash);
-        stream.last_chunk_len = request.body.len();
-        stream.next_seq += 1;
-        stream.last_activity_ms = now_ms();
-        state
-            .storage
-            .advance_stream_chunk(&stream_operation_snapshot(stream_id, stream))
-            .map_err(ApiError::from_storage)?;
-        if let Some(operation_id) = stream.operation_id.as_deref() {
-            state.update_operation_bytes(
-                operation_id,
-                "writing",
-                stream.received_bytes,
-                stream.declared_size,
-            );
-        }
-        HttpResponse::json(
-            200,
-            &StreamChunkAck {
-                stream_id: stream_id.to_owned(),
-                accepted_seq: seq,
-                next_seq: stream.next_seq,
-                received_bytes: stream.received_bytes,
-            },
-        )
-    } else if request.method == "POST" && parts.len() == 2 && parts[1] == "commit" {
-        require_control_content_type(&request)?;
-        let input: StreamWriteCommitRequest = parse_json(&request.body)?;
-        if input.sha256.len() != 64 || !input.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(ApiError::bad_request(
-                "sha256 must be a 64-character hex digest",
-            ));
-        }
-        let stream_id = parts[0];
-        let (application_id, space_id, path, existed_before, result, operation_id) = {
-            let mut streams = state
-                .write_streams
-                .lock()
-                .map_err(|_| ApiError::internal())?;
-            let stream = streams.get_mut(stream_id).ok_or_else(|| {
-                ApiError::new(
                     404,
                     ErrorCode::StreamNotFound,
                     "write stream not found or expired",
-                )
-            })?;
+                ));
+            }
             if stream.pairing_id != session.pairing_id {
                 return Err(ApiError::new(
                     403,
                     ErrorCode::PermissionDenied,
                     "stream belongs to another session",
+                ));
+            }
+            let wire_method = if request.method == "PUT" {
+                ChunkMethod::Put
+            } else {
+                ChunkMethod::Post
+            };
+            if stream.chunk_method != wire_method {
+                return Err(ApiError::new(
+                    403,
+                    ErrorCode::PermissionDenied,
+                    "stream method differs from pinned begin method",
+                ));
+            }
+            if stream.committed.is_some() {
+                return Err(ApiError::new(
+                    409,
+                    ErrorCode::StreamSequenceInvalid,
+                    "stream is already committed",
                 ));
             }
             if let Some(operation_id) = stream.operation_id.as_deref() {
@@ -6562,146 +6744,299 @@ async fn handle_write_stream_route(
                     ));
                 }
             }
-            if let Some(result) = stream.committed.clone() {
-                return HttpResponse::json(200, &file_wire(result));
+            let chunk_hash = sha256_hex(&request.body);
+            if seq.checked_add(1) == Some(stream.next_seq)
+                && stream.last_chunk_sha256.as_deref() == Some(chunk_hash.as_str())
+                && stream.last_chunk_len == request.body.len()
+            {
+                stream.last_activity_ms = now_ms();
+                return HttpResponse::json(
+                    200,
+                    &StreamChunkAck {
+                        stream_id: stream_id.to_owned(),
+                        accepted_seq: seq,
+                        next_seq: stream.next_seq,
+                        received_bytes: stream.received_bytes,
+                    },
+                );
+            }
+            if seq != stream.next_seq {
+                return Err(ApiError::new(
+                    409,
+                    ErrorCode::StreamSequenceInvalid,
+                    format!(
+                        "expected stream sequence {}, received {seq}",
+                        stream.next_seq
+                    ),
+                ));
+            }
+            let next_size = stream
+                .received_bytes
+                .saturating_add(request.body.len() as u64);
+            if next_size > MAX_MANAGED_FILE_BYTES {
+                return Err(ApiError::new(
+                    413,
+                    ErrorCode::FileTooLarge,
+                    "stream exceeds the 16 GiB safety ceiling",
+                ));
             }
             if stream
                 .declared_size
-                .is_some_and(|declared| declared != stream.received_bytes)
+                .is_some_and(|declared| next_size > declared)
             {
                 return Err(ApiError::new(
                     409,
                     ErrorCode::StreamSequenceInvalid,
-                    "received bytes do not match declared size",
+                    "stream exceeded declared size",
                 ));
             }
-            let actual = format!("{:x}", stream.hasher.clone().finalize());
-            if !actual.eq_ignore_ascii_case(&input.sha256) {
-                return Err(ApiError::new(
+            state
+                .storage
+                .ensure_write_capacity(&stream.space_id, request.body.len() as u64)
+                .map_err(ApiError::from_storage)?;
+            let file = stream.file.as_mut().ok_or_else(|| {
+                ApiError::new(
                     409,
-                    ErrorCode::StreamChecksumMismatch,
-                    "stream SHA-256 checksum does not match",
-                ));
-            }
-            if let Some(mut file) = stream.file.take() {
-                file.flush().map_err(|_| {
-                    ApiError::new(503, ErrorCode::StorageUnavailable, "failed to flush stream")
-                })?;
-                file.sync_all().map_err(|_| {
-                    ApiError::new(503, ErrorCode::StorageUnavailable, "failed to sync stream")
-                })?;
-            }
-            state
-                .storage
-                .finish_stream_operation(stream_id, &session.pairing_id, "OPEN", "COMMITTING", None)
-                .map_err(ApiError::from_storage)?;
-            let result = state
-                .storage
-                .commit_stream_file_with_metadata(
-                    &stream.space_id,
-                    &stream.path,
-                    &stream.temp_path,
-                    &actual,
-                    stream.received_bytes,
-                    stream.if_match.as_deref(),
-                    stream.metadata.as_ref(),
-                    &stream.request_id,
+                    ErrorCode::StreamSequenceInvalid,
+                    "stream is not writable",
                 )
-                .map_err(ApiError::from_storage)?;
-            stream.committed = Some(result.clone());
-            state
-                .storage
-                .finish_stream_operation(
-                    stream_id,
-                    &session.pairing_id,
-                    "COMMITTING",
-                    "COMMITTED",
-                    Some(&result),
+            })?;
+            file.write_all(&request.body).map_err(|_| {
+                ApiError::new(
+                    503,
+                    ErrorCode::StorageUnavailable,
+                    "failed to write stream chunk",
                 )
-                .map_err(ApiError::from_storage)?;
+            })?;
+            stream.hasher.update(&request.body);
+            stream.received_bytes = next_size;
+            stream.last_chunk_sha256 = Some(chunk_hash);
+            stream.last_chunk_len = request.body.len();
+            stream.next_seq += 1;
             stream.last_activity_ms = now_ms();
-            (
-                stream.application_id.clone(),
-                stream.space_id.clone(),
-                stream.path.clone(),
-                stream.existed_before,
-                result,
-                stream.operation_id.clone(),
+            state
+                .storage
+                .advance_stream_chunk(&stream_operation_snapshot(stream_id, &stream))
+                .map_err(ApiError::from_storage)?;
+            if let Some(operation_id) = stream.operation_id.as_deref() {
+                state.update_operation_bytes(
+                    operation_id,
+                    "writing",
+                    stream.received_bytes,
+                    stream.declared_size,
+                );
+            }
+            HttpResponse::json(
+                200,
+                &StreamChunkAck {
+                    stream_id: stream_id.to_owned(),
+                    accepted_seq: seq,
+                    next_seq: stream.next_seq,
+                    received_bytes: stream.received_bytes,
+                },
             )
-        };
-        if let Ok(mut paths) = state.active_write_paths.lock() {
-            paths.remove(&write_path_key(&space_id, &path));
+        })
+        .await
+        .map_err(|_| ApiError::internal())?
+    } else if request.method == "POST" && parts.len() == 2 && parts[1] == "commit" {
+        require_control_content_type(&request)?;
+        let input: StreamWriteCommitRequest = parse_json(&request.body)?;
+        if input.sha256.len() != 64 || !input.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ApiError::bad_request(
+                "sha256 must be a 64-character hex digest",
+            ));
         }
-        if let Some(operation_id) = operation_id.as_deref() {
-            state.complete_operation(
-                operation_id,
-                "complete",
-                Some(
-                    serde_json::to_value(file_wire(result.clone()))
-                        .unwrap_or(serde_json::Value::Null),
-                ),
+        let stream_id = parts[0].to_owned();
+        let state = Arc::clone(state);
+        tokio::task::spawn_blocking(move || {
+            let stream_id = stream_id.as_str();
+            let (application_id, space_id, path, existed_before, result, operation_id) = {
+                let stream_handle = state.write_stream_handle(stream_id)?;
+                let mut stream = stream_handle.lock().map_err(|_| ApiError::internal())?;
+                if !state.is_current_write_stream(stream_id, &stream_handle)? {
+                    return Err(ApiError::new(
+                        404,
+                        ErrorCode::StreamNotFound,
+                        "write stream not found or expired",
+                    ));
+                }
+                if stream.pairing_id != session.pairing_id {
+                    return Err(ApiError::new(
+                        403,
+                        ErrorCode::PermissionDenied,
+                        "stream belongs to another session",
+                    ));
+                }
+                if let Some(operation_id) = stream.operation_id.as_deref() {
+                    if state.operation_cancelled(operation_id) {
+                        state.cancelled_operation(operation_id);
+                        return Err(ApiError::new(
+                            409,
+                            ErrorCode::Conflict,
+                            "operation was cancelled",
+                        ));
+                    }
+                }
+                if let Some(result) = stream.committed.clone() {
+                    return HttpResponse::json(200, &file_wire(result));
+                }
+                if stream
+                    .declared_size
+                    .is_some_and(|declared| declared != stream.received_bytes)
+                {
+                    return Err(ApiError::new(
+                        409,
+                        ErrorCode::StreamSequenceInvalid,
+                        "received bytes do not match declared size",
+                    ));
+                }
+                let actual = format!("{:x}", stream.hasher.clone().finalize());
+                if !actual.eq_ignore_ascii_case(&input.sha256) {
+                    return Err(ApiError::new(
+                        409,
+                        ErrorCode::StreamChecksumMismatch,
+                        "stream SHA-256 checksum does not match",
+                    ));
+                }
+                if let Some(mut file) = stream.file.take() {
+                    file.flush().map_err(|_| {
+                        ApiError::new(503, ErrorCode::StorageUnavailable, "failed to flush stream")
+                    })?;
+                    file.sync_all().map_err(|_| {
+                        ApiError::new(503, ErrorCode::StorageUnavailable, "failed to sync stream")
+                    })?;
+                }
+                state
+                    .storage
+                    .finish_stream_operation(
+                        stream_id,
+                        &session.pairing_id,
+                        "OPEN",
+                        "COMMITTING",
+                        None,
+                    )
+                    .map_err(ApiError::from_storage)?;
+                let result = state
+                    .storage
+                    .commit_stream_file_with_metadata(
+                        &stream.space_id,
+                        &stream.path,
+                        &stream.temp_path,
+                        &actual,
+                        stream.received_bytes,
+                        stream.if_match.as_deref(),
+                        stream.metadata.as_ref(),
+                        &stream.request_id,
+                    )
+                    .map_err(ApiError::from_storage)?;
+                stream.committed = Some(result.clone());
+                state
+                    .storage
+                    .finish_stream_operation(
+                        stream_id,
+                        &session.pairing_id,
+                        "COMMITTING",
+                        "COMMITTED",
+                        Some(&result),
+                    )
+                    .map_err(ApiError::from_storage)?;
+                stream.last_activity_ms = now_ms();
+                (
+                    stream.application_id.clone(),
+                    stream.space_id.clone(),
+                    stream.path.clone(),
+                    stream.existed_before,
+                    result,
+                    stream.operation_id.clone(),
+                )
+            };
+            if let Ok(mut paths) = state.active_write_paths.lock() {
+                paths.remove(&write_path_key(&space_id, &path));
+            }
+            if let Some(operation_id) = operation_id.as_deref() {
+                state.complete_operation(
+                    operation_id,
+                    "complete",
+                    Some(
+                        serde_json::to_value(file_wire(result.clone()))
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                );
+            }
+            state.emit_event(
+                &application_id,
+                if existed_before {
+                    EventKindWire::FileChanged
+                } else {
+                    EventKindWire::FileCreated
+                },
+                Some(&space_id),
+                Some(&path),
+                None,
+                None,
+                None,
             );
-        }
-        state.emit_event(
-            &application_id,
-            if existed_before {
-                EventKindWire::FileChanged
-            } else {
-                EventKindWire::FileCreated
-            },
-            Some(&space_id),
-            Some(&path),
-            None,
-            None,
-            None,
-        );
-        HttpResponse::json(200, &file_wire(result))
+            HttpResponse::json(200, &file_wire(result))
+        })
+        .await
+        .map_err(|_| ApiError::internal())?
     } else if request.method == "POST" && parts.len() == 2 && parts[1] == "abort" {
         require_control_content_type(&request)?;
-        let stream_id = parts[0];
-        let mut writes = state
-            .write_streams
-            .lock()
-            .map_err(|_| ApiError::internal())?;
-        let stream = writes.get(stream_id).ok_or_else(|| {
-            ApiError::new(
-                404,
-                ErrorCode::StreamNotFound,
-                "write stream not found; resolve by requestId",
-            )
-        })?;
-        if stream.pairing_id != session.pairing_id {
-            return Err(ApiError::new(
-                403,
-                ErrorCode::PermissionDenied,
-                "stream belongs to another pairing",
-            ));
-        }
-        if stream.committed.is_some() {
-            return Err(ApiError::new(
-                409,
-                ErrorCode::Conflict,
-                "already committed; cancellation cannot undo saved data",
-            ));
-        }
-        let mut stream = writes.remove(stream_id).ok_or_else(ApiError::internal)?;
-        // The map mutex excludes a simultaneous commit/chunk. A missing cleanup ACK remains nonterminal.
-        stream.file.take();
-        state
-            .storage
-            .abort_stream_temp(&stream.space_id, &stream.temp_path)
-            .map_err(ApiError::from_storage)?;
-        state
-            .storage
-            .finish_stream_operation(stream_id, &session.pairing_id, "OPEN", "ABORTED", None)
-            .map_err(ApiError::from_storage)?;
-        if let Ok(mut paths) = state.active_write_paths.lock() {
-            paths.remove(&write_path_key(&stream.space_id, &stream.path));
-        }
-        if let Some(operation_id) = stream.operation_id.as_deref() {
-            state.cancelled_operation(operation_id);
-        }
-        Ok(HttpResponse::no_content())
+        let stream_id = parts[0].to_owned();
+        let state = Arc::clone(state);
+        tokio::task::spawn_blocking(move || {
+            let stream_id = stream_id.as_str();
+            let stream_handle = state.write_stream_handle(stream_id)?;
+            let mut stream = stream_handle.lock().map_err(|_| ApiError::internal())?;
+            if !state.is_current_write_stream(stream_id, &stream_handle)? {
+                return Err(ApiError::new(
+                    404,
+                    ErrorCode::StreamNotFound,
+                    "write stream not found; resolve by requestId",
+                ));
+            }
+            if stream.pairing_id != session.pairing_id {
+                return Err(ApiError::new(
+                    403,
+                    ErrorCode::PermissionDenied,
+                    "stream belongs to another pairing",
+                ));
+            }
+            if stream.committed.is_some() {
+                return Err(ApiError::new(
+                    409,
+                    ErrorCode::Conflict,
+                    "already committed; cancellation cannot undo saved data",
+                ));
+            }
+            // Fence the handle before removing it from the map. A caller that
+            // looked up the Arc earlier will recheck membership and cannot ACK.
+            if !state.remove_current_write_stream(stream_id, &stream_handle)? {
+                return Err(ApiError::new(
+                    404,
+                    ErrorCode::StreamNotFound,
+                    "write stream not found; resolve by requestId",
+                ));
+            }
+            stream.file.take();
+            state
+                .storage
+                .abort_stream_temp(&stream.space_id, &stream.temp_path)
+                .map_err(ApiError::from_storage)?;
+            state
+                .storage
+                .finish_stream_operation(stream_id, &session.pairing_id, "OPEN", "ABORTED", None)
+                .map_err(ApiError::from_storage)?;
+            if let Ok(mut paths) = state.active_write_paths.lock() {
+                paths.remove(&write_path_key(&stream.space_id, &stream.path));
+            }
+            if let Some(operation_id) = stream.operation_id.as_deref() {
+                state.cancelled_operation(operation_id);
+            }
+            Ok(HttpResponse::no_content())
+        })
+        .await
+        .map_err(|_| ApiError::internal())?
     } else {
         Err(ApiError::new(
             404,
@@ -6731,7 +7066,7 @@ async fn handle_read_stream_route(
             )
         })?;
         let _bulk = state.acquire_bulk(&session.pairing_id).await?;
-        let (space_id, path, expected_etag, offset, advance, size, operation_id) = {
+        let (space_id, path, expected_etag, version, file, offset, advance, size, operation_id) = {
             let streams = state
                 .read_streams
                 .lock()
@@ -6774,6 +7109,8 @@ async fn handle_read_stream_route(
                 stream.space_id.clone(),
                 stream.path.clone(),
                 stream.etag.clone(),
+                stream.version,
+                Arc::clone(&stream.file),
                 seq.saturating_mul(DEFAULT_STREAM_CHUNK_BYTES as u64),
                 seq == stream.next_seq,
                 stream.size,
@@ -6787,42 +7124,89 @@ async fn handle_read_stream_route(
                 "read stream sequence is past end of file",
             ));
         }
-        let current = state
-            .storage
-            .stat_file(&space_id, &path)
-            .map_err(ApiError::from_storage)?
-            .ok_or_else(|| {
-                ApiError::new(
-                    404,
-                    ErrorCode::NotFound,
-                    "file disappeared during stream read",
-                )
-            })?;
-        if current.etag != expected_etag || current.size != size {
+        // The disk read and SQLite stat run off the async I/O executor.
+        // Recheck the registry after the read so a concurrent replacement,
+        // deletion or snapshot restore never returns a stale chunk as success.
+        let storage_state = Arc::clone(state);
+        let bytes = tokio::task::spawn_blocking(move || {
+            let matches_identity = |current: &FileRecord| {
+                current.etag == expected_etag && current.version == version && current.size == size
+            };
+            let before = storage_state
+                .storage
+                .stat_file(&space_id, &path)
+                .map_err(ApiError::from_storage)?;
+            if !before.as_ref().is_some_and(matches_identity) {
+                return Err(ApiError::new(
+                    409,
+                    ErrorCode::Conflict,
+                    "file changed during stream read; reopen the reader",
+                ));
+            }
+            let expected_bytes = (size - offset).min(DEFAULT_STREAM_CHUNK_BYTES as u64) as usize;
+            let bytes = StorageEngine::read_open_stream_range(&file, offset, expected_bytes)
+                .map_err(ApiError::from_storage)?;
+            if bytes.len() != expected_bytes {
+                return Err(ApiError::new(
+                    503,
+                    ErrorCode::StorageUnavailable,
+                    "stream file was truncated during reading",
+                ));
+            }
+            let after = storage_state
+                .storage
+                .stat_file(&space_id, &path)
+                .map_err(ApiError::from_storage)?;
+            if !after.as_ref().is_some_and(matches_identity) {
+                return Err(ApiError::new(
+                    409,
+                    ErrorCode::Conflict,
+                    "file changed during stream read; reopen the reader",
+                ));
+            }
+            Ok::<_, ApiError>(bytes)
+        })
+        .await
+        .map_err(|_| ApiError::internal())??;
+        // A close/expiration between the snapshot and disk completion must not
+        // yield an apparently valid chunk from a detached reader.
+        if state
+            .read_streams
+            .lock()
+            .map_err(|_| ApiError::internal())?
+            .get(stream_id)
+            .is_none_or(|reader| reader.pairing_id != session.pairing_id)
+        {
             return Err(ApiError::new(
-                409,
-                ErrorCode::Conflict,
-                "file changed during stream read; reopen the reader",
+                404,
+                ErrorCode::StreamNotFound,
+                "read stream not found or expired",
             ));
         }
-        let bytes = state
-            .storage
-            .read_file_range(&space_id, &path, offset, DEFAULT_STREAM_CHUNK_BYTES)
-            .map_err(ApiError::from_storage)?;
         if advance {
             let mut streams = state
                 .read_streams
                 .lock()
                 .map_err(|_| ApiError::internal())?;
-            if let Some(stream) = streams.get_mut(stream_id) {
-                stream.next_seq += 1;
-                stream.last_activity_ms = now_ms();
-            }
-            if let Some(operation_id) = operation_id.as_deref() {
-                let done = offset.saturating_add(bytes.len() as u64).min(size);
-                state.update_operation_bytes(operation_id, "reading", done, Some(size));
-                if done >= size {
-                    state.complete_operation(operation_id, "complete", None);
+            let advanced = if let Some(stream) = streams.get_mut(stream_id) {
+                if stream.next_seq == seq && stream.pairing_id == session.pairing_id {
+                    stream.next_seq += 1;
+                    stream.last_activity_ms = now_ms();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            drop(streams);
+            if advanced {
+                if let Some(operation_id) = operation_id.as_deref() {
+                    let done = offset.saturating_add(bytes.len() as u64).min(size);
+                    state.update_operation_bytes(operation_id, "reading", done, Some(size));
+                    if done >= size {
+                        state.complete_operation(operation_id, "complete", None);
+                    }
                 }
             }
         }
@@ -7015,6 +7399,7 @@ fn operation_display_label(kind: &str, application_name: &str) -> String {
         "reconcile-usage" => "Checking storage usage",
         "clear-cache" => "Clearing cache",
         "delete-space" => "Deleting storage",
+        "delete-application" => "Removing application",
         _ => "Working with local data",
     };
     if application_name == "VontaqFS" {
@@ -7456,12 +7841,18 @@ async fn read_request(
         .filter(|session| session.expires_at_ms > now_ms());
     let guarded_stream_id = match (chunk_stream_id, header_session) {
         (Some(id), Some(session)) => {
-            let owned = state
+            let handle = state
                 .write_streams
                 .lock()
                 .map_err(|_| ApiError::internal())?
                 .get(&id)
-                .is_some_and(|stream| stream.pairing_id == session.pairing_id);
+                .cloned();
+            let owned = handle.is_some_and(|handle| {
+                handle
+                    .lock()
+                    .map(|stream| stream.pairing_id == session.pairing_id)
+                    .unwrap_or(false)
+            });
             owned.then_some(id)
         }
         _ => None,
@@ -8023,6 +8414,99 @@ mod tests {
             },
             Arc::new(HeadlessHostServices),
         ))
+    }
+
+    fn dummy_write_stream(pairing: &str, path: &str) -> WriteStreamState {
+        WriteStreamState {
+            pairing_id: pairing.into(),
+            application_id: "test-app".into(),
+            space_id: "test-space".into(),
+            path: path.into(),
+            chunk_method: ChunkMethod::Post,
+            request_id: "test-request".into(),
+            if_match: None,
+            declared_size: None,
+            metadata: None,
+            temp_path: PathBuf::from("not-a-live-temp-file"),
+            file: None,
+            hasher: Sha256::new(),
+            next_seq: 0,
+            received_bytes: 0,
+            last_chunk_sha256: None,
+            last_chunk_len: 0,
+            last_activity_ms: now_ms(),
+            existed_before: false,
+            committed: None,
+            operation_id: None,
+        }
+    }
+
+    #[test]
+    fn write_stream_map_is_not_locked_by_a_busy_stream() {
+        let state = test_state();
+        let first = Arc::new(Mutex::new(dummy_write_stream("pair-1", "/one")));
+        let second = Arc::new(Mutex::new(dummy_write_stream("pair-2", "/two")));
+        {
+            let mut writes = state.write_streams.lock().unwrap();
+            writes.insert("stream-one".into(), Arc::clone(&first));
+            writes.insert("stream-two".into(), Arc::clone(&second));
+        }
+        let blocked_first = first.lock().unwrap(); // models slow disk+SQLite
+                                                   // A different writer and the map remain accessible throughout I/O.
+        assert!(state.write_streams.try_lock().is_ok());
+        let other = state.write_stream_handle("stream-two").unwrap();
+        assert!(other.try_lock().is_ok());
+        assert!(state.is_current_write_stream("stream-one", &first).unwrap());
+        drop(blocked_first);
+    }
+
+    #[test]
+    fn removed_write_stream_handle_cannot_resurrect_or_ack() {
+        let state = test_state();
+        let handle = Arc::new(Mutex::new(dummy_write_stream("pair", "/file")));
+        state
+            .write_streams
+            .lock()
+            .unwrap()
+            .insert("id".into(), Arc::clone(&handle));
+        let old_handle = state.write_stream_handle("id").unwrap();
+        let _guard = handle.lock().unwrap();
+        assert!(state.remove_current_write_stream("id", &handle).unwrap());
+        assert!(!state.is_current_write_stream("id", &old_handle).unwrap());
+        assert!(!state
+            .remove_current_write_stream("id", &old_handle)
+            .unwrap());
+        assert!(state.write_stream_handle("id").is_err());
+    }
+
+    #[test]
+    fn positional_stream_reads_do_not_share_a_mutable_cursor() {
+        let path = std::env::temp_dir().join(format!("vontaqfs-positional-{}", Uuid::new_v4()));
+        fs::write(&path, b"abcdefghijklmnopqrstuvwxyz").unwrap();
+        let file = File::open(&path).unwrap();
+        let handle = Arc::new(file);
+        let first = Arc::clone(&handle);
+        let second = Arc::clone(&handle);
+        let a = std::thread::spawn(move || {
+            StorageEngine::read_open_stream_range(&first, 0, 5).unwrap()
+        });
+        let b = std::thread::spawn(move || {
+            StorageEngine::read_open_stream_range(&second, 20, 9).unwrap()
+        });
+        assert_eq!(a.join().unwrap(), b"abcde");
+        assert_eq!(b.join().unwrap(), b"uvwxyz");
+        assert_eq!(
+            StorageEngine::read_open_stream_range(&handle, 3, 4).unwrap(),
+            b"defg"
+        );
+        assert!(StorageEngine::read_open_stream_range(&handle, 80, 4)
+            .unwrap()
+            .is_empty());
+        assert!(StorageEngine::read_open_stream_range(&handle, 0, 0)
+            .unwrap()
+            .is_empty());
+        drop(handle);
+        fs::remove_file(path).unwrap();
     }
 
     // Unlike handle_request unit tests, these tests use a real loopback TCP socket,

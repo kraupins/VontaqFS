@@ -55,7 +55,7 @@ class StreamingRuntime {
     if (path === '/v1/streams/write/begin') {
       const id = `write-${this.streams.size + 1}`;
       assert.equal(body.chunkMethod, 'PUT');
-      this.streams.set(id, { path: body.path, size: 0, hash: createHash('sha256'), seq: 0, declaredSize: body.declaredSize, requestId: body.requestId });
+      this.streams.set(id, { path: body.path, size: 0, hash: createHash('sha256'), chunks: [], seq: 0, declaredSize: body.declaredSize, requestId: body.requestId });
       return json({ streamId: id, requestId: body.requestId, chunkMethod: 'PUT', maxChunkBytes: 512 * 1024 });
     }
     if (path.startsWith('/v1/streams/write/') && request.method === 'PUT') {
@@ -66,6 +66,7 @@ class StreamingRuntime {
       assert.equal(Number(seqText), stream.seq);
       if (this.expectedBuffer) this.chunkSharesExpectedBuffer.push(bytes.buffer === this.expectedBuffer);
       stream.hash.update(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+      stream.chunks.push(Buffer.from(bytes));
       stream.size += bytes.byteLength;
       stream.seq += 1;
       return json({ streamId, acceptedSeq: Number(seqText), nextSeq: stream.seq, receivedBytes: stream.size });
@@ -77,7 +78,7 @@ class StreamingRuntime {
       if (digest !== body.sha256) return error(409, 'STREAM_CHECKSUM_MISMATCH', 'bad hash');
       if (stream.declaredSize != null && stream.declaredSize !== stream.size) return error(409, 'STREAM_SEQUENCE_INVALID', 'size mismatch');
       const info = fileInfo(stream.path, stream.size, digest);
-      this.files.set(stream.path, { bytes: null, info });
+      this.files.set(stream.path, { bytes: new Uint8Array(Buffer.concat(stream.chunks)), info });
       return json(info);
     }
     if (path.endsWith('/abort') && path.startsWith('/v1/streams/write/')) return empty();
@@ -246,4 +247,56 @@ test('watch surfaces runtime sequence reset as resync-required after reconnect',
   const event = await Promise.race([seen, new Promise((_, reject) => setTimeout(() => reject(new Error('watch reset timeout')), 1000))]);
   unsubscribe();
   assert.equal(event.sequence, 1);
+});
+
+
+test('writeJSON coalesces 1000 tiny entries into bounded chunks while retaining exact JSON bytes', async () => {
+  const runtime = new StreamingRuntime(), fs = await connect(runtime);
+  const items = Array.from({length:1000},(_,i)=>({id:i,ok:true}));
+  const base = JSON.stringify({payload:'',items});
+  assert.ok(Buffer.byteLength(base)<296916);
+  const document = {payload:'x'.repeat(296916-Buffer.byteLength(base)),items};
+  const expected = new TextEncoder().encode(JSON.stringify(document));
+  assert.equal(expected.byteLength,296916);
+  const info = await fs.writeJSON('/many.json',document);
+  const chunks = runtime.calls.filter(call=>call.method==='PUT'&&call.path.startsWith('/v1/streams/write/'));
+  assert.ok(chunks.length<=Math.ceil(expected.byteLength/(256*1024))+2,`Too many chunks: ${chunks.length}`);
+  assert.equal(info.etag,sha(expected));
+  assert.deepEqual(runtime.files.get('/many.json').bytes,expected);
+  assert.deepEqual(await fs.readJSON('/many.json'),document);
+});
+
+test('100k short JSON items preserve serialization with O(chunk) queued bytes',async()=>{
+  const runtime=new StreamingRuntime(),fs=await connect(runtime);
+  const data=Array.from({length:100000},(_,i)=>({n:i%13}));
+  const expected=new TextEncoder().encode(JSON.stringify(data));
+  const info=await fs.writeJSON('/100k.json',data);
+  const chunks=runtime.calls.filter(call=>call.method==='PUT'&&call.path.startsWith('/v1/streams/write/'));
+  assert.ok(chunks.length<=Math.ceil(expected.length/(256*1024))+2);
+  assert.equal(info.etag,sha(expected));
+  assert.deepEqual(runtime.files.get('/100k.json').bytes,expected);
+});
+
+test('writeText Unicode and direct-boundary follow exact encoded byte length',async()=>{
+  const runtime=new StreamingRuntime(),fs=await connect(runtime);
+  for(const [name,value] of [
+    ['empty',''],['threshold','a'.repeat(256*1024)],['over','a'.repeat(256*1024+1)],
+    ['unicode','Привет 👋𐍈'.repeat(55000)],['surrogates','😺'.repeat(40000)+'\ud800'],
+  ]){
+    const expected=new TextEncoder().encode(value),file=await fs.writeText('/'+name,value);
+    assert.equal(file.etag,sha(expected));
+    assert.deepEqual(runtime.files.get('/'+name).bytes,expected);
+  }
+});
+
+test('JSON string escape, surrogate, toJSON and cycle contracts',async()=>{
+  const runtime=new StreamingRuntime(),fs=await connect(runtime);
+  const payload={emoji:'😀',unpaired:'\ud800',quoted:'\"\n',nested:[undefined,null,3],d:{toJSON(){return{count:42};}}};
+  const expected=new TextEncoder().encode(JSON.stringify(payload));
+  const file=await fs.writeJSON('/escape.json',payload);
+  assert.equal(file.etag,sha(expected));
+  assert.deepEqual(runtime.files.get('/escape.json').bytes,expected);
+  const cycle={};cycle.ref=cycle;
+  await assert.rejects(()=>fs.writeJSON('/cycle.json',cycle),TypeError);
+  assert.equal(runtime.files.has('/cycle.json'),false);
 });

@@ -26,7 +26,6 @@ const clientReadme = read('README.md');
 const developerReadme = read('README_DEVELOPER.md');
 const privacy = read('PRIVACY.md');
 const changelog = read('CHANGELOG.md');
-const wiki021 = read('WIKI_UPDATE_0.2.1.md');
 const license = read('LICENSE');
 
 function collectMarkdown(dir, base = dir) {
@@ -40,8 +39,17 @@ function collectMarkdown(dir, base = dir) {
   return out.sort();
 }
 
-test('production documentation set includes release history and Wiki handoff while core public docs stay bilingual', () => {
-  assert.deepEqual(collectMarkdown(root), ['CHANGELOG.md', 'PRIVACY.md', 'README.md', 'README_DEVELOPER.md', 'RELEASE_0.2.3_TRANSPORT.md', 'WIKI_UPDATE_0.2.0.md', 'WIKI_UPDATE_0.2.1.md']);
+test('public documentation stays complete without historical handoff or internal checkpoint files', () => {
+  const publicDocs = new Set(['CHANGELOG.md', 'PRIVACY.md', 'README.md', 'README_DEVELOPER.md']);
+  const markdown = collectMarkdown(root);
+  for (const doc of publicDocs) assert.ok(markdown.includes(doc), `missing public document: ${doc}`);
+  for (const file of markdown) {
+    assert.doesNotMatch(file, /(?:^|\/)(?:CHECKPOINT|OWNER_[^/]*|VALIDATION_SUMMARY|WIKI_UPDATE_[^/]*|RELEASE_0\.2\.3_TRANSPORT)\.md$/i, `internal handoff file included: ${file}`);
+  }
+  assert.ok(changelog.includes(`## [${pkg.version}]`), `missing changelog entry for ${pkg.version}`);
+  for (const body of [clientReadme, developerReadme, changelog]) {
+    assert.doesNotMatch(body, /RELEASE_0\.2\.3_TRANSPORT\.md|WIKI_UPDATE_0\.2\.[01]\.md/, 'public docs reference removed handoff files');
+  }
   for (const body of [clientReadme, developerReadme, privacy]) {
     assert.match(body, /## English/);
     assert.match(body, /## Русский/);
@@ -137,10 +145,7 @@ test('developer guide is public SDK/API documentation rather than owner release 
   assert.match(developerReadme, /TRANSPORT_ERROR/);
   assert.ok(developerReadme.includes('space["import"]'));
   assert.match(developerReadme, /47833.*47836/s);
-  assert.match(wiki021, /@vontaq\/fs@0\.2\.1/);
-  assert.match(wiki021, /createFigmaMainHostAdapter/);
-  assert.match(wiki021, /requestTimeoutMs[\s\S]*omitted[\s\S]*do not receive an arbitrary wall-clock hard timeout/);
-  assert.match(wiki021, /## Русский/);
+  assert.match(developerReadme, /requestTimeoutMs[\s\S]*omitted[\s\S]*hard.*timeout/i);
   assert.match(changelog, /## \[0\.2\.1\]/);
   assert.match(changelog, /TRANSPORT_CANCELLED/);
   for (const internal of ['WINDOWS_SIGNING_MODE', 'TAURI_SIGNING_PRIVATE_KEY', 'production-release', 'GitHub Environment']) {

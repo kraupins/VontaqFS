@@ -11,7 +11,7 @@ async function sha256(url) {
   return createHash('sha256').update(await readFile(url)).digest('hex');
 }
 
-test('0.2.3 runtime/desktop and 0.2.3 SDK share protocol v1 with private registry schema v2', async () => {
+test('0.2.4 runtime/desktop and 0.2.4 SDK share protocol v1 with private registry schema v2', async () => {
   const packageJson = JSON.parse(await read('package.json'));
   const sdk = JSON.parse(await read('packages/sdk/package.json'));
   const desktop = JSON.parse(await read('apps/desktop/package.json'));
@@ -19,8 +19,8 @@ test('0.2.3 runtime/desktop and 0.2.3 SDK share protocol v1 with private registr
   const cargo = await read('Cargo.toml');
   const protocol = await read('crates/protocol/src/lib.rs');
   const storage = await read('crates/core/src/storage.rs');
-  assert.equal(packageJson.version, '0.2.3');
-  assert.equal(sdk.version, '0.2.3');
+  assert.equal(packageJson.version, '0.2.4');
+  assert.equal(sdk.version, '0.2.4');
   assert.equal(desktop.version, packageJson.version);
   assert.equal(tauri.version, packageJson.version);
   const workspacePackage = cargo.match(/\[workspace\.package\]([\s\S]*?)(?:\n\[|$)/)?.[1] ?? '';

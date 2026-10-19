@@ -32,9 +32,11 @@ The SDK `@vontaq/fs@0.2.3` discovers the Runtime-selected method; application de
 
 The production Runtime uses the official loopback endpoint pool `localhost:47833`–`localhost:47836`. Applications discover the active endpoint automatically; users should not need to configure a port manually.
 
-### Local data and uninstall
+### Local data, application removal and uninstall
 
-Normal VontaqFS storage is local. Revoking an application's access does not delete its stored data. Removing VontaqFS also does not intentionally erase user storage by default; destructive removal is a separate explicit action.
+Normal VontaqFS storage is local. Revoking a pairing removes access **without deleting stored data**. Uninstalling VontaqFS does not intentionally erase managed user data by default.
+
+**VontaqFS 0.2.4 source candidate (not yet published):** In Desktop → Applications, you can delete an individual managed storage space, or choose **Remove application completely** to permanently remove that application's VontaqFS-managed spaces, pairing records, grants and associated settings. Enter `DELETE` to confirm. Disconnect active sessions first; removal is refused while an application has active sessions or unresolved storage streams. This does **not** uninstall the external plugin/application or remove files previously exported to user-selected OS folders. These controls are not features of the published 0.2.3 release.
 
 ### Updates
 
@@ -83,9 +85,11 @@ SDK `@vontaq/fs@0.2.3` получает выбранный метод от Runti
 
 Production Runtime использует официальный loopback-пул `localhost:47833`–`localhost:47836`. Приложения автоматически находят активный endpoint; пользователю не нужно вручную выбирать порт.
 
-### Локальные данные и удаление приложения
+### Локальные данные, удаление приложения и деинсталляция
 
-Обычное хранилище VontaqFS является локальным. Отзыв доступа приложения не удаляет его данные. Удаление VontaqFS также по умолчанию не должно стирать пользовательское хранилище; разрушительное удаление данных выполняется только отдельным явным действием.
+VontaqFS хранит данные локально. Отзыв pairing прекращает доступ, **но не удаляет данные**. Деинсталляция самого VontaqFS также по умолчанию не предполагает удаления пользовательского хранилища.
+
+**Исходный кандидат VontaqFS 0.2.4 (ещё не опубликован):** в Desktop → Applications можно удалить отдельное управляемое хранилище или выбрать **«Полностью удалить приложение»** для удаления его хранилищ VontaqFS, сопряжений, разрешений на папки и связанных настроек. Для подтверждения вводится `DELETE`. Перед удалением отключите активные сессии; операция отклоняется при активных подключениях и незавершённых потоках хранения. Сам внешний плагин/приложение не деинсталлируется, а файлы, ранее экспортированные в выбранные папки ОС, не удаляются. В опубликованном релизе 0.2.3 этой функции нет.
 
 ### Обновления
 

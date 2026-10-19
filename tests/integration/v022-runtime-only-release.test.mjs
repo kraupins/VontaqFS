@@ -17,16 +17,16 @@ const spawn = (script, env) => spawnSync(process.execPath, [path.join(root, scri
   cwd: root, env: {...process.env, ...env}, encoding: 'utf8',
 });
 
-test('Runtime/Desktop and SDK 0.2.3 versions agree across package and lock', () => {
-  assert.equal(pkg.version, '0.2.3');
-  assert.equal(sdk.version, '0.2.3');
+test('Runtime/Desktop and SDK 0.2.4 versions agree across package and lock', () => {
+  assert.equal(pkg.version, '0.2.4');
+  assert.equal(sdk.version, '0.2.4');
   assert.equal(lock.packages[''].version, pkg.version);
   assert.equal(lock.packages['apps/desktop'].version, pkg.version);
   assert.equal(lock.packages['packages/sdk'].version, sdk.version);
   assert.equal(JSON.parse(read('apps/desktop/package.json')).version, pkg.version);
   assert.equal(JSON.parse(read('src-tauri/tauri.conf.json')).version, pkg.version);
   for (const crate of ['vontaqfs-core', 'vontaqfs-protocol', 'vontaqfs-runtime', 'vontaqfs-desktop']) {
-    assert.match(read('Cargo.lock'), new RegExp(`name = "${crate}"\\nversion = "0\\.2\\.3"`));
+    assert.match(read('Cargo.lock'), new RegExp(`name = "${crate}"\\nversion = "0\\.2\\.4"`));
   }
 });
 
@@ -51,17 +51,17 @@ test('npm publication is blocked in both PUBLISH_NPM branches for a runtime-only
 });
 
 test('matching SDK release still requires explicit npm opt-in and matching tag', () => {
-  const args = {runtimeVersion: '0.2.3', sdkVersion: '0.2.3', releaseTag: 'v0.2.3'};
+  const args = {runtimeVersion: '0.2.4', sdkVersion: '0.2.4', releaseTag: 'v0.2.4'};
   assert.equal(sdkPublishEligibility({...args, publishNpm: 'false'}).publish, false);
   assert.equal(sdkPublishEligibility({...args, publishNpm: 'true'}).publish, true);
   assert.throws(() => sdkPublishEligibility({...args, releaseTag: 'v0.2.2', publishNpm: 'true'}), /tag/);
 });
 
-test('release verify accepts v0.2.3 and rejects a mismatched old tag', () => {
+test('release verify accepts v0.2.4 and rejects a mismatched old tag', () => {
   const gate = path.join(root, 'scripts/release/verify-release.mjs');
-  const ok = spawnSync(process.execPath, [gate, '--tag', 'v0.2.3'], {cwd: root, encoding:'utf8'});
+  const ok = spawnSync(process.execPath, [gate, '--tag', 'v0.2.4'], {cwd: root, encoding:'utf8'});
   assert.equal(ok.status, 0, ok.stderr);
-  assert.equal(JSON.parse(ok.stdout).sdkVersion, '0.2.3');
+  assert.equal(JSON.parse(ok.stdout).sdkVersion, '0.2.4');
   const old = spawnSync(process.execPath, [gate, '--tag', 'v0.2.1'], {cwd: root, encoding:'utf8'});
   assert.notEqual(old.status, 0);
   assert.match(old.stderr, /does not match/);

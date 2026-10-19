@@ -217,6 +217,7 @@ export const desktopApi = {
   reconcileUsage: (spaceId: string) => invoke<LongOperation>('start_usage_reconcile', { spaceId }),
   clearCache: (spaceId: string) => invoke<LongOperation>('start_clear_cache_space', { spaceId }),
   deleteSpace: (spaceId: string) => invoke<LongOperation>('start_delete_space', { spaceId }),
+  deleteApplication: (applicationId: string) => invoke<LongOperation>('start_delete_application', { applicationId }),
   revealSpace: (spaceId: string) => invoke<void>('reveal_space', { spaceId }),
   operationStatus: (operationId: string) => invoke<LongOperation | null>('operation_status', { operationId }),
   cancelOperation: (operationId: string) => invoke<boolean>('cancel_operation', { operationId }),
