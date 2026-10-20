@@ -3,7 +3,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -23,6 +23,55 @@ use vontaqfs_runtime::{
     RuntimeHostServices, RuntimeLifecycleStatus, RuntimeServer, SetTransportPreference,
     SnapshotRecord, UpdaterConfiguration,
 };
+
+// Local, bounded lifecycle breadcrumbs. No storage contents, application names,
+// paths or credentials are written to the file. Windows release builds hide stderr.
+static DESKTOP_EVENT_LOG: OnceLock<PathBuf> = OnceLock::new();
+static REPORTED_DELETE_OPERATIONS: OnceLock<Mutex<std::collections::HashSet<String>>> =
+    OnceLock::new();
+static DESKTOP_EVENT_LOG_LOCK: Mutex<()> = Mutex::new(());
+
+fn trace_desktop_event(event: &str) {
+    let Some(path) = DESKTOP_EVENT_LOG.get() else {
+        return;
+    };
+    let Ok(_guard) = DESKTOP_EVENT_LOG_LOCK.lock() else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or_default();
+    if std::fs::metadata(path).is_ok_and(|meta| meta.len() > 1_048_576) {
+        let _ = std::fs::rename(path, path.with_extension("log.old"));
+    }
+    if let Ok(mut file) = OpenOptions::new().append(true).create(true).open(path) {
+        let _ = writeln!(file, "{now} pid={} {event}", std::process::id());
+        let _ = file.sync_data();
+    }
+}
+
+fn trace_delete_completion(snapshot: &LongOperationSnapshot) {
+    if snapshot.kind != "delete-space" && snapshot.kind != "delete-application" {
+        return;
+    }
+    let terminal = matches!(
+        snapshot.status,
+        vontaqfs_runtime::LongOperationStatus::Completed
+            | vontaqfs_runtime::LongOperationStatus::Failed
+            | vontaqfs_runtime::LongOperationStatus::Cancelled
+    );
+    if !terminal {
+        return;
+    }
+    let reported = REPORTED_DELETE_OPERATIONS.get_or_init(|| Mutex::new(Default::default()));
+    if let Ok(mut ids) = reported.lock() {
+        if ids.insert(snapshot.id.clone()) {
+            // Record only the operation kind and status, not user-controlled data.
+            trace_desktop_event(&format!("{} {:?}", snapshot.kind, snapshot.status));
+        }
+    }
+}
 
 const OPERATIONS_WINDOW_SHOW_DELAY_MS: i64 = 300;
 const OPERATIONS_WINDOW_POLL_MS: u64 = 150;
@@ -565,6 +614,7 @@ async fn quit_vontaqfs(
         .shutdown()
         .await
         .map_err(|error| error.to_string())?;
+    trace_desktop_event("explicit quit command");
     app.exit(0);
     Ok(())
 }
@@ -733,10 +783,14 @@ fn operation_status(
     runtime: tauri::State<'_, DesktopRuntime>,
     operation_id: String,
 ) -> Result<Option<LongOperationSnapshot>, String> {
-    runtime
+    let result = runtime
         .handle
         .operation_status(&operation_id)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if let Some(snapshot) = result.as_ref() {
+        trace_delete_completion(snapshot);
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -793,10 +847,17 @@ fn start_delete_application(
     runtime: tauri::State<'_, DesktopRuntime>,
     application_id: String,
 ) -> Result<LongOperationSnapshot, String> {
-    runtime
+    trace_desktop_event("delete-application requested");
+    let result = runtime
         .handle
         .start_delete_application(application_id)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string());
+    trace_desktop_event(if result.is_ok() {
+        "delete-application accepted"
+    } else {
+        "delete-application rejected"
+    });
+    result
 }
 
 #[tauri::command]
@@ -804,10 +865,17 @@ fn start_delete_space(
     runtime: tauri::State<'_, DesktopRuntime>,
     space_id: String,
 ) -> Result<LongOperationSnapshot, String> {
-    runtime
+    trace_desktop_event("delete-space requested");
+    let result = runtime
         .handle
         .start_delete_space(space_id)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string());
+    trace_desktop_event(if result.is_ok() {
+        "delete-space accepted"
+    } else {
+        "delete-space rejected"
+    });
+    result
 }
 
 #[tauri::command]
@@ -1122,14 +1190,22 @@ fn spawn_operations_attention(app: tauri::AppHandle, runtime: RuntimeHandle) {
                 break;
             }
             let rows = runtime.desktop_operations().unwrap_or_default();
-            let window_exists = app.get_webview_window("operations").is_some();
+            let operations_window = app.get_webview_window("operations");
             if rows.is_empty() {
-                if let Some(window) = app.get_webview_window("operations") {
-                    let _ = window.close();
+                if let Some(window) = operations_window {
+                    // Keep the WebView alive: destroying an auxiliary window as soon
+                    // as a deletion completes can destabilize Windows WebView2 and
+                    // can trigger Tauri's last-window exit policy in tray workflows.
+                    if window.is_visible().unwrap_or(false) {
+                        trace_desktop_event("operations window hidden (idle)");
+                        let _ = window.hide();
+                    }
                 }
-            } else if window_exists {
-                // Keep one shared window alive while visible operations (including the brief
-                // completion hold and undismissed failures) remain.
+            } else if operations_window
+                .as_ref()
+                .is_some_and(|window| window.is_visible().unwrap_or(false))
+            {
+                // An already visible operations window needs no intervention.
             } else {
                 let now = current_time_ms();
                 let should_show = rows.iter().any(|row| {
@@ -1166,7 +1242,11 @@ fn spawn_pairing_attention(app: tauri::AppHandle, runtime: RuntimeHandle) {
             if pending {
                 ensure_pairing_window(&app);
             } else if let Some(window) = app.get_webview_window("pairing") {
-                let _ = window.close();
+                // Pairing removal (including full application removal) must not
+                // destroy the WebView on the background attention thread.
+                if window.is_visible().unwrap_or(false) {
+                    let _ = window.hide();
+                }
             }
             if pending != had_pending || status != last_status {
                 refresh_tray(&app);
@@ -1420,6 +1500,7 @@ fn spawn_instance_activation_listener(app: tauri::AppHandle, data_dir: PathBuf) 
 }
 
 fn graceful_exit(app: tauri::AppHandle) {
+    trace_desktop_event("explicit tray quit requested");
     let runtime = app.state::<DesktopRuntime>().handle.clone();
     tauri::async_runtime::spawn(async move {
         let _ = runtime.shutdown().await;
@@ -1442,6 +1523,11 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
+            let diagnostics_dir = data_dir.join("diagnostics");
+            if std::fs::create_dir_all(&diagnostics_dir).is_ok() {
+                let _ = DESKTOP_EVENT_LOG.set(diagnostics_dir.join("desktop-events.log"));
+            }
+            trace_desktop_event("desktop started");
             let instance_lock =
                 acquire_desktop_instance_lock(&data_dir).map_err(std::io::Error::other)?;
             app.manage(instance_lock);
@@ -1481,6 +1567,7 @@ pub fn run() {
                 let window_to_hide = window.clone();
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        trace_desktop_event("main window close requested; hiding to tray");
                         api.prevent_close();
                         let _ = window_to_hide.hide();
                     }
@@ -1548,8 +1635,26 @@ pub fn run() {
             open_public_document,
             request_quit,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running VontaqFS desktop");
+        .build(tauri::generate_context!())
+        .expect("error while building VontaqFS desktop")
+        .run(|_app, event| match event {
+            tauri::RunEvent::ExitRequested {
+                code: None, api, ..
+            } => {
+                // Windows tray runtime must survive auxiliary window destruction.
+                // Do not change normal native quit behavior on other platforms.
+                // Explicit Quit uses app.exit(0) (code: Some).
+                if cfg!(target_os = "windows") {
+                    trace_desktop_event("unexpected window-driven exit prevented");
+                    api.prevent_exit();
+                }
+            }
+            tauri::RunEvent::ExitRequested { code: Some(_), .. } => {
+                trace_desktop_event("explicit process exit requested");
+            }
+            tauri::RunEvent::Exit => trace_desktop_event("desktop process exiting"),
+            _ => {}
+        });
 }
 
 #[cfg(target_os = "windows")]

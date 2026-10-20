@@ -2,10 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 const read = async (path) => readFile(new URL(path, import.meta.url),'utf8');
-const [storage,runtime,tauri,desktop,api] = await Promise.all([
+const [storage,runtime,tauri,desktop,api,desktopEntry] = await Promise.all([
   read('../../crates/core/src/storage.rs'),read('../../crates/runtime/src/lib.rs'),
   read('../../src-tauri/src/lib.rs'),read('../../apps/desktop/src/main.tsx'),
   read('../../apps/desktop/src/desktopApi.ts'),
+  read('../../src-tauri/src/main.rs'),
 ]);
 
 test('space deletion removes terminal durable stream journal before space row', () => {
@@ -44,4 +45,32 @@ test('UI differentiates space deletion and full app removal, requires DELETE for
   assert.match(desktop,/deletePhrase !== 'DELETE'/);
   assert.match(desktop,/External exported files and the installed plugin\/application are NOT removed/);
   assert.match(desktop,/next\.status === 'failed'[\s\S]*setActionError/);
+});
+
+test('deletion lifecycle keeps attention WebViews alive instead of closing them on empty work', () => {
+  const operations = tauri.slice(tauri.indexOf('fn spawn_operations_attention('), tauri.indexOf('fn spawn_pairing_attention('));
+  const pairing = tauri.slice(tauri.indexOf('fn spawn_pairing_attention('), tauri.indexOf('fn install_lifecycle_tray('));
+  assert.match(operations, /window\.hide\(\)/);
+  assert.doesNotMatch(operations, /window\.close\(\)/);
+  assert.match(operations, /window\.is_visible\(\)/);
+  assert.match(operations, /ensure_operations_window\(&app\)/);
+  assert.match(pairing, /window\.hide\(\)/);
+  assert.doesNotMatch(pairing, /window\.close\(\)/);
+  assert.match(tauri, /api\.prevent_close\(\)/);
+  assert.match(tauri, /RunEvent::ExitRequested \{ code: None, api/);
+  assert.match(tauri, /api\.prevent_exit\(\)/);
+  assert.match(tauri, /code: Some\(_\)/);
+});
+
+test('installed Windows builds record local panic and deletion stages without exposing IDs or paths', () => {
+  assert.match(desktopEntry, /APPDATA/);
+  assert.match(desktopEntry, /desktop-crash\.log/);
+  assert.match(desktopEntry, /Backtrace::force_capture/);
+  assert.match(tauri, /desktop-events\.log/);
+  assert.match(tauri, /DESKTOP_EVENT_LOG_LOCK/);
+  assert.match(tauri, /trace_delete_completion/);
+  assert.match(tauri, /trace_desktop_event\("delete-space requested"\)/);
+  assert.match(tauri, /trace_desktop_event\("delete-application requested"\)/);
+  assert.doesNotMatch(tauri, /trace_desktop_event\(&space_id/);
+  assert.doesNotMatch(tauri, /trace_desktop_event\(&application_id/);
 });

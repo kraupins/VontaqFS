@@ -2,7 +2,7 @@
 
 ## English
 
-VontaqFS is a local-first desktop storage runtime for applications and plugins built by independent developers, including supported Figma integrations. It keeps application data on your computer and provides controlled local storage, import/export, backup, snapshots, and application access management. **Current release: 0.2.4** (Runtime, Desktop and `@vontaq/fs` SDK).
+VontaqFS is a local-first desktop storage runtime for applications and plugins built by independent developers, including supported Figma integrations. It keeps application data on your computer and provides controlled local storage, import/export, backup, snapshots, and application access management. **Current release: 0.2.5** (Runtime/Desktop); public SDK remains `@vontaq/fs@0.2.4` (no npm republish).
 
 ### What VontaqFS does
 
@@ -19,7 +19,7 @@ VontaqFS does not bypass the security restrictions of a host application or oper
 
 ### PUT / POST transfer (0.2.3)
 
-VontaqFS 0.2.4 supports authorized binary PUT and POST stream uploads (introduced in 0.2.3). During pairing, an integration can declare PUT, POST, or both. In Desktop Settings → Data transfer, the local user selects **one supported and authorized method per connection**. Runtime enforces that choice for new streams; already-active streams keep their original method. Previously approved connections remain PUT-only until explicitly reauthorized for additional methods.
+VontaqFS 0.2.5 supports authorized binary PUT and POST stream uploads (introduced in 0.2.3). During pairing, an integration can declare PUT, POST, or both. In Desktop Settings → Data transfer, the local user selects **one supported and authorized method per connection**. Runtime enforces that choice for new streams; already-active streams keep their original method. Previously approved connections remain PUT-only until explicitly reauthorized for additional methods.
 
 The SDK `@vontaq/fs@0.2.4` discovers the Runtime-selected method; application developers do not need to implement method switching in ordinary Files API calls. There is no automatic PUT-to-POST fallback, no bypass of organization policies, and no transfer without the relevant pairing and space authorization. Internal registry schema v2 requires a compatible registry backup for downgrades; see [the changelog](CHANGELOG.md).
 
@@ -55,7 +55,7 @@ VontaqFS source may be used, copied, modified and redistributed under the Vontaq
 
 ## Русский
 
-VontaqFS — локальный desktop-runtime хранения данных для приложений и плагинов сторонних разработчиков, включая поддерживаемые интеграции Figma. Он хранит данные приложений на вашем компьютере и предоставляет управляемое локальное хранилище, импорт/экспорт, резервные копии, snapshots и управление доступом приложений. **Текущий релиз: 0.2.4** (Runtime, Desktop и SDK `@vontaq/fs`).
+VontaqFS — локальный desktop-runtime хранения данных для приложений и плагинов сторонних разработчиков, включая поддерживаемые интеграции Figma. Он хранит данные приложений на вашем компьютере и предоставляет управляемое локальное хранилище, импорт/экспорт, резервные копии, snapshots и управление доступом приложений. **Текущий релиз: 0.2.5** (Runtime/Desktop); публичный SDK остаётся `@vontaq/fs@0.2.4` (без повторной публикации в npm).
 
 ### Что делает VontaqFS
 
@@ -72,7 +72,7 @@ VontaqFS не обходит ограничения безопасности О�
 
 ### Передача PUT / POST (0.2.3)
 
-VontaqFS 0.2.4 поддерживает авторизованную потоковую запись бинарных данных методами PUT и POST (доступна начиная с 0.2.3). При сопряжении интеграция объявляет поддержку PUT, POST или обоих методов. В Desktop Settings → Передача данных пользователь выбирает **один разрешённый метод для каждого подключения**. Runtime применяет выбор к новым потокам, а активные потоки сохраняют свой метод. Ранее авторизованные подключения остаются PUT-only до явного повторного разрешения новых методов.
+VontaqFS 0.2.5 поддерживает авторизованную потоковую запись бинарных данных методами PUT и POST (доступна начиная с 0.2.3). При сопряжении интеграция объявляет поддержку PUT, POST или обоих методов. В Desktop Settings → Передача данных пользователь выбирает **один разрешённый метод для каждого подключения**. Runtime применяет выбор к новым потокам, а активные потоки сохраняют свой метод. Ранее авторизованные подключения остаются PUT-only до явного повторного разрешения новых методов.
 
 SDK `@vontaq/fs@0.2.4` получает выбранный метод от Runtime. Разработчику приложения не требуется вручную переключать HTTP-метод в обычном Files API. Автоматического fallback с PUT на POST, обхода корпоративных ограничений или передачи без необходимого разрешения нет. Для отката с внутренней SQLite registry schema v2 требуется резервная копия совместимой registry; подробнее в [CHANGELOG](CHANGELOG.md).
 

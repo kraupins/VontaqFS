@@ -2,7 +2,28 @@
 
 All notable public changes to VontaqFS are documented here.
 
-**Current release:** VontaqFS Runtime/Desktop `0.2.4` and public TypeScript SDK `@vontaq/fs@0.2.4`. The HTTP wire protocol remains v1 and the portable Storage Format remains v1. The private SQLite registry uses schema v2 (introduced in 0.2.3); a downgrade requires restoring a compatible registry backup.
+**Current release:** VontaqFS Runtime/Desktop `0.2.5` and public TypeScript SDK `@vontaq/fs@0.2.4` (SDK unchanged in this Desktop/Runtime-only patch). The HTTP wire protocol remains v1 and the portable Storage Format remains v1. The private SQLite registry uses schema v2 (introduced in 0.2.3); a downgrade requires restoring a compatible registry backup.
+
+## [0.2.5] - 2026-10-20
+
+### Added
+
+- Desktop: bounded local diagnostic logs for administrative operations and panic reporting, making unexpected Windows shutdowns diagnosable without changing the SDK or public protocol.
+
+### Changed
+
+- Desktop: auxiliary operation and pairing windows are hidden rather than destroyed during normal window lifecycle; explicit Quit remains available.
+- Runtime: synchronous Desktop administration entry points schedule background work on the captured Tokio executor rather than assuming the caller thread has an active Tokio reactor.
+
+### Fixed
+
+- Desktop: fixed a fatal `there is no reactor running` panic triggered by confirming managed storage or application deletion (also affecting other long-running administrative commands). Both deletion paths now run their background workers via the Runtime executor.
+- Desktop: avoid unintended application termination associated with auxiliary window cleanup in the Windows tray lifecycle.
+
+### Compatibility
+
+- **Runtime/Desktop-only patch:** public npm package `@vontaq/fs` stays at **0.2.4**, without republishing. The release workflow skips npm publish for `v0.2.5` even if npm publication is enabled.
+- HTTP protocol v1, portable Storage Format v1, SQLite registry schema v2, authorized PUT/POST transport selection, existing application data and pairing credentials remain compatible. No migration or API change is required.
 
 ## [0.2.4] - 2026-10-19
 

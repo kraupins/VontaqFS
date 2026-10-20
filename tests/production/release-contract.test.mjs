@@ -49,7 +49,7 @@ test('public documentation stays complete without historical handoff or internal
   assert.ok(changelog.includes(`## [${pkg.version}]`), `missing changelog entry for ${pkg.version}`);
   const currentVersion = pkg.version;
   assert.ok(clientReadme.includes(`Current release: ${currentVersion}`), 'client README must name current release');
-  assert.ok(developerReadme.includes(`@vontaq/fs@${currentVersion}`), 'developer guide must name current SDK version');
+  assert.ok(developerReadme.includes(`@vontaq/fs@${sdkPkg.version}`), 'developer guide must name published SDK version (which may differ for runtime-only releases)');
   assert.ok(changelog.includes(`## [${currentVersion}]`), 'release changelog must match package version');
   for (const [filename, body] of [['README.md', clientReadme], ['README_DEVELOPER.md', developerReadme], ['CHANGELOG.md', changelog]]) {
     assert.doesNotMatch(body, /0\.2\.4[^\n]*(?:unpublished|not yet published|неопубликован|не опубликован|source candidate|исходн[^\n]*кандидат)/i, `${filename} incorrectly marks current release unpublished`);

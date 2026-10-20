@@ -17,8 +17,8 @@ const spawn = (script, env) => spawnSync(process.execPath, [path.join(root, scri
   cwd: root, env: {...process.env, ...env}, encoding: 'utf8',
 });
 
-test('Runtime/Desktop and SDK 0.2.4 versions agree across package and lock', () => {
-  assert.equal(pkg.version, '0.2.4');
+test('Runtime/Desktop 0.2.5 and unchanged SDK 0.2.4 match package and lock metadata', () => {
+  assert.equal(pkg.version, '0.2.5');
   assert.equal(sdk.version, '0.2.4');
   assert.equal(lock.packages[''].version, pkg.version);
   assert.equal(lock.packages['apps/desktop'].version, pkg.version);
@@ -26,7 +26,7 @@ test('Runtime/Desktop and SDK 0.2.4 versions agree across package and lock', () 
   assert.equal(JSON.parse(read('apps/desktop/package.json')).version, pkg.version);
   assert.equal(JSON.parse(read('src-tauri/tauri.conf.json')).version, pkg.version);
   for (const crate of ['vontaqfs-core', 'vontaqfs-protocol', 'vontaqfs-runtime', 'vontaqfs-desktop']) {
-    assert.match(read('Cargo.lock'), new RegExp(`name = "${crate}"\\nversion = "0\\.2\\.4"`));
+    assert.match(read('Cargo.lock'), new RegExp(`name = "${crate}"\\nversion = "0\\.2\\.5"`));
   }
 });
 
@@ -50,6 +50,16 @@ test('npm publication is blocked in both PUBLISH_NPM branches for a runtime-only
   assert.match(publishSection, /steps\.sdk_release\.outputs\.publish == 'true' && steps\.npm_state\.outputs\.already_published != 'true'/);
 });
 
+test('current v0.2.5 Desktop/Runtime-only release never republishes SDK 0.2.4', () => {
+  for (const publishNpm of ['true', 'false']) {
+    const result = sdkPublishEligibility({
+      runtimeVersion: '0.2.5', sdkVersion: '0.2.4', releaseTag: 'v0.2.5', publishNpm,
+    });
+    assert.equal(result.publish, false);
+    assert.match(result.reason, /runtime-only/);
+  }
+});
+
 test('matching SDK release still requires explicit npm opt-in and matching tag', () => {
   const args = {runtimeVersion: '0.2.4', sdkVersion: '0.2.4', releaseTag: 'v0.2.4'};
   assert.equal(sdkPublishEligibility({...args, publishNpm: 'false'}).publish, false);
@@ -57,9 +67,9 @@ test('matching SDK release still requires explicit npm opt-in and matching tag',
   assert.throws(() => sdkPublishEligibility({...args, releaseTag: 'v0.2.2', publishNpm: 'true'}), /tag/);
 });
 
-test('release verify accepts v0.2.4 and rejects a mismatched old tag', () => {
+test('release verify accepts v0.2.5 and rejects a mismatched old tag', () => {
   const gate = path.join(root, 'scripts/release/verify-release.mjs');
-  const ok = spawnSync(process.execPath, [gate, '--tag', 'v0.2.4'], {cwd: root, encoding:'utf8'});
+  const ok = spawnSync(process.execPath, [gate, '--tag', 'v0.2.5'], {cwd: root, encoding:'utf8'});
   assert.equal(ok.status, 0, ok.stderr);
   assert.equal(JSON.parse(ok.stdout).sdkVersion, '0.2.4');
   const old = spawnSync(process.execPath, [gate, '--tag', 'v0.2.1'], {cwd: root, encoding:'utf8'});

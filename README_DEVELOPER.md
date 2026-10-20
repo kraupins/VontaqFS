@@ -2,11 +2,11 @@
 
 VontaqFS is a local-first desktop storage runtime. Applications connect through the public TypeScript package `@vontaq/fs`; filesystem paths, pairing credentials and runtime internals stay behind the SDK/runtime boundary.
 
-**Current release:** `@vontaq/fs@0.2.4` with VontaqFS Runtime/Desktop `0.2.4`. Version 0.2.3 adds authorized binary PUT/POST streaming and status-based recovery. Version 0.2.1 introduced the public Figma Plugin host adapter; earlier releases remain historical compatibility baselines for their existing API and data contracts.
+**Current release:** VontaqFS Runtime/Desktop `0.2.5` with unchanged public SDK `@vontaq/fs@0.2.4` (runtime-only patch; no npm republish). Version 0.2.3 adds authorized binary PUT/POST streaming and status-based recovery. Version 0.2.1 introduced the public Figma Plugin host adapter; earlier releases remain historical compatibility baselines for their existing API and data contracts.
 
 VontaqFS — локальный desktop-runtime хранения данных. Приложения подключаются через публичный TypeScript-пакет `@vontaq/fs`; физические пути файловой системы, pairing credentials и внутреннее устройство runtime не входят в обычный API клиента.
 
-**Текущий релиз:** `@vontaq/fs@0.2.4` с VontaqFS Runtime/Desktop `0.2.4`. Версия 0.2.3 добавляет авторизованный бинарный PUT/POST streaming и восстановление через статус операции. В 0.2.1 появился публичный адаптер для Figma Plugin; более ранние версии остаются историческими базами совместимости своих API и данных.
+**Текущий релиз:** VontaqFS Runtime/Desktop `0.2.5` с неизменённым публичным SDK `@vontaq/fs@0.2.4` (патч только Runtime/Desktop; без повторной публикации в npm). Версия 0.2.3 добавляет авторизованный бинарный PUT/POST streaming и восстановление через статус операции. В 0.2.1 появился публичный адаптер для Figma Plugin; более ранние версии остаются историческими базами совместимости своих API и данных.
 
 ---
 
@@ -1053,7 +1053,7 @@ await fs.close();
 - module format: ESM
 - package Node engine metadata: Node.js 18+
 - production runtime endpoint pool: `localhost:47833`–`localhost:47836`
-- current release: SDK/Runtime/Desktop `0.2.4`
+- current release: Runtime/Desktop `0.2.5`; SDK `@vontaq/fs@0.2.4` unchanged
 - recommended SDK for new integrations (including Figma plugins): `@vontaq/fs@0.2.4`
 - 0.1.x and 0.2.0: historical preview/integration releases; existing compatible data is preserved, but the stabilized public Figma Plugin host path starts at 0.2.1
 - protocol range in this release: v1

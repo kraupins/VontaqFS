@@ -968,6 +968,7 @@ impl RuntimeHandle {
         space_id: String,
         destination: PathBuf,
     ) -> Result<LongOperationSnapshot, RuntimeAdminError> {
+        let admin_executor = self.state.admin_executor()?;
         self.state
             .storage
             .get_space(&space_id)?
@@ -977,7 +978,7 @@ impl RuntimeHandle {
             .begin_operation("export-space", "preparing", true)?;
         let operation_id = snapshot.id.clone();
         let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
+        admin_executor.spawn(async move {
             state.update_operation(
                 &operation_id,
                 "exporting",
@@ -1033,6 +1034,7 @@ impl RuntimeHandle {
         space_id: String,
         destination: PathBuf,
     ) -> Result<LongOperationSnapshot, RuntimeAdminError> {
+        let admin_executor = self.state.admin_executor()?;
         self.state
             .storage
             .get_space(&space_id)?
@@ -1048,7 +1050,7 @@ impl RuntimeHandle {
         let operation_id = snapshot.id.clone();
         self.state.lock_space_exclusive(&space_id, &operation_id)?;
         let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
+        admin_executor.spawn(async move {
             let storage = Arc::clone(&state.storage);
             let op_for_progress = operation_id.clone();
             let state_for_progress = Arc::clone(&state);
@@ -1096,6 +1098,7 @@ impl RuntimeHandle {
         source: PathBuf,
         replace_existing: bool,
     ) -> Result<LongOperationSnapshot, RuntimeAdminError> {
+        let admin_executor = self.state.admin_executor()?;
         let maintenance_id = format!("restore-backup-{}", Uuid::new_v4());
         self.state.lock_global_maintenance(&maintenance_id)?;
         if self.active_session_count() != 0 {
@@ -1124,7 +1127,7 @@ impl RuntimeHandle {
             };
         let operation_id = snapshot.id.clone();
         let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
+        admin_executor.spawn(async move {
             let storage = Arc::clone(&state.storage);
             let op_for_progress = operation_id.clone();
             let state_for_progress = Arc::clone(&state);
@@ -1184,6 +1187,7 @@ impl RuntimeHandle {
         space_id: String,
         label: Option<String>,
     ) -> Result<LongOperationSnapshot, RuntimeAdminError> {
+        let admin_executor = self.state.admin_executor()?;
         self.state
             .storage
             .get_space(&space_id)?
@@ -1199,7 +1203,7 @@ impl RuntimeHandle {
         let operation_id = snapshot.id.clone();
         self.state.lock_space_exclusive(&space_id, &operation_id)?;
         let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
+        admin_executor.spawn(async move {
             let storage = Arc::clone(&state.storage);
             let op_for_progress = operation_id.clone();
             let state_for_progress = Arc::clone(&state);
@@ -1247,6 +1251,7 @@ impl RuntimeHandle {
         space_id: String,
         snapshot_id: String,
     ) -> Result<LongOperationSnapshot, RuntimeAdminError> {
+        let admin_executor = self.state.admin_executor()?;
         self.state
             .storage
             .get_snapshot(&space_id, &snapshot_id)?
@@ -1262,7 +1267,7 @@ impl RuntimeHandle {
         let operation_id = snapshot.id.clone();
         self.state.lock_space_exclusive(&space_id, &operation_id)?;
         let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
+        admin_executor.spawn(async move {
             let storage = Arc::clone(&state.storage);
             let op_for_progress = operation_id.clone();
             let state_for_progress = Arc::clone(&state);
@@ -1321,6 +1326,7 @@ impl RuntimeHandle {
         &self,
         space_id: String,
     ) -> Result<LongOperationSnapshot, RuntimeAdminError> {
+        let admin_executor = self.state.admin_executor()?;
         self.state
             .storage
             .get_space(&space_id)?
@@ -1334,7 +1340,7 @@ impl RuntimeHandle {
         let operation_id = snapshot.id.clone();
         self.state.lock_space_exclusive(&space_id, &operation_id)?;
         let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
+        admin_executor.spawn(async move {
             state.update_operation(
                 &operation_id,
                 "verify",
@@ -1401,6 +1407,7 @@ impl RuntimeHandle {
         &self,
         space_id: String,
     ) -> Result<LongOperationSnapshot, RuntimeAdminError> {
+        let admin_executor = self.state.admin_executor()?;
         self.state
             .storage
             .get_space(&space_id)?
@@ -1410,7 +1417,7 @@ impl RuntimeHandle {
             .begin_operation("reconcile-usage", "scanning", true)?;
         let operation_id = snapshot.id.clone();
         let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
+        admin_executor.spawn(async move {
             let storage = Arc::clone(&state.storage);
             let cancel_for_work = Arc::clone(&cancel);
             let result = tokio::task::spawn_blocking(move || {
@@ -1439,6 +1446,7 @@ impl RuntimeHandle {
         &self,
         space_id: String,
     ) -> Result<LongOperationSnapshot, RuntimeAdminError> {
+        let admin_executor = self.state.admin_executor()?;
         let space = self
             .state
             .storage
@@ -1460,7 +1468,7 @@ impl RuntimeHandle {
         let operation_id = snapshot.id.clone();
         self.state.lock_space_exclusive(&space_id, &operation_id)?;
         let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
+        admin_executor.spawn(async move {
             let storage = Arc::clone(&state.storage);
             let work_space_id = space_id.clone();
             let result =
@@ -1476,6 +1484,7 @@ impl RuntimeHandle {
         &self,
         space_id: String,
     ) -> Result<LongOperationSnapshot, RuntimeAdminError> {
+        let admin_executor = self.state.admin_executor()?;
         self.state
             .storage
             .get_space(&space_id)?
@@ -1499,7 +1508,7 @@ impl RuntimeHandle {
             ));
         }
         let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
+        admin_executor.spawn(async move {
             let storage = Arc::clone(&state.storage);
             let work_space_id = space_id.clone();
             let result =
@@ -1520,6 +1529,7 @@ impl RuntimeHandle {
         &self,
         application_id: String,
     ) -> Result<LongOperationSnapshot, RuntimeAdminError> {
+        let admin_executor = self.state.admin_executor()?;
         self.state.prune_ephemeral();
         self.state
             .storage
@@ -1652,7 +1662,7 @@ impl RuntimeHandle {
         }
         drop(deleting);
         let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
+        admin_executor.spawn(async move {
             let storage = Arc::clone(&state.storage);
             let work_id = application_id.clone();
             let outcome =
@@ -2070,6 +2080,8 @@ fn persist_selected_endpoint(root: &Path, port: u16) -> Result<(), RuntimeBindEr
 
 struct RuntimeState {
     storage: Arc<StorageEngine>,
+    // Captured at bind time; synchronous Tauri commands must never call tokio::spawn directly.
+    admin_executor: Option<tokio::runtime::Handle>,
     pending_pairings: Mutex<HashMap<String, PendingPairing>>,
     sessions: Mutex<HashMap<String, SessionState>>,
     revoked_sessions: Mutex<HashMap<String, i64>>,
@@ -2108,6 +2120,7 @@ impl RuntimeState {
     ) -> Self {
         Self {
             storage: Arc::new(storage),
+            admin_executor: tokio::runtime::Handle::try_current().ok(),
             pending_pairings: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             revoked_sessions: Mutex::new(HashMap::new()),
@@ -2138,6 +2151,12 @@ impl RuntimeState {
             endpoint_status,
             host_services,
         }
+    }
+
+    fn admin_executor(&self) -> Result<&tokio::runtime::Handle, RuntimeAdminError> {
+        self.admin_executor
+            .as_ref()
+            .ok_or_else(|| RuntimeAdminError::Internal("background runtime is unavailable".into()))
     }
 
     fn lifecycle_status(&self) -> RuntimeLifecycleStatus {
@@ -8414,6 +8433,79 @@ mod tests {
             },
             Arc::new(HeadlessHostServices),
         ))
+    }
+
+    #[test]
+    fn desktop_deletion_works_from_thread_without_entered_tokio_context() {
+        // Tauri invokes synchronous commands on a thread with no entered Tokio reactor.
+        // The executor captured when the RuntimeServer was bound must be used instead.
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let state = executor.block_on(async { test_state() });
+        assert!(state.admin_executor.is_some());
+        let application = state
+            .storage
+            .register_application(ApplicationKind::FigmaPlugin, "delete-test", "Delete Test")
+            .unwrap();
+        let storage = state
+            .storage
+            .open_space(&application.id, "temporary", StorageClass::Persistent, None)
+            .unwrap();
+        state
+            .storage
+            .write_file(&storage.id, "/content.txt", b"test", None, "write-test")
+            .unwrap();
+        let handle = RuntimeHandle {
+            state: Arc::clone(&state),
+        };
+
+        let caller = handle.clone();
+        let storage_id = storage.id.clone();
+        let deletion = std::thread::spawn(move || {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            caller.start_delete_space(storage_id).unwrap()
+        })
+        .join()
+        .unwrap();
+        wait_for_desktop_operation(&handle, &deletion.id);
+        assert!(state.storage.get_space(&storage.id).unwrap().is_none());
+
+        let caller = handle.clone();
+        let application_id = application.id.clone();
+        let deletion = std::thread::spawn(move || {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            caller.start_delete_application(application_id).unwrap()
+        })
+        .join()
+        .unwrap();
+        wait_for_desktop_operation(&handle, &deletion.id);
+        assert!(state
+            .storage
+            .get_application(&application.id)
+            .unwrap()
+            .is_none());
+    }
+
+    fn wait_for_desktop_operation(handle: &RuntimeHandle, operation_id: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let operation = handle.operation_status(operation_id).unwrap().unwrap();
+            match operation.status {
+                LongOperationStatus::Completed => return,
+                LongOperationStatus::Failed | LongOperationStatus::Cancelled => {
+                    panic!("desktop operation failed: {:?}", operation.error)
+                }
+                _ => {}
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "desktop operation timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     fn dummy_write_stream(pairing: &str, path: &str) -> WriteStreamState {
