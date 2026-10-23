@@ -4,26 +4,26 @@ All notable public changes to VontaqFS are documented here.
 
 ## [0.2.6] - 2026-10-22
 
-### Runtime and storage
+### Added
 
 - Registry v3 adds durable operation identity, retained result evidence and bounded capacity escrow for compound operations. HTTP wire protocol and portable storage format remain v1.
-- Startup recovery and receipt retention protect unresolved operations; event delivery, shutdown draining and storage repair use stronger concurrency boundaries.
-- Production `durableReplay` remains disabled; callers must negotiate the capability and reconcile uncertain outcomes explicitly.
 
-### Desktop
+### Changed
 
 - Lifecycle, pairing and directory-grant administration, per-space recovery, diagnostics and updater concurrency handling have been strengthened.
 - User data deletion, access revocation and saved export permissions remain separate operations.
-
-### TypeScript SDK 0.2.5
-
-- Streaming JSON encoding, bounded tree writes, explicit resume/status helpers and host-neutral transport contracts are reflected in the public documentation.
+- Streaming JSON encoding, bounded tree writes, explicit resume/status helpers and host-neutral transport contracts are reflected in the public documentation for TypeScript SDK 0.2.5.
 - The optional Figma host adapter remains a separate SDK entry point; VontaqFS storage is not tied to any single host application.
+
+### Fixed
+
+- Startup recovery and receipt retention protect unresolved operations; event delivery, shutdown draining and storage repair use stronger concurrency boundaries.
 
 ### Compatibility
 
 - Public protocol v1 and portable storage format v1 are retained.
 - Private Registry v3 requires a compatible backup for downgrades to older Runtime versions that do not understand its recovery/escrow records.
+- Production `durableReplay` remains disabled; callers must negotiate the capability and reconcile uncertain outcomes explicitly.
 
 ## [0.2.5] - 2026-10-20
 
