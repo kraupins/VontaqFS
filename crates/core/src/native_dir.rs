@@ -276,7 +276,7 @@ mod imp {
             };
             let marker = CString::new("target").map_err(|_| invalid())?;
             let item = CString::new("item").map_err(|_| invalid())?;
-            let mut marker_file = opened(unsafe {
+            let marker_file = opened(unsafe {
                 libc::openat(
                     quarantine.as_raw_fd(),
                     marker.as_ptr(),
@@ -462,8 +462,8 @@ mod imp {
             // Errors and changes both require restoring the quarantined file.
             // linkat cannot overwrite a different file created at the old path;
             // in that case the quarantine survives as recovery evidence.
-            if !matches!(&confirmed, Ok(true)) {
-                if unsafe {
+            if !matches!(&confirmed, Ok(true))
+                && unsafe {
                     libc::linkat(
                         quarantine_dir.as_raw_fd(),
                         item.as_ptr(),
@@ -472,12 +472,11 @@ mod imp {
                         0,
                     )
                 } < 0
-                {
-                    return Err(StorageError::StorageUnavailable(format!(
-                        "tracked prune changed during verification; retained recovery file in {}",
-                        folder.to_string_lossy()
-                    )));
-                }
+            {
+                return Err(StorageError::StorageUnavailable(format!(
+                    "tracked prune changed during verification; retained recovery file in {}",
+                    folder.to_string_lossy()
+                )));
             }
             if unsafe { libc::unlinkat(quarantine_dir.as_raw_fd(), item.as_ptr(), 0) } < 0 {
                 return Err(io::Error::last_os_error().into());
@@ -713,7 +712,7 @@ pub(crate) fn read_small(
 mod tests {
     use super::*;
     use sha2::Digest;
-    use std::{fs, io::Read, os::unix::fs::symlink, path::PathBuf};
+    use std::{fs, os::unix::fs::symlink, path::PathBuf};
 
     fn sandbox(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

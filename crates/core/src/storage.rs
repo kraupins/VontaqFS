@@ -17387,7 +17387,7 @@ mod tests {
                 "g7-copy-plan",
                 &fingerprint,
                 "fs-copy:/src:/dst:false",
-                &[fp.clone()],
+                std::slice::from_ref(&fp),
             )
             .unwrap();
         {
