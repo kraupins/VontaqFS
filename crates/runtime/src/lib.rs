@@ -11459,7 +11459,9 @@ mod tests {
             .application_long_job(&app.id, &snapshot.id)
             .unwrap()
             .unwrap();
-        assert_eq!(phase, "CANCEL_REQUESTED");
+        // Registry v3 keeps the nonterminal RUNNING phase while persisting
+        // cancellation intent as durable evidence for restart reconciliation.
+        assert_eq!(phase, "RUNNING");
         assert!(proof.unwrap().get("_cancelRequestedAtMs").is_some());
         state.cancelled_operation(&snapshot.id);
         // A native-export worker can have applied external writes: cancellation

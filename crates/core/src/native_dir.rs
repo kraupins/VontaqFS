@@ -85,12 +85,15 @@ mod imp {
             Err(error.into())
         }
     }
-    fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    fn same_inode_contents(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
         left.dev() == right.dev()
             && left.ino() == right.ino()
             && left.len() == right.len()
             && left.mtime() == right.mtime()
             && left.mtime_nsec() == right.mtime_nsec()
+    }
+    fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+        same_inode_contents(left, right)
             && left.ctime() == right.ctime()
             && left.ctime_nsec() == right.ctime_nsec()
     }
@@ -442,7 +445,10 @@ mod imp {
                     )
                 })?;
                 let meta = file.metadata()?;
-                if !meta.is_file() || !same_file(&original_metadata, &meta) {
+                // Moving the verified inode into quarantine legitimately changes
+                // ctime on macOS/Linux; compare identity and content metadata
+                // across the move, then require stable ctime during hashing.
+                if !meta.is_file() || !same_inode_contents(&original_metadata, &meta) {
                     return Ok(false);
                 }
                 let mut reader = file;
@@ -456,7 +462,7 @@ mod imp {
                 }
                 Ok(
                     format!("{:x}", hash.finalize()) == expected_sha256.to_ascii_lowercase()
-                        && same_file(&original_metadata, &reader.metadata()?),
+                        && same_file(&meta, &reader.metadata()?),
                 )
             })();
             // Errors and changes both require restoring the quarantined file.
@@ -718,10 +724,10 @@ mod tests {
         // macOS temp_dir() commonly starts with /var, a symlink to /private/var.
         // Keep production O_NOFOLLOW unchanged: create test roots under the
         // resolved physical directory instead of traversing that symlink.
-        let path = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("vontaq-native-dir-{label}-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "vontaq-native-dir-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
         fs::create_dir(&path).unwrap();
         path
     }

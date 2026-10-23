@@ -396,12 +396,12 @@ fn delete_handle(file: &File) -> StorageResult<()> {
 }
 fn dir_sync(dir: &File) -> StorageResult<()> {
     // NTFS journals atomic namespace changes. Directory FlushFileBuffers is
-    // not implemented on many Windows builds (ERROR_INVALID_FUNCTION / 50 /
-    // ERROR_INVALID_PARAMETER); the file is flushed before publication.
-    // This is not an OS power-loss durability certification.
+    // not implemented on many Windows builds. Read/traverse directory handles
+    // can also return ERROR_ACCESS_DENIED (5) even though the file was synced
+    // before publication. This is not an OS power-loss durability certification.
     match flush(dir) {
         Ok(()) => Ok(()),
-        Err(StorageError::Io(e)) if matches!(e.raw_os_error(), Some(1 | 50 | 87)) => Ok(()),
+        Err(StorageError::Io(e)) if matches!(e.raw_os_error(), Some(1 | 5 | 50 | 87)) => Ok(()),
         Err(e) => Err(e),
     }
 }

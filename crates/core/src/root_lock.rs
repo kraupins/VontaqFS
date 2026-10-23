@@ -47,7 +47,9 @@ impl StorageRootLock {
             );
         }
         let file = options.open(&path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::PermissionDenied {
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                || (cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33)))
+            {
                 StorageError::StorageRootBusy
             } else {
                 error.into()
