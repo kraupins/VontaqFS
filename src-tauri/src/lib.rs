@@ -171,11 +171,23 @@ impl RuntimeHostServices for TauriHostServices {
 
 struct DesktopInstanceLock {
     path: PathBuf,
+    owner: DesktopInstanceLockRecord,
 }
 
 impl Drop for DesktopInstanceLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Desktop's advisory UI singleton must not unlink another process's
+        // replacement after a crash/restart race. Core's independent OS-held
+        // storage-root.lock is the authoritative storage ownership fence.
+        let same_owner = std::fs::read(&self.path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<DesktopInstanceLockRecord>(&bytes).ok())
+            .is_some_and(|record| {
+                record.pid == self.owner.pid && record.executable == self.owner.executable
+            });
+        if same_owner {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -186,7 +198,7 @@ struct DesktopInstanceLockRecord {
     executable: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum DesktopUpdaterPhase {
     NotChecked,
@@ -231,17 +243,67 @@ struct PendingDesktopUpdate {
     downloaded: Option<Vec<u8>>,
 }
 
+// Status, pending artifact and async operation generation must change under
+// one mutex. Individual mutexes allow a stale Check/Download to overwrite a
+// newer pending update even when each field is individually protected.
 struct DesktopUpdater {
-    status: Mutex<DesktopUpdaterStatus>,
-    pending: Mutex<Option<PendingDesktopUpdate>>,
+    inner: Mutex<DesktopUpdaterState>,
+}
+
+struct DesktopUpdaterState {
+    generation: u64,
+    status: DesktopUpdaterStatus,
+    pending: Option<PendingDesktopUpdate>,
 }
 
 impl Default for DesktopUpdater {
     fn default() -> Self {
         Self {
-            status: Mutex::new(DesktopUpdaterStatus::default()),
-            pending: Mutex::new(None),
+            inner: Mutex::new(DesktopUpdaterState {
+                generation: 0,
+                status: DesktopUpdaterStatus::default(),
+                pending: None,
+            }),
         }
+    }
+}
+
+impl DesktopUpdater {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, DesktopUpdaterState>, String> {
+        self.inner
+            .lock()
+            .map_err(|_| "updater state mutex poisoned".to_string())
+    }
+
+    fn begin_check(&self) -> Result<u64, String> {
+        let mut state = self.lock()?;
+        if matches!(state.status.phase, DesktopUpdaterPhase::Installing) {
+            return Err("UPDATE_BUSY: installation in progress".into());
+        }
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "updater generation exhausted".to_string())?;
+        state.pending = None;
+        state.status.phase = DesktopUpdaterPhase::Checking;
+        state.status.available_version = None;
+        state.status.notes = None;
+        state.status.downloaded_bytes = None;
+        state.status.download_total_bytes = None;
+        state.status.error = None;
+        Ok(state.generation)
+    }
+
+    fn commit<F>(&self, generation: u64, change: F) -> Result<DesktopUpdaterStatus, String>
+    where
+        F: FnOnce(&mut DesktopUpdaterState),
+    {
+        let mut state = self.lock()?;
+        if state.generation != generation {
+            return Err("UPDATE_SUPERSEDED: a newer updater action owns the state".into());
+        }
+        change(&mut state);
+        Ok(state.status.clone())
     }
 }
 
@@ -428,11 +490,7 @@ fn updater_configuration(
 fn updater_status(
     updater: tauri::State<'_, DesktopUpdater>,
 ) -> Result<DesktopUpdaterStatus, String> {
-    updater
-        .status
-        .lock()
-        .map(|status| status.clone())
-        .map_err(|_| "updater status mutex poisoned".to_string())
+    Ok(updater.lock()?.status.clone())
 }
 
 #[tauri::command]
@@ -448,74 +506,79 @@ async fn check_for_updates(
 async fn download_update(
     updater: tauri::State<'_, DesktopUpdater>,
 ) -> Result<DesktopUpdaterStatus, String> {
-    let mut pending = updater
-        .pending
-        .lock()
-        .map_err(|_| "updater pending mutex poisoned".to_string())?
-        .take()
-        .ok_or_else(|| "NO_PENDING_UPDATE: run Check now before downloading".to_string())?;
-
-    if let Some(bytes) = pending.downloaded.take() {
-        let size = bytes.len() as u64;
-        pending.downloaded = Some(bytes);
-        *updater
+    let (generation, mut pending) = {
+        let mut state = updater.lock()?;
+        if !matches!(
+            state.status.phase,
+            DesktopUpdaterPhase::Available
+                | DesktopUpdaterPhase::Downloaded
+                | DesktopUpdaterPhase::Error
+        ) {
+            return Err("UPDATE_BUSY: check for an update before downloading".into());
+        }
+        let pending = state
             .pending
-            .lock()
-            .map_err(|_| "updater pending mutex poisoned".to_string())? = Some(pending);
-        return set_updater_status(&updater, |status| {
-            status.phase = DesktopUpdaterPhase::Downloaded;
-            status.downloaded_bytes = Some(size);
-            status.download_total_bytes = Some(size);
-            status.error = None;
+            .take()
+            .ok_or_else(|| "NO_PENDING_UPDATE: run Check now before downloading".to_string())?;
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "updater generation exhausted".to_string())?;
+        let generation = state.generation;
+        state.status.phase = DesktopUpdaterPhase::Downloading;
+        state.status.error = None;
+        state.status.downloaded_bytes = Some(0);
+        state.status.download_total_bytes = None;
+        (generation, pending)
+    };
+
+    if let Some(bytes) = pending.downloaded.as_ref() {
+        let size = bytes.len() as u64;
+        return updater.commit(generation, |state| {
+            state.pending = Some(pending);
+            state.status.phase = DesktopUpdaterPhase::Downloaded;
+            state.status.downloaded_bytes = Some(size);
+            state.status.download_total_bytes = Some(size);
         });
     }
 
-    set_updater_status(&updater, |status| {
-        status.phase = DesktopUpdaterPhase::Downloading;
-        status.error = None;
-        status.downloaded_bytes = Some(0);
-        status.download_total_bytes = None;
-    })?;
-
     let mut downloaded = 0u64;
-    match pending
+    let result = pending
         .update
         .download(
             |chunk_length, content_length| {
                 downloaded = downloaded.saturating_add(chunk_length as u64);
-                if let Ok(mut status) = updater.status.lock() {
-                    status.downloaded_bytes = Some(downloaded);
-                    status.download_total_bytes = content_length;
+                if let Ok(mut state) = updater.lock() {
+                    if state.generation == generation
+                        && matches!(state.status.phase, DesktopUpdaterPhase::Downloading)
+                    {
+                        state.status.downloaded_bytes = Some(downloaded);
+                        state.status.download_total_bytes = content_length;
+                    }
                 }
             },
             || {},
         )
-        .await
-    {
+        .await;
+    match result {
         Ok(bytes) => {
             let size = bytes.len() as u64;
             pending.downloaded = Some(bytes);
-            *updater
-                .pending
-                .lock()
-                .map_err(|_| "updater pending mutex poisoned".to_string())? = Some(pending);
-            set_updater_status(&updater, |status| {
-                status.phase = DesktopUpdaterPhase::Downloaded;
-                status.downloaded_bytes = Some(size);
-                status.download_total_bytes = Some(size);
-                status.error = None;
+            updater.commit(generation, |state| {
+                state.pending = Some(pending);
+                state.status.phase = DesktopUpdaterPhase::Downloaded;
+                state.status.downloaded_bytes = Some(size);
+                state.status.download_total_bytes = Some(size);
+                state.status.error = None;
             })
         }
         Err(error) => {
-            *updater
-                .pending
-                .lock()
-                .map_err(|_| "updater pending mutex poisoned".to_string())? = Some(pending);
             let message = format!("update download failed: {error}");
-            let _ = set_updater_status(&updater, |status| {
-                status.phase = DesktopUpdaterPhase::Error;
-                status.error = Some(message.clone());
-            });
+            updater.commit(generation, |state| {
+                state.pending = Some(pending);
+                state.status.phase = DesktopUpdaterPhase::Error;
+                state.status.error = Some(message.clone());
+            })?;
             Err(message)
         }
     }
@@ -527,53 +590,53 @@ async fn install_update_and_restart(
     runtime: tauri::State<'_, DesktopRuntime>,
     updater: tauri::State<'_, DesktopUpdater>,
 ) -> Result<(), String> {
-    let pending = updater
-        .pending
-        .lock()
-        .map_err(|_| "updater pending mutex poisoned".to_string())?
-        .take()
-        .ok_or_else(|| "NO_PENDING_UPDATE: download an update before installing".to_string())?;
-    if pending.downloaded.is_none() {
-        *updater
+    let (generation, pending) = {
+        let mut state = updater.lock()?;
+        if !matches!(state.status.phase, DesktopUpdaterPhase::Downloaded) {
+            return Err(
+                "UPDATE_NOT_DOWNLOADED: download the verified update before installing".into(),
+            );
+        }
+        let pending = state
             .pending
-            .lock()
-            .map_err(|_| "updater pending mutex poisoned".to_string())? = Some(pending);
-        return Err("UPDATE_NOT_DOWNLOADED: download the verified update before installing".into());
-    }
-
-    set_updater_status(&updater, |status| {
-        status.phase = DesktopUpdaterPhase::Installing;
-        status.error = None;
-    })?;
+            .take()
+            .ok_or_else(|| "NO_PENDING_UPDATE: download an update before installing".to_string())?;
+        if pending.downloaded.is_none() {
+            state.pending = Some(pending);
+            return Err(
+                "UPDATE_NOT_DOWNLOADED: download the verified update before installing".into(),
+            );
+        }
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "updater generation exhausted".to_string())?;
+        state.status.phase = DesktopUpdaterPhase::Installing;
+        state.status.error = None;
+        (state.generation, pending)
+    };
     if let Err(error) = runtime.handle.shutdown().await {
-        *updater
-            .pending
-            .lock()
-            .map_err(|_| "updater pending mutex poisoned".to_string())? = Some(pending);
         let message = format!("runtime drain before update failed: {error}");
-        let _ = set_updater_status(&updater, |status| {
-            status.phase = DesktopUpdaterPhase::Error;
-            status.error = Some(message.clone());
-        });
+        updater.commit(generation, |state| {
+            state.pending = Some(pending);
+            state.status.phase = DesktopUpdaterPhase::Error;
+            state.status.error = Some(message.clone());
+        })?;
         return Err(message);
     }
-
     let bytes = pending
         .downloaded
         .as_ref()
         .expect("downloaded update was checked above");
     if let Err(error) = pending.update.install(bytes) {
         let message = format!("update installation failed after runtime drain: {error}");
-        let _ = set_updater_status(&updater, |status| {
-            status.phase = DesktopUpdaterPhase::Error;
-            status.error = Some(message.clone());
-        });
-        // Runtime has already drained. Restart the existing app rather than leaving
-        // a half-alive Desktop process after an installer failure.
+        updater.commit(generation, |state| {
+            state.status.phase = DesktopUpdaterPhase::Error;
+            state.status.error = Some(message.clone());
+        })?;
         eprintln!("{message}");
         app.restart();
     }
-
     #[cfg(not(target_os = "windows"))]
     {
         app.restart();
@@ -981,116 +1044,96 @@ fn configured_update_public_key() -> Option<String> {
         })
 }
 
-fn set_updater_status<F>(
-    updater: &DesktopUpdater,
-    update: F,
-) -> Result<DesktopUpdaterStatus, String>
-where
-    F: FnOnce(&mut DesktopUpdaterStatus),
-{
-    let mut status = updater
-        .status
-        .lock()
-        .map_err(|_| "updater status mutex poisoned".to_string())?;
-    update(&mut status);
-    Ok(status.clone())
-}
-
 async fn perform_update_check(
     app: &tauri::AppHandle,
     runtime: &RuntimeHandle,
     updater: &DesktopUpdater,
 ) -> Result<DesktopUpdaterStatus, String> {
-    let configuration = runtime
-        .updater_configuration()
-        .map_err(|error| error.to_string())?;
-    if !configuration.release_transport_ready {
-        if let Ok(mut pending) = updater.pending.lock() {
-            *pending = None;
+    // Begin before constructing the network request. Every late result is
+    // accepted only by its own generation; a newer Check supersedes Download.
+    let generation = updater.begin_check()?;
+    let configuration = (|| -> Result<(_, _, _), String> {
+        let configuration = runtime
+            .updater_configuration()
+            .map_err(|error| error.to_string())?;
+        if !configuration.release_transport_ready {
+            return Ok((false, None, None));
         }
-        return set_updater_status(updater, |status| {
-            status.phase = DesktopUpdaterPhase::NotConfigured;
-            status.available_version = None;
-            status.notes = None;
-            status.downloaded_bytes = None;
-            status.download_total_bytes = None;
-            status.error = Some("Signed updater transport is not configured for this build".into());
+        let endpoint = configuration
+            .endpoint
+            .ok_or_else(|| "UPDATER_NOT_CONFIGURED: missing HTTPS endpoint".to_string())?;
+        let endpoint = endpoint
+            .parse()
+            .map_err(|error| format!("invalid updater endpoint: {error}"))?;
+        let public_key = configured_update_public_key()
+            .ok_or_else(|| "UPDATER_NOT_CONFIGURED: missing updater public key".to_string())?;
+        Ok((true, Some(endpoint), Some(public_key)))
+    })();
+    let (ready, endpoint, public_key) = match configuration {
+        Ok(fields) => fields,
+        Err(message) => {
+            updater.commit(generation, |state| {
+                state.status.phase = DesktopUpdaterPhase::Error;
+                state.status.error = Some(message.clone());
+            })?;
+            return Err(message);
+        }
+    };
+    if !ready {
+        return updater.commit(generation, |state| {
+            state.pending = None;
+            state.status.phase = DesktopUpdaterPhase::NotConfigured;
+            state.status.error =
+                Some("Signed updater transport is not configured for this build".into());
         });
     }
-
-    let endpoint = configuration
-        .endpoint
-        .ok_or_else(|| "UPDATER_NOT_CONFIGURED: missing HTTPS endpoint".to_string())?;
-    let endpoint = endpoint
-        .parse()
-        .map_err(|error| format!("invalid updater endpoint: {error}"))?;
-    let public_key = configured_update_public_key()
-        .ok_or_else(|| "UPDATER_NOT_CONFIGURED: missing updater public key".to_string())?;
-    set_updater_status(updater, |status| {
-        status.phase = DesktopUpdaterPhase::Checking;
-        status.error = None;
-    })?;
-
-    let check = app
-        .updater_builder()
-        .endpoints(vec![endpoint])
-        .map_err(|error| error.to_string())?
-        .pubkey(public_key)
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|error| error.to_string())?
-        .check()
-        .await;
-
+    let endpoint = endpoint.expect("configured endpoint is present");
+    let public_key = public_key.expect("configured updater public key is present");
+    let check = async {
+        let client = app
+            .updater_builder()
+            .endpoints(vec![endpoint])?
+            .pubkey(public_key)
+            .timeout(Duration::from_secs(30))
+            .build()?;
+        client.check().await
+    }
+    .await;
     match check {
         Ok(Some(update)) => {
-            // Keep restart behavior explicit for Windows updater installs. Tauri defaults to
-            // restarting after install, but making it part of our contract prevents future
-            // config/version changes from silently turning a successful install into an exit.
             let update = update.restart_after_install(true);
-            let status = DesktopUpdaterStatus {
-                phase: DesktopUpdaterPhase::Available,
-                current_version: update.current_version.clone(),
-                available_version: Some(update.version.clone()),
-                notes: update.body.clone(),
-                downloaded_bytes: None,
-                download_total_bytes: None,
-                error: None,
-            };
-            *updater
-                .pending
-                .lock()
-                .map_err(|_| "updater pending mutex poisoned".to_string())? =
-                Some(PendingDesktopUpdate {
+            updater.commit(generation, |state| {
+                state.status = DesktopUpdaterStatus {
+                    phase: DesktopUpdaterPhase::Available,
+                    current_version: update.current_version.clone(),
+                    available_version: Some(update.version.clone()),
+                    notes: update.body.clone(),
+                    downloaded_bytes: None,
+                    download_total_bytes: None,
+                    error: None,
+                };
+                state.pending = Some(PendingDesktopUpdate {
                     update,
                     downloaded: None,
                 });
-            *updater
-                .status
-                .lock()
-                .map_err(|_| "updater status mutex poisoned".to_string())? = status.clone();
-            Ok(status)
-        }
-        Ok(None) => {
-            *updater
-                .pending
-                .lock()
-                .map_err(|_| "updater pending mutex poisoned".to_string())? = None;
-            set_updater_status(updater, |status| {
-                status.phase = DesktopUpdaterPhase::UpToDate;
-                status.available_version = None;
-                status.notes = None;
-                status.downloaded_bytes = None;
-                status.download_total_bytes = None;
-                status.error = None;
             })
         }
+        Ok(None) => updater.commit(generation, |state| {
+            state.pending = None;
+            state.status.phase = DesktopUpdaterPhase::UpToDate;
+            state.status.available_version = None;
+            state.status.notes = None;
+            state.status.downloaded_bytes = None;
+            state.status.download_total_bytes = None;
+            state.status.error = None;
+        }),
         Err(error) => {
             let message = format!("update check failed: {error}");
-            let _ = set_updater_status(updater, |status| {
-                status.phase = DesktopUpdaterPhase::Error;
-                status.error = Some(message.clone());
-            });
+            updater.commit(generation, |state| {
+                state.pending = None;
+                state.status.phase = DesktopUpdaterPhase::Error;
+                state.status.error = Some(message.clone());
+            })?;
             Err(message)
         }
     }
@@ -1403,7 +1446,10 @@ fn acquire_desktop_instance_lock(data_dir: &Path) -> Result<DesktopInstanceLock,
                     .map_err(|error| error.to_string())?;
                 file.write_all(b"\n").map_err(|error| error.to_string())?;
                 file.sync_all().map_err(|error| error.to_string())?;
-                return Ok(DesktopInstanceLock { path });
+                return Ok(DesktopInstanceLock {
+                    path,
+                    owner: record,
+                });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let existing = std::fs::read(&path).ok().and_then(|value| {
@@ -1503,8 +1549,16 @@ fn graceful_exit(app: tauri::AppHandle) {
     trace_desktop_event("explicit tray quit requested");
     let runtime = app.state::<DesktopRuntime>().handle.clone();
     tauri::async_runtime::spawn(async move {
-        let _ = runtime.shutdown().await;
-        app.exit(0);
+        match runtime.shutdown().await {
+            Ok(()) => app.exit(0),
+            Err(error) => {
+                // No five-second forced exit: owned workers may still be
+                // committing durable outcomes and Core keeps its root lock.
+                trace_desktop_event("explicit quit blocked by active runtime drain");
+                let _ = app.emit("vontaqfs-runtime-shutdown-error", error.to_string());
+                show_main_window(&app);
+            }
+        }
     });
 }
 
@@ -1721,4 +1775,50 @@ fn xml_escape(value: &str) -> String {
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn configure_os_autostart(_enabled: bool) -> Result<(), String> {
     Err("launch on login is supported only on Windows and macOS in VontaqFS v1".into())
+}
+
+#[cfg(test)]
+mod cp19_updater_tests {
+    use super::*;
+
+    #[test]
+    fn stale_check_cannot_restore_older_updater_state() {
+        let updater = DesktopUpdater::default();
+        let first = updater.begin_check().unwrap();
+        let second = updater.begin_check().unwrap();
+        assert!(updater
+            .commit(first, |state| {
+                state.status.phase = DesktopUpdaterPhase::Available;
+            })
+            .is_err());
+        assert!(matches!(
+            updater.lock().unwrap().status.phase,
+            DesktopUpdaterPhase::Checking
+        ));
+        updater
+            .commit(second, |state| {
+                state.status.phase = DesktopUpdaterPhase::UpToDate;
+            })
+            .unwrap();
+        assert!(matches!(
+            updater.lock().unwrap().status.phase,
+            DesktopUpdaterPhase::UpToDate
+        ));
+    }
+
+    #[test]
+    fn installation_does_not_allow_another_check_to_erase_pending() {
+        let updater = DesktopUpdater::default();
+        let generation = updater.begin_check().unwrap();
+        updater
+            .commit(generation, |state| {
+                state.status.phase = DesktopUpdaterPhase::Installing;
+            })
+            .unwrap();
+        assert!(updater.begin_check().is_err());
+        assert!(matches!(
+            updater.lock().unwrap().status.phase,
+            DesktopUpdaterPhase::Installing
+        ));
+    }
 }

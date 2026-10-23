@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -248,6 +248,12 @@ function App() {
   const [pending, setPending] = useState<PendingPairing[]>([]);
   const [preferences, setPreferences] = useState<DesktopPreferences | null>(null);
   const [updater, setUpdater] = useState<UpdaterStatus | null>(null);
+  // Reject out-of-order periodic poll results after a newer update action.
+  const updaterEpoch = useRef(0);
+  const applyUpdaterAction = (status: UpdaterStatus) => {
+    updaterEpoch.current += 1;
+    setUpdater(status);
+  };
   const [diagnostics, setDiagnostics] = useState<DiagnosticsReport | null>(null);
   const [endpointStatus, setEndpointStatus] = useState<RuntimeEndpointStatus | null>(null);
   const [selectedAppId, setSelectedAppId] = useState<string | null>(null);
@@ -259,6 +265,7 @@ function App() {
   const [actionError, setActionError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
+    const requestEpoch = ++updaterEpoch.current;
     const [healthResult, endpointResult, appsResult, pendingResult, prefsResult, updaterResult] = await Promise.allSettled([
       desktopApi.runtimeStatus(), desktopApi.runtimeEndpointStatus(), desktopApi.applications(), desktopApi.pendingPairings(), desktopApi.preferences(), desktopApi.updaterStatus(),
     ]);
@@ -268,7 +275,7 @@ function App() {
     if (appsResult.status === 'fulfilled') setApps(appsResult.value);
     if (pendingResult.status === 'fulfilled') setPending(pendingResult.value);
     if (prefsResult.status === 'fulfilled') setPreferences(prefsResult.value);
-    if (updaterResult.status === 'fulfilled') setUpdater(updaterResult.value);
+    if (updaterResult.status === 'fulfilled' && requestEpoch === updaterEpoch.current) setUpdater(updaterResult.value);
   }, []);
 
   const loadDiagnostics = useCallback(async () => {
@@ -304,6 +311,15 @@ function App() {
   useEffect(() => {
     let dispose: (() => void) | undefined;
     void listen<number>('vontaqfs-confirm-quit', (event) => setConfirm({ kind: 'quit', sessions: event.payload })).then((fn) => { dispose = fn; });
+    return () => dispose?.();
+  }, []);
+
+  // CP18: failed drain must be visible rather than silently exiting with
+  // in-flight workers. Reuse the existing error banner without changing UX.
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    void listen<string>('vontaqfs-runtime-shutdown-error', (event) =>
+      setActionError(event.payload)).then((fn) => { dispose = fn; });
     return () => dispose?.();
   }, []);
 
@@ -469,7 +485,7 @@ function App() {
         {page === 'settings' && (
           <>
             <PageHeader title={tr('Settings', 'Настройки')} subtitle={tr('Runtime startup, updates and local diagnostics.', 'Запуск runtime, обновления и локальная диагностика.')} />
-            <SettingsPage preferences={preferences} updater={updater} diagnostics={diagnostics} setPreferences={setPreferences} setUpdater={setUpdater} setDiagnostics={setDiagnostics} setToast={setToast} setError={setActionError} />
+            <SettingsPage preferences={preferences} updater={updater} diagnostics={diagnostics} setPreferences={setPreferences} setUpdater={applyUpdaterAction} setDiagnostics={setDiagnostics} setToast={setToast} setError={setActionError} />
           </>
         )}
       </main>

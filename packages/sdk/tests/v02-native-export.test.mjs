@@ -19,13 +19,14 @@ class Store {
 }
 
 class CP3Runtime {
-  constructor({ capabilities, cancelDestination = false, loseOperation = false } = {}) {
+  constructor({ capabilities, cancelDestination = false, loseOperation = false, dropStartAck = false } = {}) {
     this.capabilities = capabilities ?? [
       'files', 'spaces', 'operations', 'native-export', 'saved-directories',
       'destination-picker-hints', 'internal-export-bookkeeping', 'tracked-export-prune', 'directory-contents-export',
     ];
     this.cancelDestination = cancelDestination;
     this.loseOperation = loseOperation;
+    this.dropStartAck = dropStartAck;
     this.calls = [];
   }
 
@@ -53,6 +54,7 @@ class CP3Runtime {
       return ok({ id: DESTINATION_ID, label: body.label ?? 'Exports', capability: body.capability, status: 'available', createdAtMs: 1 });
     }
     if (path === '/v1/exports/start') {
+      if (this.dropStartAck) throw new Error('socket reset after accepted operation start');
       const now = Date.now();
       return response(202, {
         id: body.operation.id, kind: 'native-export', phase: 'exporting', presentation: body.operation.presentation,
@@ -120,13 +122,13 @@ test('native export forwards internal bookkeeping, tracked prune, stable trackin
   const fs = await VontaqFS.connect(options(runtime));
   const report = await fs.defaultSpace.export('/runs/run-2', {
     mode: 'directory', destinationId: DESTINATION_ID, conflict: 'update-changed',
-    bookkeeping: 'internal', prune: 'tracked', trackingKey: 'bridge-document-export', directoryLayout: 'contents',
+    bookkeeping: 'internal', prune: 'tracked', trackingKey: 'example-document-export', directoryLayout: 'contents',
   });
   assert.equal(report.guarantee, 'file-atomic');
   const call = runtime.calls.find(item => item.path === '/v1/exports/start');
   assert.equal(call.body.bookkeeping, 'internal');
   assert.equal(call.body.prune, 'tracked');
-  assert.equal(call.body.trackingKey, 'bridge-document-export');
+  assert.equal(call.body.trackingKey, 'example-document-export');
   assert.equal(call.body.directoryLayout, 'contents');
   assert.deepEqual(call.body.sourcePaths, ['/runs/run-2']);
 });
@@ -141,12 +143,12 @@ test('new native export modes fail before request when an older runtime lacks th
   assert.equal(runtime.calls.some(item => item.path === '/v1/exports/start'), false);
 });
 
-test('tracked export maps runtime operation disappearance to OPERATION_LOST', async () => {
+test('tracked export maps missing authoritative operation status to OUTCOME_UNKNOWN', async () => {
   const runtime = new CP3Runtime({ loseOperation: true });
   const fs = await VontaqFS.connect(options(runtime));
   await assert.rejects(
     () => fs.defaultSpace.export('/a.vui', { mode: 'file', destinationId: DESTINATION_ID }),
-    error => error instanceof VontaqFSError && error.code === 'OPERATION_LOST' && typeof error.details?.operationId === 'string',
+    error => error instanceof VontaqFSError && error.code === 'OUTCOME_UNKNOWN' && typeof error.details?.operationId === 'string',
   );
 });
 
@@ -156,4 +158,34 @@ test('contents layout and tracking key validation reject invalid requests locall
   await assert.rejects(() => fs.defaultSpace.export(['/a', '/b'], { mode: 'directory', directoryLayout: 'contents' }), TypeError);
   await assert.rejects(() => fs.defaultSpace.export('/a', { mode: 'directory', trackingKey: 'bad\nkey' }), TypeError);
   assert.equal(runtime.calls.some(item => item.path === '/v1/exports/start'), false);
+});
+
+test('lost native export start ACK resolves stable operationId without spawning a second worker', async () => {
+  const runtime = new CP3Runtime({ dropStartAck: true });
+  const fs = await VontaqFS.connect(options(runtime));
+  const report = await fs.defaultSpace.export('/ready.vui', { mode: 'file', destinationId: DESTINATION_ID });
+  assert.equal(report.guarantee, 'file-atomic');
+  assert.equal(runtime.calls.filter(call => call.path === '/v1/exports/start').length, 1);
+  const start = runtime.calls.find(call => call.path === '/v1/exports/start');
+  const status = runtime.calls.find(call => call.path === '/v1/operations/status');
+  assert.equal(status.body.operationId, start.body.operation.id);
+});
+
+test('reconciled previous worker reports a typed state instead of polling forever', async () => {
+  const runtime = new CP3Runtime();
+  const prior = runtime.request.bind(runtime);
+  runtime.request = async request => {
+    const path = new URL(request.url).pathname;
+    if (path === '/v1/operations/status') {
+      const id = JSON.parse(request.body).operationId;
+      return ok({ id, kind: 'native-export', phase: 'reconciling', presentation: 'silent',
+        status: 'reconciling', cancellable: false, startedAtMs: 1, updatedAtMs: 2 });
+    }
+    return prior(request);
+  };
+  const fs = await VontaqFS.connect(options(runtime));
+  await assert.rejects(() => fs.defaultSpace.export('/uncertain.vui', { mode: 'file', destinationId: DESTINATION_ID }),
+    error => error instanceof VontaqFSError && error.code === 'RECONCILING' &&
+      typeof error.details.operationId === 'string');
+  assert.equal(runtime.calls.filter(call => call.path === '/v1/exports/start').length, 1);
 });

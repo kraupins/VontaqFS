@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, createHmac } from 'node:crypto';
-import { VontaqFS } from '../dist/index.js';
+import { VontaqFS, VontaqFSError } from '../dist/index.js';
 
 const CREDENTIAL='9'.repeat(64), TOKEN='a'.repeat(64);
 class Store{constructor(){this.map=new Map([['vontaqfs.client-instance.v1','client-d8'],['vontaqfs.pairing-credential.v1',CREDENTIAL]])}async get(k){return this.map.get(k)??null}async set(k,v){this.map.set(k,v)}}
@@ -82,4 +82,57 @@ test('Workspace is a thin deterministic SDK layer over ordinary categorized spac
   assert.ok(opens.some(call=>call.key==='workspace:design-system:generated'&&call.storageCategory==='generated'));
   assert.ok(opens.some(call=>call.key==='workspace:design-system:index'&&call.storageCategory==='index'));
   assert.ok(opens.some(call=>call.key==='workspace:design-system:cache'&&call.storageClass==='cache'));
+});
+
+test('writeTree reports only confirmed bytes and paths when a bounded group partially fails', async () => {
+  const runtime = new D8Runtime();
+  const original = runtime.request.bind(runtime);
+  runtime.request = async request => {
+    if (new URL(request.url).pathname !== '/v1/batch') return original(request);
+    const operations = JSON.parse(request.body).operations;
+    const okOp = operations[0];
+    return json({
+      results: [
+        { index: 0, operationType: 'write-file', ok: true, file: fileInfo(okOp.path, Buffer.from(okOp.dataBase64, 'base64').length) },
+        { index: 1, operationType: 'write-file', ok: false, error: { code: 'CONFLICT', message: 'existing file conflict' } },
+      ],
+      completedItems: 2, failedItems: 1, cancelled: false,
+    });
+  };
+  const fs = await VontaqFS.connect(options(runtime));
+  await assert.rejects(
+    () => fs.defaultSpace.writeTree([
+      { path: '/ok.txt', bytes: new Uint8Array([1, 2, 3]) },
+      { path: '/denied.txt', bytes: new Uint8Array([4, 5, 6, 7]) },
+    ]),
+    error => error instanceof VontaqFSError && error.code === 'PARTIALLY_APPLIED' &&
+      error.details.confirmedBytes === 3 &&
+      error.details.confirmedPaths.includes('/ok.txt') &&
+      error.details.failedPaths.includes('/denied.txt'),
+  );
+});
+
+test('writeTree retains confirmed paths after a cancelled bounded batch without assuming rollback', async () => {
+  const runtime = new D8Runtime();
+  const prior = runtime.request.bind(runtime);
+  runtime.request = async request => {
+    if (new URL(request.url).pathname !== '/v1/batch') return prior(request);
+    const [first] = JSON.parse(request.body).operations;
+    return json({
+      results: [{ index: 0, operationType: 'write-file', ok: true,
+        file: fileInfo(first.path, Buffer.from(first.dataBase64, 'base64').length) }],
+      completedItems: 1, failedItems: 0, cancelled: true,
+    });
+  };
+  const fs = await VontaqFS.connect(options(runtime));
+  await assert.rejects(
+    () => fs.defaultSpace.writeTree([
+      { path: '/confirmed.txt', bytes: new Uint8Array([1, 2, 3]) },
+      { path: '/uncertain.txt', bytes: new Uint8Array([4]) },
+    ]),
+    err => err instanceof VontaqFSError && err.code === 'PARTIALLY_APPLIED' &&
+      err.details.confirmedBytes === 3 &&
+      err.details.confirmedPaths.includes('/confirmed.txt') &&
+      err.details.unknownPaths.includes('/uncertain.txt'),
+  );
 });

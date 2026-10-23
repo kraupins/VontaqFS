@@ -1,0 +1,306 @@
+{
+  "source": "VontaqFS/crates/runtime/src/lib.rs",
+  "method": "literal route arm regex + dynamic branch check",
+  "counts": {
+    "literal": 42,
+    "dynamic": 7,
+    "total": 49,
+    "requiredPrimary": 25
+  },
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/v1/health",
+      "classification": "EXCLUDED_BOOTSTRAP",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/batch",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/batch/resume",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/destinations/create",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/destinations/list",
+      "classification": "EXCLUDED_READ_CONTROL",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/destinations/revoke",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/events/poll",
+      "classification": "EXCLUDED_READ_CONTROL",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/export-presets/delete",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/export-presets/list",
+      "classification": "EXCLUDED_READ_CONTROL",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/export-presets/save",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/exports/resume",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/exports/start",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/formats/delete",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/formats/list",
+      "classification": "EXCLUDED_READ_CONTROL",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/formats/register",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/fs/copy",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/fs/delete",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/fs/move",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/fs/read-many",
+      "classification": "EXCLUDED_READ_CONTROL",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/fs/read-small",
+      "classification": "EXCLUDED_READ_CONTROL",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/fs/stat",
+      "classification": "EXCLUDED_READ_CONTROL",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/fs/write-small",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/identity/challenge",
+      "classification": "EXCLUDED_BOOTSTRAP",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/imports/resume",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/imports/start",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/kv/get",
+      "classification": "EXCLUDED_READ_CONTROL",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/kv/set",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/operations/cancel",
+      "classification": "AUXILIARY_CANCEL",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/operations/status",
+      "classification": "EXCLUDED_READ_CONTROL",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/pairings/poll",
+      "classification": "EXCLUDED_BOOTSTRAP",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/pairings/request",
+      "classification": "EXCLUDED_BOOTSTRAP",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/sessions",
+      "classification": "EXCLUDED_BOOTSTRAP",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/snapshots/create",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/snapshots/delete",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/snapshots/list",
+      "classification": "EXCLUDED_READ_CONTROL",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/snapshots/restore",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/spaces/clear",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/spaces/list",
+      "classification": "EXCLUDED_READ_CONTROL",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/spaces/open",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/streams/read/begin",
+      "classification": "EXCLUDED_READ_CONTROL",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/streams/write/begin",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/streams/write/capability",
+      "classification": "EXCLUDED_READ_CONTROL",
+      "dispatch": "literal"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/streams/write/resolve",
+      "classification": "EXCLUDED_READ_CONTROL",
+      "dispatch": "dynamic"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/streams/write/{streamId}/status",
+      "classification": "EXCLUDED_READ_CONTROL",
+      "dispatch": "dynamic"
+    },
+    {
+      "method": "PUT",
+      "path": "/v1/streams/write/{streamId}/{seq}",
+      "classification": "STREAM_CHUNK_SUBSTEP",
+      "dispatch": "dynamic"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/streams/write/{streamId}/{seq}/chunk",
+      "classification": "STREAM_CHUNK_SUBSTEP",
+      "dispatch": "dynamic"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/streams/write/{streamId}/commit",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "dynamic"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/streams/write/{streamId}/abort",
+      "classification": "REQUIRED_PRIMARY",
+      "dispatch": "dynamic"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/streams/read/{streamId}/{seq}",
+      "classification": "EXCLUDED_READ_CONTROL",
+      "dispatch": "dynamic"
+    }
+  ]
+}

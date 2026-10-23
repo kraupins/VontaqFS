@@ -1,5 +1,6 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{BufWriter, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
@@ -14,21 +15,32 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
+    native_dir::{read_small as read_native_small, NativeDirectory},
     path::{ensure_no_symlink_escape, is_link_like, LogicalPath},
-    ApplicationFormatDescriptor, ApplicationKind, ApplicationRecord, DirectoryExportLayout,
-    DirectoryGrantCapability, DirectoryGrantRecord, ExportBookkeepingPolicy, ExportConflictPolicy,
-    ExportPresetRecord, ExportPrunePolicy, FileMetadata, FileRecord, ImportConflictPolicy,
-    KvRecord, NativeExportMode, NativeExportReport, NativeImportMode, NativeImportReport,
-    PairingRecord, PairingTransportPolicy, PortableBackupReport, PortableRestoreReport,
-    RepairOutcome, RepairReport, RestoreConflictPolicy, SnapshotRecord, SnapshotRestoreReport,
-    SpaceClearReport, SpaceExportReport, SpaceManifest, SpaceRecord, StorageCategory, StorageClass,
-    StorageDiagnostics, StorageError, StorageResult,
+    root_lock::StorageRootLock,
+    AdmissionLease, AdmissionManager, ApplicationFormatDescriptor, ApplicationKind,
+    ApplicationRecord, Claim, DirectoryExportLayout, DirectoryGrantCapability,
+    DirectoryGrantRecord, ExportBookkeepingPolicy, ExportConflictPolicy, ExportPresetRecord,
+    ExportPrunePolicy, FileMetadata, FileRecord, ImportConflictPolicy, KvRecord,
+    MutationDisposition, MutationResult, NativeExportMode, NativeExportReport, NativeImportMode,
+    NativeImportReport, PairingRecord, PairingTransportPolicy, PortableBackupReport,
+    PortableRestoreReport, RepairOutcome, RepairReport, RestoreConflictPolicy, SnapshotRecord,
+    SnapshotRestoreReport, SpaceClearReport, SpaceExportReport, SpaceManifest, SpaceRecord,
+    StorageCategory, StorageClass, StorageDiagnostics, StorageError, StorageResult,
 };
 
-const SCHEMA_VERSION: i64 = 2;
+// Internal SQLite result shapes; aliases do not alter the on-disk schema.
+type DurableOperationDbRow = (String, String, String, Option<String>, Option<i64>);
+type NativeDeletionEntry = (String, PathBuf, PathBuf, String);
+type StreamReceiptDbRow = (String, i64, Option<String>, Option<i64>, String);
+
+const SCHEMA_VERSION: i64 = 3;
 const SPACE_FORMAT_VERSION: u32 = 1;
-const MUTATION_RECEIPT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
-const MUTATION_RECEIPT_MAX_ROWS: i64 = 10_000;
+// Capacity is checked *before* admitting a new v3 identity; protected receipts
+// are never evicted to make room. A fixed ceiling is intentionally conservative
+// until CP17 supplies a configurable background storage budget.
+const V3_PROTECTED_RECEIPT_CAPACITY: i64 = 1_000_000;
+const V3_GC_BATCH_ROWS: i64 = 128;
 const REGISTRY_BACKUP_MAX_FILES: usize = 5;
 const MIN_FREE_DISK_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 const FREE_DISK_RESERVE_PERCENT_DENOMINATOR: u64 = 50;
@@ -36,6 +48,165 @@ const MAX_NATIVE_IMPORT_ITEMS: usize = 100_000;
 const PORTABLE_BACKUP_FORMAT_VERSION: u32 = 1;
 const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 const MAX_BACKUP_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Internal Rust-side capacity-only batch plan (not a wire/API type).
+/// File paths are validated again in Core; this plan never grants access.
+#[derive(Debug, Clone)]
+pub enum BatchCapacityOperation {
+    Write { path: String },
+    Delete { path: String },
+    Copy { from: String, to: String },
+    Move { from: String, to: String },
+    Kv,
+}
+
+// BATCH parent owns <=64 immutable durable_operation_items, and those items
+// are NOT individually charged by ensure_v3_result_capacity_slots. Their
+// bounded growth is included in the one protected BATCH parent slot. In
+// contrast, COPY/NATIVE_IMPORT items represent reserved *file receipts* and
+// their pending rows are counted one-for-one until replaced by receipts.
+fn g7_capacity_error() -> StorageError {
+    StorageError::StorageUnavailable(
+        "durable replay result capacity reached; no mutation admitted".into(),
+    )
+}
+fn budget_write() -> i64 {
+    1
+} // one SQL/file terminal receipt
+fn budget_delete() -> i64 {
+    2
+} // durable DELETE parent and result receipt
+fn budget_kv() -> i64 {
+    1
+} // a single atomic KV receipt
+fn budget_copy(files: usize) -> StorageResult<i64> {
+    i64::try_from(files)
+        .ok()
+        .and_then(|n| n.checked_add(2))
+        .filter(|n| *n <= V3_PROTECTED_RECEIPT_CAPACITY)
+        .ok_or_else(g7_capacity_error)
+}
+fn budget_move_fallback(files: usize) -> StorageResult<i64> {
+    // MOVE_COMPOSITE parent+receipt, COPY child parent+receipt+N per-file
+    // proofs, and DELETE child parent+receipt. Fast rename uses fewer.
+    budget_copy(files)?
+        .checked_add(4)
+        .filter(|n| *n <= V3_PROTECTED_RECEIPT_CAPACITY)
+        .ok_or_else(g7_capacity_error)
+}
+
+/// Conservative immutable envelope under an already held space-exclusive
+/// mutation lease. Paths generated by earlier *possible* writes/copies/moves
+/// remain candidates even if an earlier operation might fail or delete them.
+/// Do not use file bytes or hash contents to compute this bound.
+fn batch_capacity_envelope(
+    existing_paths: &[String],
+    operations: &[BatchCapacityOperation],
+) -> StorageResult<i64> {
+    if operations.is_empty() || operations.len() > 64 {
+        return Err(StorageError::RequestInvalid(
+            "invalid batch capacity plan length".into(),
+        ));
+    }
+    let mut candidates = BTreeSet::<String>::new();
+    let has_expanding_operation = operations.iter().any(|op| {
+        matches!(
+            op,
+            BatchCapacityOperation::Copy { .. } | BatchCapacityOperation::Move { .. }
+        )
+    });
+    if has_expanding_operation {
+        for path in existing_paths {
+            let path = LogicalPath::parse(path)?;
+            candidates.insert(path.as_str().to_owned());
+            if candidates.len() > V3_PROTECTED_RECEIPT_CAPACITY as usize {
+                return Err(g7_capacity_error());
+            }
+        }
+    }
+    let mut total = 0_i64;
+    for operation in operations {
+        let cost = match operation {
+            BatchCapacityOperation::Write { path } => {
+                let path = LogicalPath::parse(path)?;
+                if has_expanding_operation {
+                    candidates.insert(path.as_str().to_owned());
+                }
+                budget_write()
+            }
+            BatchCapacityOperation::Delete { path } => {
+                LogicalPath::parse(path)?;
+                // A failed DELETE leaves its source; never subtract paths.
+                budget_delete()
+            }
+            BatchCapacityOperation::Kv => budget_kv(),
+            BatchCapacityOperation::Copy { from, to }
+            | BatchCapacityOperation::Move { from, to } => {
+                let from = LogicalPath::parse(from)?;
+                let to = LogicalPath::parse(to)?;
+                let prefix = format!("{}/", from.as_str().trim_end_matches('/'));
+                // Snapshot the set *before* inserting destinations: copying
+                // a folder into its subtree must not recurse without bound.
+                let new_paths: Vec<String> = candidates
+                    .iter()
+                    .filter_map(|path| {
+                        let suffix = if path == from.as_str() {
+                            Some("")
+                        } else {
+                            path.strip_prefix(&prefix)
+                        }?;
+                        Some(if suffix.is_empty() {
+                            to.as_str().to_owned()
+                        } else {
+                            format!("{}/{}", to.as_str().trim_end_matches('/'), suffix)
+                        })
+                    })
+                    .collect();
+                let cost = match operation {
+                    BatchCapacityOperation::Copy { .. } => budget_copy(new_paths.len())?,
+                    _ => budget_move_fallback(new_paths.len())?,
+                };
+                for path in new_paths {
+                    candidates.insert(path);
+                    if candidates.len() > V3_PROTECTED_RECEIPT_CAPACITY as usize {
+                        return Err(g7_capacity_error());
+                    }
+                }
+                cost
+            }
+        };
+        total = total
+            .checked_add(cost)
+            .filter(|n| *n <= V3_PROTECTED_RECEIPT_CAPACITY)
+            .ok_or_else(g7_capacity_error)?;
+    }
+    Ok(total)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MoveFallbackPlan {
+    from: String,
+    to: String,
+    overwrite: bool,
+    if_match: Option<String>,
+    records: Vec<FileRecord>,
+}
+
+fn move_copy_fingerprint(plan: &MoveFallbackPlan) -> StorageResult<String> {
+    semantic_fingerprint(
+        "COPY",
+        &json!({
+            "from":plan.from,"to":plan.to,"overwrite":plan.overwrite,
+            "records":plan.records.iter().map(|r|json!({"path":r.path,"etag":r.etag,"size":r.size,"version":r.version})).collect::<Vec<_>>()
+        }),
+    )
+}
+fn move_delete_fingerprint(plan: &MoveFallbackPlan) -> StorageResult<String> {
+    semantic_fingerprint(
+        "DELETE",
+        &json!({"path":plan.from,"recursive":true,"ifMatch":plan.if_match}),
+    )
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,6 +278,265 @@ struct NativeExportTrackingManifest {
 pub struct StorageEngine {
     root: PathBuf,
     connection: Mutex<Connection>,
+    _root_lock: StorageRootLock,
+    admission: std::sync::Arc<AdmissionManager>,
+}
+
+/// Core-owned exclusive lease for one ordered BATCH worker. No public wire
+/// representation and no constructor outside Core: the owner/space proof is
+/// bound to the admission lease, not to caller-supplied child arguments.
+///
+/// Holding this context alone is NOT permission to start a BATCH: the root
+/// plan and every mandatory child result still require durable G7 escrow
+/// admission before the runtime can execute its first child.
+#[derive(Debug)]
+struct BatchMutationContext {
+    owner_application_id: String,
+    space_id: String,
+    root_request_id: String,
+    lease: AdmissionLease,
+}
+
+// A receipt credit is attached to exactly one saved BATCH item. This is
+// never accepted from a public API; caller must hold the matching Core lease.
+struct BatchReceiptCredit<'a> {
+    context: &'a BatchMutationContext,
+    item_index: usize,
+    item_fingerprint: &'a str,
+}
+
+/// Scoped child capacity authorization lives only on the synchronous Core
+/// worker thread while a verified BatchExecution owns the exclusive lease.
+/// This scope is never supplied by wire arguments or made persistent itself:
+/// the durable BATCH plan, credit ledger and root escrow are authoritative.
+#[derive(Clone)]
+struct ScopedCapacityCredit {
+    owner: String,
+    space_id: String,
+    root_id: String,
+    item_index: i64,
+    item_fingerprint: String,
+    child_id: String,
+    standalone_move: bool,
+}
+
+thread_local! {
+    static ACTIVE_CAPACITY_CREDIT: RefCell<Option<ScopedCapacityCredit>> = const { RefCell::new(None) };
+}
+
+struct CapacityCreditScope(Option<ScopedCapacityCredit>);
+impl Drop for CapacityCreditScope {
+    fn drop(&mut self) {
+        ACTIVE_CAPACITY_CREDIT.with(|value| {
+            value.replace(self.0.take());
+        });
+    }
+}
+fn enter_capacity_credit(credit: ScopedCapacityCredit) -> CapacityCreditScope {
+    let previous = ACTIVE_CAPACITY_CREDIT.with(|value| value.replace(Some(credit)));
+    CapacityCreditScope(previous)
+}
+fn active_capacity_credit() -> Option<ScopedCapacityCredit> {
+    ACTIVE_CAPACITY_CREDIT.with(|value| value.borrow().clone())
+}
+
+/// Convert a pre-funded slot to one durable proof under the very same SQLite
+/// transaction. No caller can draw from another root/space or item. A COPY
+/// file proof is already represented by its immutable pending item and later
+/// replaces that item with a receipt without consuming an additional credit.
+fn spend_scoped_proof(
+    tx: &Connection,
+    space_id: &str,
+    child_id: &str,
+    kind: &str,
+    fingerprint: &str,
+    slots: i64,
+) -> StorageResult<bool> {
+    let Some(grant) = active_capacity_credit() else {
+        return Ok(false);
+    };
+    if grant.space_id != space_id
+        || (child_id != grant.child_id && !child_id.starts_with(&format!("{}:", grant.child_id)))
+    {
+        return Err(StorageError::RequestIdConflict);
+    }
+    if !grant.standalone_move {
+        let binding: Option<(String, String, String, Option<String>, String)> = tx
+            .query_row(
+                "SELECT i.item_fingerprint,i.phase,p.owner_application_id,i.result_json,p.phase \
+             FROM durable_operation_items i JOIN durable_operations p ON p.scope_kind=i.scope_kind \
+             AND p.scope_id=i.scope_id AND p.request_id=i.request_id \
+             WHERE i.scope_kind='space' AND i.scope_id=?1 AND i.request_id=?2 \
+             AND i.item_index=?3 AND p.kind='BATCH'",
+                params![space_id, grant.root_id, grant.item_index],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let Some((fp, phase, owner, raw, root_phase)) = binding else {
+            return Err(StorageError::RecoveryRequired);
+        };
+        let value: Value =
+            serde_json::from_str(raw.as_deref().ok_or(StorageError::RecoveryRequired)?)?;
+        if fp != grant.item_fingerprint
+            || phase != "RUNNING"
+            || root_phase != "RUNNING"
+            || owner != grant.owner
+            || value.get("childRequestId").and_then(Value::as_str) != Some(&grant.child_id)
+        {
+            return Err(StorageError::RequestIdConflict);
+        }
+    } else {
+        let saved: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT owner_application_id,kind,phase FROM durable_operations \
+             WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2",
+                params![space_id, grant.root_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if !matches!(saved,Some((ref owner,ref root_kind,ref phase))
+            if owner == &grant.owner && root_kind == "MOVE_COMPOSITE" &&
+               (phase == "RUNNING" || (phase == "COMMITTED" && child_id == grant.root_id && kind == "RECEIPT")))
+        {
+            return Err(StorageError::RecoveryRequired);
+        }
+    }
+    if kind == "PARENT" || kind == "RECEIPT" {
+        spend_capacity_escrow(
+            tx,
+            "space",
+            space_id,
+            &grant.root_id,
+            &grant.owner,
+            grant.item_index,
+            child_id,
+            kind,
+            fingerprint,
+            slots,
+        )
+    } else {
+        Err(StorageError::RequestInvalid(
+            "invalid escrow proof type".into(),
+        ))
+    }
+}
+
+/// A child's COPY item or pending WRITE is already a paid slot. The
+/// fingerprint of the terminal receipt is still checked against its durable
+/// journal/parent; this prevents charging the parent's escrow a second time.
+fn prepaid_child_proof(tx: &Connection, space_id: &str, child_id: &str) -> StorageResult<bool> {
+    let Some(grant) = active_capacity_credit() else {
+        return Ok(false);
+    };
+    if grant.space_id != space_id {
+        return Err(StorageError::RequestIdConflict);
+    }
+    let prior: Option<i64> = tx
+        .query_row(
+            "SELECT slots FROM durable_capacity_spends WHERE scope_kind='space' AND scope_id=?1 \
+         AND root_request_id=?2 AND item_index=?3 AND child_request_id=?4 AND proof_kind='PARENT'",
+            params![space_id, grant.root_id, grant.item_index, child_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if prior == Some(2) {
+        return Ok(true);
+    } // a COPY parent pays for its terminal receipt
+    if prior != Some(1) {
+        return Ok(false);
+    }
+    // An ordinary DELETE/MOVE parent needs a *separate* terminal receipt.
+    // Only the file-level COPY proof paid into its immutable child item
+    // already owns its eventual write receipt slot.
+    let item: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM durable_operation_items i JOIN durable_operations p \
+         ON p.scope_kind=i.scope_kind AND p.scope_id=i.scope_id AND p.request_id=i.request_id \
+         WHERE p.kind='COPY' AND i.scope_kind='space' AND i.scope_id=?1 \
+         AND json_extract(i.result_json,'$.childRequestId')=?2 AND i.phase IN ('PENDING','RUNNING')",
+        params![space_id,child_id],|r|r.get(0),
+    )?;
+    if item > 1 {
+        return Err(StorageError::RecoveryRequired);
+    }
+    Ok(item == 1)
+}
+
+/// An active child has pre-reserved all the slots needed by its bounded tree.
+/// Still validate total occupancy; never admit another unescrowed effect.
+fn scoped_capacity_slots(slots: i64) -> i64 {
+    if active_capacity_credit().is_some() {
+        0
+    } else {
+        slots
+    }
+}
+
+/// Core-owned context: Runtime can only obtain this through verified owner,
+/// frozen metadata envelope and atomic immutable plan+escrow admission.
+pub struct BatchExecution {
+    context: BatchMutationContext,
+    item_fingerprints: Vec<String>,
+}
+impl BatchExecution {
+    fn with_child<T>(
+        &self,
+        storage: &StorageEngine,
+        index: usize,
+        child_id: &str,
+        f: impl FnOnce() -> StorageResult<T>,
+    ) -> StorageResult<T> {
+        self.context.verify(storage, &self.context.space_id)?;
+        let item_fingerprint = self
+            .item_fingerprints
+            .get(index)
+            .ok_or(StorageError::RequestIdConflict)?;
+        let _guard = enter_capacity_credit(ScopedCapacityCredit {
+            owner: self.context.owner_application_id.clone(),
+            space_id: self.context.space_id.clone(),
+            root_id: self.context.root_request_id.clone(),
+            item_index: index as i64,
+            item_fingerprint: item_fingerprint.clone(),
+            child_id: child_id.to_owned(),
+            standalone_move: false,
+        });
+        let outcome = f()?;
+        // A semantically matching receipt from an unrelated previous request
+        // is not evidence funded by this BATCH. A successful child MUST have
+        // an exact spend under this immutable root and a terminal Core proof.
+        let conn = storage
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let proved: i64=conn.query_row(
+            "SELECT COUNT(*) FROM durable_capacity_spends s WHERE s.scope_kind='space' AND s.scope_id=?1 \
+             AND s.root_request_id=?2 AND s.item_index=?3 AND s.child_request_id=?4 \
+             AND (EXISTS(SELECT 1 FROM mutation_receipts r WHERE r.space_id=s.scope_id \
+                       AND r.request_id=s.child_request_id AND r.identity_version>=3) \
+                  OR EXISTS(SELECT 1 FROM durable_operations p WHERE p.scope_kind=s.scope_kind \
+                       AND p.scope_id=s.scope_id AND p.request_id=s.child_request_id AND p.phase='COMMITTED'))",
+            params![self.context.space_id,self.context.root_request_id,index as i64,child_id],|r|r.get(0),
+        )?;
+        if proved == 0 {
+            return Err(StorageError::RecoveryRequired);
+        }
+        Ok(outcome)
+    }
+}
+
+impl BatchMutationContext {
+    fn verify(&self, storage: &StorageEngine, space_id: &str) -> StorageResult<()> {
+        if self.space_id != space_id
+            || !self.lease.belongs_to(&storage.admission)
+            || !self.lease.covers(&Claim::space_exclusive(space_id))
+            || self.owner_application_id.is_empty()
+            || self.root_request_id.is_empty()
+        {
+            return Err(StorageError::RequestInvalid(
+                "batch mutation context scope mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +556,9 @@ pub struct StreamOperationRecord {
     pub method: String,
     pub path: String,
     pub declared_size: Option<u64>,
+    /// Hash of the full admitted stream-begin intent (including preconditions).
+    /// Absent only for migrated legacy journal entries.
+    pub request_fingerprint: Option<String>,
     pub phase: String,
     pub state_revision: i64,
     pub next_seq: u64,
@@ -135,9 +568,31 @@ pub struct StreamOperationRecord {
     pub result: Option<FileRecord>,
 }
 
+/// The pre-effect, immutable evidence for a public SPACE_OPEN. Store it in
+/// the nonterminal parent's result_json field, never as a successful result.
+/// The terminal transition replaces this with the actual SpaceRecord.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpaceOpenRecoveryPlan {
+    application_id: String,
+    key: String,
+    storage_class: StorageClass,
+    storage_category: Option<StorageCategory>,
+    display_name: Option<String>,
+    before: Option<SpaceRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DestinationGrantAdmission {
+    New,
+    Replayed(DirectoryGrantRecord),
+    UserCancelled,
+}
+
 impl StorageEngine {
     pub fn open(root: impl AsRef<Path>) -> StorageResult<Self> {
         let root = root.as_ref().to_path_buf();
+        let root_lock = StorageRootLock::acquire(&root)?;
         fs::create_dir_all(root.join("runtime/registry-backups"))?;
         fs::create_dir_all(root.join("runtime/logs"))?;
         fs::create_dir_all(root.join("spaces"))?;
@@ -146,17 +601,2143 @@ impl StorageEngine {
         let engine = Self {
             root,
             connection: Mutex::new(connection),
+            _root_lock: root_lock,
+            admission: AdmissionManager::new(),
         };
-        // Restore directories staged by a crashed deletion before touching per-space
-        // journal recovery (which otherwise sees their paths as missing).
+        // The OS root lock and Registry-v3 migration are complete, but the
+        // engine is still private to open(): no Runtime admission can run while
+        // these recovery barriers are pending (effectively RECOVERING).
+        // Recover owner directories before touching any per-space file journal.
         engine.cleanup_deletion_quarantine()?;
-        engine.prune_mutation_receipts()?;
         engine.recover_pending_mutations()?;
+        // OPEN/ABORTING stream fencing is safe only AFTER all temp evidence is
+        // quarantined. COMMITTING remains UNCERTAIN, never inferred aborted.
         engine.quarantine_orphan_stream_temps()?;
         engine.recover_stream_operations()?;
-        engine.prune_stream_operations()?;
+        engine.reconcile_interrupted_long_jobs()?;
+        engine.recover_filesystem_intents()?;
+        engine.recover_initializing_spaces()?;
+        engine.reconcile_interrupted_space_opens()?;
+        engine.reconcile_native_import_receipts()?;
+        engine.reconcile_batch_child_receipts()?;
         engine.recover_native_import_journals()?;
+        engine.fence_inconsistent_snapshots()?;
+        engine.fence_unresolved_recovery_scopes()?;
+        // ACTIVE follows the final recovery barrier. GC is deliberately NOT
+        // run in open(): Runtime schedules bounded maintenance after serving.
         Ok(engine)
+    }
+
+    /// Durable application-owned long-job identity. This is deliberately independent
+    /// of in-memory Runtime workers: a lost start ACK or Runtime restart cannot
+    /// authorize a second worker using the same operation ID.
+    pub fn admit_application_long_job(
+        &self,
+        owner: &str,
+        operation_id: &str,
+        kind: &str,
+        fingerprint: &str,
+    ) -> StorageResult<bool> {
+        if owner.is_empty() || operation_id.is_empty() || fingerprint.is_empty() {
+            return Err(StorageError::RequestInvalid(
+                "empty durable operation identity".into(),
+            ));
+        }
+        let now = now_ms();
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing: Option<(String, String, String, Option<i64>)> = tx.query_row(
+            "SELECT kind,request_fingerprint,phase,expires_at_ms FROM durable_operations WHERE scope_kind='application' AND scope_id=?1 AND request_id=?2 AND owner_application_id=?1",
+            params![owner, operation_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional()?;
+        if let Some((prior_kind, prior_fingerprint, phase, expires_at_ms)) = existing {
+            if prior_kind != kind || prior_fingerprint != fingerprint {
+                return Err(StorageError::RequestIdConflict);
+            }
+            if matches!(
+                phase.as_str(),
+                "COMMITTED" | "ABORTED" | "PARTIALLY_APPLIED"
+            ) && expires_at_ms.is_some_and(|expires| expires <= now)
+            {
+                return Err(StorageError::ResultExpired);
+            }
+            return Ok(false);
+        }
+        // Existing authenticated results are queried before time validation.
+        // A *new* v3 operation outside its initial admission window must not
+        // silently re-execute after its previous receipt could have expired.
+        let identity_version = if operation_id.starts_with("operation-v3-") {
+            validate_new_v3_operation_id(operation_id, now)?;
+            3
+        } else {
+            1
+        };
+        // Legacy operations still create unresolved durable evidence and
+        // consume the same finite registry capacity as versioned operations.
+        ensure_v3_result_capacity(&tx, now)?;
+        tx.execute("INSERT INTO durable_operations(scope_kind,scope_id,request_id,operation_id,kind,owner_application_id,identity_version,request_fingerprint,phase,request_started_at_ms,created_at_ms,updated_at_ms) VALUES('application',?1,?2,?2,?3,?1,?4,?5,'ADMITTED',?6,?6,?6)",
+            params![owner,operation_id,kind,identity_version,fingerprint,now])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Persist a request to stop a live application worker *before* signalling it.
+    /// This is not terminal ABORTED evidence: a worker may already have applied
+    /// effects, so a crash after the request still requires reconciliation.
+    /// Preserve result_json (native source bindings, previous snapshots) and
+    /// attach a cancellation marker which survives startup recovery.
+    pub fn request_application_long_job_cancel(
+        &self,
+        owner: &str,
+        operation_id: &str,
+        fingerprint: &str,
+    ) -> StorageResult<()> {
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row: Option<(String,String,Option<String>)> = tx.query_row(
+            "SELECT request_fingerprint,phase,result_json FROM durable_operations WHERE scope_kind='application' AND scope_id=?1 AND request_id=?2 AND owner_application_id=?1",
+            params![owner,operation_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional()?;
+        let (saved_fp, phase, saved_json) = row.ok_or(StorageError::RecoveryRequired)?;
+        if saved_fp != fingerprint {
+            return Err(StorageError::RequestIdConflict);
+        }
+        if phase == "CANCEL_REQUESTED" {
+            return Ok(());
+        }
+        if !matches!(phase.as_str(), "ADMITTED" | "RUNNING") {
+            return Err(StorageError::RecoveryRequired);
+        }
+        let mut evidence: Value = match saved_json {
+            Some(raw) => serde_json::from_str(&raw)?,
+            None => json!({}),
+        };
+        // Existing evidence must be an object; never silently discard a
+        // native import/export binding or a previously persisted snapshot.
+        let fields = evidence
+            .as_object_mut()
+            .ok_or(StorageError::RecoveryRequired)?;
+        let now = now_ms();
+        fields.insert("_cancelRequestedAtMs".into(), json!(now));
+        let changed = tx.execute(
+            "UPDATE durable_operations SET phase='CANCEL_REQUESTED',result_json=?1,updated_at_ms=?2 WHERE scope_kind='application' AND scope_id=?3 AND request_id=?4 AND owner_application_id=?3 AND request_fingerprint=?5 AND phase IN ('ADMITTED','RUNNING')",
+            params![serde_json::to_string(&evidence)?,now,owner,operation_id,fingerprint],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::RecoveryRequired);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Explicit restart resume, not a retry of an uncertain start ACK. The
+    /// durable application's fingerprint/owner/phase is checked and claimed
+    /// atomically before a new worker can run. Child admission is separately
+    /// fenced by the space-level immutable import plan.
+    pub fn resume_application_native_import(
+        &self,
+        owner: &str,
+        operation_id: &str,
+        fingerprint: &str,
+        space_id: &str,
+        child_request_id: &str,
+    ) -> StorageResult<()> {
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // The existing source selection and space plan are both essential:
+        // a failed picker/start before the plan was durably persisted must
+        // not be treated as an empty import eligible for restart.
+        let bound: Option<String> = tx.query_row(
+            "SELECT result_json FROM durable_operations WHERE scope_kind='application' AND scope_id=?1 AND request_id=?2 AND owner_application_id=?1 AND kind='native-import' AND request_fingerprint=?3 AND phase='RECONCILING'",
+            params![owner,operation_id,fingerprint], |r|r.get(0)).optional()?;
+        let bound: Value = serde_json::from_str(&bound.ok_or(StorageError::OutcomeUnknown)?)?;
+        if bound.get("_cancelRequestedAtMs").is_some() {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        if bound.get("spaceId").and_then(Value::as_str) != Some(space_id)
+            || bound.get("requestId").and_then(Value::as_str) != Some(child_request_id)
+        {
+            return Err(StorageError::RequestIdConflict);
+        }
+        let plan_count: Option<i64> = tx.query_row(
+            "SELECT (SELECT COUNT(*) FROM durable_operation_items i WHERE i.scope_kind=p.scope_kind AND i.scope_id=p.scope_id AND i.request_id=p.request_id) FROM durable_operations p WHERE p.scope_kind='space' AND p.scope_id=?1 AND p.request_id=?2 AND p.owner_application_id=?3 AND p.kind='NATIVE_IMPORT' AND p.phase='RUNNING'",
+            params![space_id,child_request_id,owner], |r|r.get(0)).optional()?;
+        if plan_count.unwrap_or(0) == 0 {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        let changed = tx.execute("UPDATE durable_operations SET phase='RUNNING',updated_at_ms=?1 WHERE scope_kind='application' AND scope_id=?2 AND request_id=?3 AND owner_application_id=?2 AND kind='native-import' AND request_fingerprint=?4 AND phase='RECONCILING'",
+            params![now_ms(),owner,operation_id,fingerprint])?;
+        if changed != 1 {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Bind the selected destination and source scope before a native export
+    /// worker can touch external files. A historical parent without this binding
+    /// is intentionally not eligible for restart continuation.
+    pub fn bind_application_native_export(
+        &self,
+        owner: &str,
+        operation_id: &str,
+        space_id: &str,
+        destination_grant_id: Option<&str>,
+    ) -> StorageResult<()> {
+        let evidence = json!({"spaceId":space_id,"destinationGrantId":destination_grant_id});
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let affected = conn.execute("UPDATE durable_operations SET result_json=?1,updated_at_ms=?2 WHERE scope_kind='application' AND scope_id=?3 AND request_id=?4 AND owner_application_id=?3 AND kind='native-export' AND phase='ADMITTED' AND result_json IS NULL",
+            params![serde_json::to_string(&evidence)?,now_ms(),owner,operation_id])?;
+        if affected != 1 {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        Ok(())
+    }
+
+    /// Explicit restart continuation. Refuse historical unbound exports,
+    /// changed fingerprints, uncertain items and one-off destinations. Only a
+    /// fully journaled confirmed prefix plus untouched PENDING tail is safe to
+    /// continue. Identity and worker claim are one IMMEDIATE transaction.
+    pub fn resume_application_native_export(
+        &self,
+        owner: &str,
+        operation_id: &str,
+        fingerprint: &str,
+        space_id: &str,
+        grant_id: &str,
+    ) -> StorageResult<()> {
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let saved: Option<String> = tx.query_row(
+            "SELECT result_json FROM durable_operations WHERE scope_kind='application' AND scope_id=?1 AND request_id=?2 AND owner_application_id=?1 AND kind='native-export' AND request_fingerprint=?3 AND phase='RECONCILING'",
+            params![owner,operation_id,fingerprint],|r|r.get(0)).optional()?;
+        let bound: Value = serde_json::from_str(&saved.ok_or(StorageError::OutcomeUnknown)?)?;
+        if bound.get("_cancelRequestedAtMs").is_some() {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        if bound.get("spaceId").and_then(Value::as_str) != Some(space_id)
+            || bound.get("destinationGrantId").and_then(Value::as_str) != Some(grant_id)
+        {
+            return Err(StorageError::RequestIdConflict);
+        }
+        let (total,uncertain): (i64,i64) = tx.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(CASE WHEN phase IN ('RUNNING','FAILED') THEN 1 ELSE 0 END),0) FROM durable_operation_items WHERE scope_kind='application' AND scope_id=?1 AND request_id=?2",
+            params![owner,operation_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        if total == 0 || uncertain > 0 {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        let changed = tx.execute("UPDATE durable_operations SET phase='RUNNING',updated_at_ms=?1 WHERE scope_kind='application' AND scope_id=?2 AND request_id=?3 AND owner_application_id=?2 AND kind='native-export' AND request_fingerprint=?4 AND phase='RECONCILING'",
+            params![now_ms(),owner,operation_id,fingerprint])?;
+        if changed != 1 {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Retrieve only outcomes belonging to the authenticated application.
+    /// Nonterminal jobs are marked RECONCILING at startup (never respawned).
+    // Public result shape is part of the existing Core API.
+    #[allow(clippy::type_complexity)]
+    pub fn application_long_job(
+        &self,
+        owner: &str,
+        operation_id: &str,
+    ) -> StorageResult<Option<(String, String, String, Option<Value>)>> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let item: Option<DurableOperationDbRow> = conn.query_row(
+            "SELECT kind,request_fingerprint,phase,result_json,expires_at_ms FROM durable_operations WHERE scope_kind='application' AND scope_id=?1 AND request_id=?2 AND owner_application_id=?1",
+            params![owner,operation_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).optional()?;
+        item.map(|(kind, fingerprint, phase, result, expires_at)| {
+            if matches!(
+                phase.as_str(),
+                "COMMITTED" | "ABORTED" | "PARTIALLY_APPLIED"
+            ) && expires_at.is_some_and(|expiry| expiry <= now_ms())
+            {
+                return Err(StorageError::ResultExpired);
+            }
+            Ok((
+                kind,
+                fingerprint,
+                phase,
+                result.map(|text| serde_json::from_str(&text)).transpose()?,
+            ))
+        })
+        .transpose()
+    }
+
+    /// The child batch journal is authoritative for a completed batch even
+    /// when the application-level status write was lost after the space-level
+    /// terminal commit. Never create another worker merely to recover this.
+    pub fn finished_batch_result(
+        &self,
+        owner: &str,
+        operation_id: &str,
+        fingerprint: &str,
+    ) -> StorageResult<Option<(String, Value)>> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT phase,result_json FROM durable_operations              WHERE scope_kind='space' AND owner_application_id=?1              AND request_id=?2 AND kind='BATCH' AND request_fingerprint=?3              AND phase IN ('COMMITTED','PARTIALLY_APPLIED')",
+        )?;
+        let mut rows = stmt.query(params![owner, operation_id, fingerprint])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let phase: String = row.get(0)?;
+        let result_json: String = row
+            .get::<_, Option<String>>(1)?
+            .ok_or(StorageError::RecoveryRequired)?;
+        // Ambiguous duplicate parents under different spaces are not a proof
+        // of one result even if their operation IDs happen to match.
+        if rows.next()?.is_some() {
+            return Err(StorageError::RecoveryRequired);
+        }
+        Ok(Some((phase, serde_json::from_str(&result_json)?)))
+    }
+
+    /// Status-only reconstruction of an interrupted batch's ordered children.
+    /// A COMMITTED child is grounded in a stored mutation receipt or a durable
+    /// child result. RUNNING/PENDING never implies a safe retry or an abort.
+    /// Resolve by owner + complete parent fingerprint; ambiguous duplicate
+    /// operation IDs under multiple spaces are rejected, not guessed.
+    pub fn batch_item_evidence(
+        &self,
+        owner: &str,
+        operation_id: &str,
+        fingerprint: &str,
+    ) -> StorageResult<Vec<Value>> {
+        // Status may be queried after a child committed but before its batch
+        // journal update. Reconcile using receipts only; never execute a child.
+        self.reconcile_batch_child_receipts()?;
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT i.scope_id,i.item_index,i.phase,i.result_json FROM durable_operation_items i \
+             JOIN durable_operations p ON p.scope_kind=i.scope_kind AND p.scope_id=i.scope_id AND p.request_id=i.request_id \
+             WHERE p.scope_kind='space' AND p.owner_application_id=?1 AND p.request_id=?2 \
+             AND p.kind='BATCH' AND p.request_fingerprint=?3 ORDER BY i.scope_id,i.item_index"
+        )?;
+        let rows = stmt
+            .query_map(params![owner, operation_id, fingerprint], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut source_space: Option<String> = None;
+        let mut out = Vec::with_capacity(rows.len());
+        for (space, index, phase, stored) in rows {
+            if let Some(ref previous) = source_space {
+                if previous != &space {
+                    return Err(StorageError::RecoveryRequired);
+                }
+            } else {
+                source_space = Some(space);
+            }
+            let result = stored
+                .as_deref()
+                .map(serde_json::from_str::<Value>)
+                .transpose()?;
+            out.push(json!({"index":index,"phase":phase,"result":result}));
+        }
+        Ok(out)
+    }
+
+    /// Explicit opt-in batch continuation after restart. Receipt-only
+    /// reconciliation runs before admission: any RUNNING child without a
+    /// proved receipt must remain uncertain, never silently re-executed.
+    pub fn resume_application_batch(
+        &self,
+        owner: &str,
+        operation_id: &str,
+        fingerprint: &str,
+        space_id: &str,
+        item_fingerprints: &[String],
+    ) -> StorageResult<()> {
+        self.reconcile_batch_child_receipts()?;
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let parent: Option<(String,Option<String>)> = tx.query_row(
+            "SELECT phase,result_json FROM durable_operations WHERE scope_kind='application' AND scope_id=?1 AND request_id=?2 AND owner_application_id=?1 AND kind='batch' AND request_fingerprint=?3",
+            params![owner,operation_id,fingerprint],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let (parent_phase, parent_evidence) = parent.ok_or(StorageError::OutcomeUnknown)?;
+        if parent_phase != "RECONCILING" {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        if let Some(raw) = parent_evidence {
+            let evidence: Value = serde_json::from_str(&raw)?;
+            if evidence.get("_cancelRequestedAtMs").is_some() {
+                return Err(StorageError::OutcomeUnknown);
+            }
+        }
+        let space_parent: Option<(String,String)> = tx.query_row(
+            "SELECT phase,request_fingerprint FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 AND kind='BATCH' AND owner_application_id=?3",
+            params![space_id,operation_id,owner],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let (phase, saved_fp) = space_parent.ok_or(StorageError::OutcomeUnknown)?;
+        if saved_fp != fingerprint {
+            return Err(StorageError::RequestIdConflict);
+        }
+        if !matches!(phase.as_str(), "RUNNING" | "RECONCILING") {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        let mut stmt = tx.prepare("SELECT item_index,item_fingerprint,phase FROM durable_operation_items WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 ORDER BY item_index")?;
+        let saved = stmt
+            .query_map(params![space_id, operation_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        if saved.len() != item_fingerprints.len() || saved.is_empty() {
+            return Err(StorageError::RequestIdConflict);
+        }
+        for (index, (item_index, fp, state)) in saved.iter().enumerate() {
+            if *item_index != index as i64 || fp != &item_fingerprints[index] {
+                return Err(StorageError::RequestIdConflict);
+            }
+            if !matches!(state.as_str(), "COMMITTED" | "PENDING") {
+                return Err(StorageError::OutcomeUnknown);
+            }
+        }
+        let changed = tx.execute("UPDATE durable_operations SET phase='RUNNING',updated_at_ms=?1 WHERE scope_kind='application' AND scope_id=?2 AND request_id=?3 AND owner_application_id=?2 AND kind='batch' AND request_fingerprint=?4 AND phase='RECONCILING'",
+            params![now_ms(),owner,operation_id,fingerprint])?;
+        if changed != 1 {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        tx.execute("UPDATE durable_operations SET phase='RUNNING',updated_at_ms=?1 WHERE scope_kind='space' AND scope_id=?2 AND request_id=?3 AND kind='BATCH' AND owner_application_id=?4 AND phase='RECONCILING'",
+            params![now_ms(),space_id,operation_id,owner])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Previously completed child result, already reconciled with its Core
+    /// receipt when required. PENDING is the only phase eligible to execute.
+    pub fn prior_batch_result(
+        &self,
+        space_id: &str,
+        batch_id: &str,
+        index: usize,
+    ) -> StorageResult<Option<Value>> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let row: Option<(String,Option<String>)> = conn.query_row(
+            "SELECT phase,result_json FROM durable_operation_items WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 AND item_index=?3",
+            params![space_id,batch_id,index as i64],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let (phase, raw) = row.ok_or(StorageError::OutcomeUnknown)?;
+        if phase == "PENDING" {
+            return Ok(None);
+        }
+        if phase != "COMMITTED" {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        let value: Value = serde_json::from_str(&raw.ok_or(StorageError::OutcomeUnknown)?)?;
+        if value.get("ok").and_then(Value::as_bool) != Some(true)
+            || value.get("index").and_then(Value::as_u64) != Some(index as u64)
+        {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        Ok(Some(value))
+    }
+
+    /// Store a terminal outcome before Runtime acknowledges it to a client.
+    /// Terminal records are immutable, minimum seven-day replay retention.
+    pub fn finish_application_long_job(
+        &self,
+        owner: &str,
+        operation_id: &str,
+        phase: &str,
+        snapshot: &Value,
+    ) -> StorageResult<()> {
+        if !matches!(phase, "COMMITTED" | "ABORTED" | "PARTIALLY_APPLIED") {
+            return Err(StorageError::RequestInvalid(
+                "invalid long-job terminal phase".into(),
+            ));
+        }
+        let now = now_ms();
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let updated = conn.execute(
+            "UPDATE durable_operations SET phase=?1,result_json=?2,terminal_at_ms=?3,expires_at_ms=?4,updated_at_ms=?3 WHERE scope_kind='application' AND scope_id=?5 AND request_id=?6 AND owner_application_id=?5 AND phase IN ('ADMITTED','RUNNING','CANCEL_REQUESTED','RECONCILING')",
+            params![phase,serde_json::to_string(snapshot)?,now,now.saturating_add(DURABLE_SQL_RECEIPT_TTL_MS),owner,operation_id],
+        )?;
+        if updated == 0 {
+            return Err(StorageError::RecoveryRequired);
+        }
+        Ok(())
+    }
+
+    /// A worker failure after possible external/file side effects is NOT proof
+    /// of an abort. Leave the durable identity nonterminal for reconciliation.
+    pub fn mark_application_long_job_uncertain(
+        &self,
+        owner: &str,
+        operation_id: &str,
+        snapshot: &Value,
+    ) -> StorageResult<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        // Retain the original import source binding along with the snapshot.
+        // Overwriting it with an error-only snapshot would orphan its child
+        // receipts after restart and prevent authenticated status resolution.
+        let previous: Option<(String,Option<String>)> = conn.query_row(
+            "SELECT kind,result_json FROM durable_operations WHERE scope_kind='application' AND scope_id=?1 AND request_id=?2 AND owner_application_id=?1",
+            params![owner,operation_id], |r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let mut evidence = snapshot.clone();
+        if let Some((kind, Some(raw))) = previous {
+            let source: Value = serde_json::from_str(&raw)?;
+            if let Some(object) = evidence.as_object_mut() {
+                // A failure following cancel acknowledgement must not erase
+                // the persisted cancellation intent and make a later resume
+                // appear safe. Keep native source bindings as before.
+                let keys: &[&str] = if kind == "native-import" {
+                    &["spaceId", "requestId", "_cancelRequestedAtMs"]
+                } else if kind == "native-export" {
+                    &["spaceId", "destinationGrantId", "_cancelRequestedAtMs"]
+                } else {
+                    &["_cancelRequestedAtMs"]
+                };
+                for key in keys {
+                    if let Some(value) = source.get(*key) {
+                        object.insert((*key).to_owned(), value.clone());
+                    }
+                }
+            }
+        }
+        let updated = conn.execute("UPDATE durable_operations SET phase='RECONCILING',result_json=?1,updated_at_ms=?2 WHERE scope_kind='application' AND scope_id=?3 AND request_id=?4 AND owner_application_id=?3 AND phase IN ('ADMITTED','RUNNING','CANCEL_REQUESTED','RECONCILING')",
+            params![serde_json::to_string(&evidence)?,now_ms(),owner,operation_id])?;
+        if updated != 1 {
+            return Err(StorageError::RecoveryRequired);
+        }
+        Ok(())
+    }
+
+    /// At startup a worker from the old process is no longer alive. Preserve
+    /// evidence and require reconciliation instead of lying about its outcome.
+    fn reconcile_interrupted_long_jobs(&self) -> StorageResult<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        // SPACE_OPEN has its own pre-effect recovery plan. Keep ADMITTED
+        // until that resolver has compared its registry row and manifest.
+        // Long-running workers are the only operations converted here.
+        conn.execute("UPDATE durable_operations SET phase='RECONCILING',updated_at_ms=?1 WHERE scope_kind='application' AND kind<>'SPACE_OPEN' AND phase IN ('ADMITTED','RUNNING','CANCEL_REQUESTED')",params![now_ms()])?;
+        Ok(())
+    }
+
+    /// Persist the complete ordered batch plan before the first child mutation.
+    /// Child mutations retain their own receipts; parent items record confirmed
+    /// results and are never incorrectly treated as an all-or-none transaction.
+    pub fn prepare_batch_items(
+        &self,
+        owner: &str,
+        space_id: &str,
+        batch_id: &str,
+        fingerprint: &str,
+        item_fingerprints: &[String],
+    ) -> StorageResult<()> {
+        // Legacy path remains unchanged until the entire Runtime BATCH tree
+        // consumes escrow credits atomically. Do not activate the exclusive
+        // context and then call these public child mutators (self-deadlock).
+        self.prepare_batch_items_transaction(
+            owner,
+            space_id,
+            batch_id,
+            fingerprint,
+            item_fingerprints,
+            None,
+        )
+    }
+
+    /// G7 U2 root-admission boundary. The exclusive space lease freezes the
+    /// metadata envelope while the BATCH parent, ordered child identities and
+    /// their globally accounted escrow are committed in ONE IMMEDIATE tx.
+    /// This is Core-private until descendant debit/receipt transfer is wired;
+    /// reserving credits alone does not authorize a child filesystem effect.
+    fn prepare_batch_items_in_context(
+        &self,
+        context: &BatchMutationContext,
+        space_id: &str,
+        batch_id: &str,
+        fingerprint: &str,
+        item_fingerprints: &[String],
+        operations: &[BatchCapacityOperation],
+    ) -> StorageResult<i64> {
+        context.verify(self, space_id)?;
+        if context.root_request_id != batch_id || operations.len() != item_fingerprints.len() {
+            return Err(StorageError::RequestInvalid(
+                "batch context/plan identity mismatch".into(),
+            ));
+        }
+        // Replay MUST NOT recalculate the envelope from mutable source files.
+        // A completed child may already have changed the indexed file tree.
+        // Reuse the original durable grant after checking the immutable root
+        // identity, or refuse an old RUNNING parent that has no escrow.
+        let saved = {
+            let conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            conn.query_row("SELECT p.request_fingerprint,e.total_slots FROM durable_operations p LEFT JOIN durable_capacity_escrows e ON e.scope_kind=p.scope_kind AND e.scope_id=p.scope_id AND e.root_request_id=p.request_id WHERE p.scope_kind='space' AND p.scope_id=?1 AND p.request_id=?2 AND p.kind='BATCH'",
+                params![space_id,batch_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<i64>>(1)?))).optional()?
+        };
+        let credits = match saved {
+            Some((prior_fp, Some(slots))) => {
+                if prior_fp != fingerprint {
+                    return Err(StorageError::RequestIdConflict);
+                }
+                slots
+            }
+            Some((prior_fp, None)) => {
+                if prior_fp != fingerprint {
+                    return Err(StorageError::RequestIdConflict);
+                }
+                return Err(StorageError::RecoveryRequired);
+            }
+            None => self.batch_capacity_budget(context, space_id, operations)?,
+        };
+        self.prepare_batch_items_transaction(
+            &context.owner_application_id,
+            space_id,
+            batch_id,
+            fingerprint,
+            item_fingerprints,
+            Some(credits),
+        )?;
+        Ok(credits)
+    }
+
+    /// A missing escrow on an old unfinished parent is NOT a fresh operation.
+    /// Replays of the context-admitted plan must match the original escrow
+    /// exactly; the reserve helper deliberately refuses retroactive top-ups.
+    fn prepare_batch_items_transaction(
+        &self,
+        owner: &str,
+        space_id: &str,
+        batch_id: &str,
+        fingerprint: &str,
+        item_fingerprints: &[String],
+        reserved_child_slots: Option<i64>,
+    ) -> StorageResult<()> {
+        let now = now_ms();
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let real_owner: String = tx.query_row(
+            "SELECT owner_application_id FROM spaces WHERE id=?1",
+            params![space_id],
+            |r| r.get(0),
+        )?;
+        if real_owner != owner {
+            return Err(StorageError::RequestInvalid(
+                "batch scope owner mismatch".into(),
+            ));
+        }
+        let prior: Option<(String,String)> = tx.query_row("SELECT request_fingerprint,phase FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2",params![space_id,batch_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        match prior {
+            None => {
+                let version = if batch_id.starts_with("operation-v3-") {
+                    validate_new_v3_operation_id(batch_id, now)?;
+                    3
+                } else {
+                    1
+                };
+                ensure_v3_result_capacity(&tx, now)?;
+                tx.execute("INSERT INTO durable_operations(scope_kind,scope_id,request_id,operation_id,kind,owner_application_id,identity_version,request_fingerprint,phase,request_started_at_ms,created_at_ms,updated_at_ms) VALUES('space',?1,?2,?2,'BATCH',?3,?4,?5,'RUNNING',?6,?6,?6)",params![space_id,batch_id,owner,version,fingerprint,now])?;
+                for (index, child_fingerprint) in item_fingerprints.iter().enumerate() {
+                    tx.execute("INSERT INTO durable_operation_items(scope_kind,scope_id,request_id,item_index,item_fingerprint,phase,updated_at_ms) VALUES('space',?1,?2,?3,?4,'PENDING',?5)",params![space_id,batch_id,index as i64,child_fingerprint,now])?;
+                }
+                if let Some(slots) = reserved_child_slots {
+                    // The parent now occupies one protected actual slot.
+                    // The quota check inside reserve counts it and the full
+                    // escrow in the same SQLite IMMEDIATE critical section.
+                    reserve_capacity_escrow(
+                        &tx,
+                        "space",
+                        space_id,
+                        batch_id,
+                        owner,
+                        fingerprint,
+                        slots,
+                        true,
+                    )?;
+                }
+            }
+            Some((prior_fp, phase)) => {
+                if prior_fp != fingerprint {
+                    return Err(StorageError::RequestIdConflict);
+                }
+                if phase != "RUNNING" {
+                    return Err(StorageError::OutcomeUnknown);
+                }
+                let count: i64 = tx.query_row("SELECT COUNT(*) FROM durable_operation_items WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2",params![space_id,batch_id],|r|r.get(0))?;
+                if count != item_fingerprints.len() as i64 {
+                    return Err(StorageError::RequestIdConflict);
+                }
+                for (index, child_fingerprint) in item_fingerprints.iter().enumerate() {
+                    let expected: String = tx.query_row("SELECT item_fingerprint FROM durable_operation_items WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 AND item_index=?3",params![space_id,batch_id,index as i64],|r|r.get(0))?;
+                    if expected != *child_fingerprint {
+                        return Err(StorageError::RequestIdConflict);
+                    }
+                }
+                if let Some(slots) = reserved_child_slots {
+                    // Exact replay reuses the original grant. A pre-escrow
+                    // RUNNING parent fails closed instead of receiving fresh
+                    // capacity after possible unknown child effects.
+                    reserve_capacity_escrow(
+                        &tx,
+                        "space",
+                        space_id,
+                        batch_id,
+                        owner,
+                        fingerprint,
+                        slots,
+                        false,
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Mark the exact child request before execution, so an interrupted
+    /// parent can reconcile against its independently durable Core receipt.
+    pub fn mark_batch_item_running(
+        &self,
+        space_id: &str,
+        batch_id: &str,
+        index: usize,
+        child_request_id: &str,
+        kind: &str,
+    ) -> StorageResult<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let changed = conn.execute("UPDATE durable_operation_items SET phase='RUNNING',result_json=?1,updated_at_ms=?2 WHERE scope_kind='space' AND scope_id=?3 AND request_id=?4 AND item_index=?5 AND phase='PENDING'",
+            params![serde_json::to_string(&json!({"childRequestId":child_request_id,"kind":kind}))?,now_ms(),space_id,batch_id,index as i64])?;
+        if changed != 1 {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        Ok(())
+    }
+
+    pub fn record_batch_item(
+        &self,
+        space_id: &str,
+        batch_id: &str,
+        index: usize,
+        successful: bool,
+        result: &Value,
+    ) -> StorageResult<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        // On an uncertain child failure retain its durable child identity.
+        // Replacing RUNNING.result_json with only an error used to erase
+        // childRequestId, making receipt-based reconciliation impossible.
+        let payload = if successful {
+            result.clone()
+        } else {
+            let context: Option<String> = conn.query_row(
+                "SELECT result_json FROM durable_operation_items WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 AND item_index=?3 AND phase='RUNNING'",
+                params![space_id,batch_id,index as i64],|row| row.get(0),
+            ).optional()?;
+            let mut evidence: Value = context
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?
+                .ok_or(StorageError::OutcomeUnknown)?;
+            let object = evidence
+                .as_object_mut()
+                .ok_or(StorageError::OutcomeUnknown)?;
+            object.insert("observedError".into(), result.clone());
+            evidence
+        };
+        let affected = conn.execute("UPDATE durable_operation_items SET phase=?1,result_json=?2,updated_at_ms=?3 WHERE scope_kind='space' AND scope_id=?4 AND request_id=?5 AND item_index=?6 AND phase='RUNNING'",
+            params![if successful {"COMMITTED"} else {"RUNNING"},serde_json::to_string(&payload)?,now_ms(),space_id,batch_id,index as i64])?;
+        if affected != 1 {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        Ok(())
+    }
+
+    pub fn finish_batch_items(
+        &self,
+        space_id: &str,
+        batch_id: &str,
+        result: &Value,
+        had_uncertainty: bool,
+    ) -> StorageResult<bool> {
+        let now = now_ms();
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut pending: i64 = tx.query_row("SELECT COUNT(*) FROM durable_operation_items WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 AND phase IN ('PENDING','RUNNING')",params![space_id,batch_id],|r|r.get(0))?;
+        let cancelled = result.get("cancelled").and_then(Value::as_bool) == Some(true);
+        if pending > 0 && cancelled {
+            // PENDING means the worker has NOT acknowledged starting this
+            // child. An entirely untouched suffix may be skipped atomically
+            // on cancellation. RUNNING is an unknown possible effect and
+            // must retain escrow until receipt/intent reconciliation.
+            let running: i64=tx.query_row(
+                "SELECT COUNT(*) FROM durable_operation_items WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 AND phase='RUNNING'",
+                params![space_id,batch_id],|r|r.get(0))?;
+            if running == 0 {
+                tx.execute("UPDATE durable_operation_items SET phase='SKIPPED',result_json=?1,updated_at_ms=?2 WHERE scope_kind='space' AND scope_id=?3 AND request_id=?4 AND phase='PENDING'",
+                    params![serde_json::to_string(&json!({"cancelled":true}))?,now,space_id,batch_id])?;
+                pending = 0;
+            }
+        }
+        if pending > 0 {
+            // Unknown children cannot be retrospectively declared terminal
+            // PARTIALLY_APPLIED. They remain eligible for receipt/intent
+            // reconciliation, and the parent cannot be expired by GC.
+            let changed = tx.execute("UPDATE durable_operations SET phase='RECONCILING',result_json=?1,updated_at_ms=?2 WHERE scope_kind='space' AND scope_id=?3 AND request_id=?4 AND phase IN ('RUNNING','RECONCILING')",
+                params![serde_json::to_string(result)?,now,space_id,batch_id])?;
+            if changed != 1 {
+                return Err(StorageError::RecoveryRequired);
+            }
+            tx.commit()?;
+            return Ok(false);
+        }
+        let completed = result
+            .get("completedItems")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let phase = if cancelled && completed == 0 {
+            "ABORTED"
+        } else if had_uncertainty {
+            "PARTIALLY_APPLIED"
+        } else {
+            "COMMITTED"
+        };
+        let updated = tx.execute("UPDATE durable_operations SET phase=?1,result_json=?2,terminal_at_ms=?3,expires_at_ms=?4,updated_at_ms=?3 WHERE scope_kind='space' AND scope_id=?5 AND request_id=?6 AND phase IN ('RUNNING','RECONCILING')",params![phase,serde_json::to_string(result)?,now,now.saturating_add(DURABLE_SQL_RECEIPT_TTL_MS),space_id,batch_id])?;
+        if updated != 1 {
+            return Err(StorageError::RecoveryRequired);
+        }
+        let has_escrow: bool=tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM durable_capacity_escrows WHERE scope_kind='space' AND scope_id=?1 AND root_request_id=?2)",
+            params![space_id,batch_id],|r|r.get::<_,i64>(0))? != 0;
+        if has_escrow {
+            close_capacity_escrow(&tx, "space", space_id, batch_id)?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// A child receipt proves that a Core SQL/file write committed before
+    /// the batch parent captured its result. Other child classes may have
+    /// filesystem intents; leave them RECONCILING rather than executing twice.
+    fn reconcile_batch_child_receipts(&self) -> StorageResult<()> {
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut stmt = tx.prepare("SELECT i.scope_id,i.request_id,i.item_index,i.result_json FROM durable_operation_items i JOIN durable_operations p ON p.scope_kind=i.scope_kind AND p.scope_id=i.scope_id AND p.request_id=i.request_id WHERE p.kind='BATCH' AND i.phase='RUNNING'")?;
+        let mut rows = stmt.query([])?;
+        let mut unfinished = Vec::new();
+        while let Some(row) = rows.next()? {
+            unfinished.push((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ));
+        }
+        drop(rows);
+        drop(stmt);
+        for (space_id, parent_id, index, data) in unfinished {
+            let context: Value = serde_json::from_str(&data)?;
+            let Some(id) = context.get("childRequestId").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(kind) = context.get("kind").and_then(Value::as_str) else {
+                continue;
+            };
+            let receipt: Option<(String,String,i64)> = tx.query_row("SELECT operation,result_json,created_at_ms FROM mutation_receipts WHERE space_id=?1 AND request_id=?2",
+                params![space_id,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+            let Some((operation, payload, receipt_at)) = receipt else {
+                // In particular, absence of an FS-intent receipt does not prove
+                // that a delete/move/copy never changed the filesystem.
+                continue;
+            };
+            let parent_at: i64 = tx.query_row("SELECT request_started_at_ms FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 AND kind='BATCH'",
+                params![space_id,parent_id],|r|r.get(0))?;
+            if receipt_at < parent_at {
+                continue;
+            } // historical legacy receipt is not proof of this child
+            let result = match kind {
+                "write-file" => {
+                    let value: FileRecord = serde_json::from_str(&payload)?;
+                    if operation != file_write_operation(&value.path) {
+                        return Err(StorageError::RecoveryRequired);
+                    }
+                    json!({"index":index,"operationType":"write-file","ok":true,
+                        "file":value,"kv":null,"affectedFiles":null,"error":null})
+                }
+                "kv-set" => {
+                    if !operation.starts_with("kv-set:") {
+                        return Err(StorageError::RecoveryRequired);
+                    }
+                    let value: KvRecord = serde_json::from_str(&payload)?;
+                    json!({"index":index,"operationType":"kv-set","ok":true,
+                        "file":null,"kv":value,"affectedFiles":null,"error":null})
+                }
+                "delete" | "copy" | "move" => {
+                    let prefix = match kind {
+                        "delete" => "fs-delete:",
+                        "copy" => "fs-copy:",
+                        _ => "fs-move:",
+                    };
+                    if !operation.starts_with(prefix) {
+                        return Err(StorageError::RecoveryRequired);
+                    }
+                    let count: u64 = serde_json::from_str(&payload)?;
+                    json!({"index":index,"operationType":kind,"ok":true,
+                        "file":null,"kv":null,"affectedFiles":count,"error":null})
+                }
+                _ => return Err(StorageError::RecoveryRequired),
+            };
+            tx.execute("UPDATE durable_operation_items SET phase='COMMITTED',result_json=?1,updated_at_ms=?2 WHERE scope_kind='space' AND scope_id=?3 AND request_id=?4 AND item_index=?5 AND phase='RUNNING'",
+                params![serde_json::to_string(&result)?,now_ms(),space_id,parent_id,index])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// All claims are acquired before touching SQLite; the owned lease can move
+    /// into an async worker. Nested helpers reuse its MutationContext.
+    pub fn admit(&self, claims: Vec<Claim>) -> StorageResult<AdmissionLease> {
+        self.admission.acquire(claims)
+    }
+
+    /// Nonblocking exclusive admission for a future BATCH worker. Retaining
+    /// this owned context through spawn_blocking prevents another authorized
+    /// space mutator from changing the capacity envelope. The runtime must
+    /// *not* activate it before atomic root+escrow admission is wired.
+    fn try_begin_batch_mutation(
+        &self,
+        owner: &str,
+        space_id: &str,
+        root_request_id: &str,
+    ) -> StorageResult<BatchMutationContext> {
+        validate_request_id(root_request_id)?;
+        let lease = self.admission.try_acquire(vec![
+            Claim::global_shared(),
+            Claim::space_exclusive(space_id),
+        ])?;
+        self.ensure_space_mutable(space_id)?;
+        let actual_owner: Option<String> = {
+            let conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            conn.query_row(
+                "SELECT owner_application_id FROM spaces WHERE id=?1",
+                params![space_id],
+                |row| row.get(0),
+            )
+            .optional()?
+        };
+        if actual_owner.as_deref() != Some(owner) {
+            return Err(StorageError::RequestInvalid(
+                "batch owner/space mismatch".into(),
+            ));
+        }
+        Ok(BatchMutationContext {
+            owner_application_id: owner.to_owned(),
+            space_id: space_id.to_owned(),
+            root_request_id: root_request_id.to_owned(),
+            lease,
+        })
+    }
+
+    /// Metadata-only immutable capacity envelope. Caller owns the exclusive
+    /// space lease for the entire read/plan/admission/worker lifetime; other
+    /// authorized writers cannot increase the source tree behind the plan.
+    /// The returned number counts child outcomes only: the new BATCH parent
+    /// is one separate protected actual slot in the admission transaction.
+    fn batch_capacity_budget(
+        &self,
+        context: &BatchMutationContext,
+        space_id: &str,
+        operations: &[BatchCapacityOperation],
+    ) -> StorageResult<i64> {
+        context.verify(self, space_id)?;
+        self.ensure_space_mutable(space_id)?;
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT logical_path FROM file_entries WHERE space_id=?1 ORDER BY logical_path",
+        )?;
+        let mut rows = stmt.query(params![space_id])?;
+        let mut paths = Vec::new();
+        while let Some(row) = rows.next()? {
+            if paths.len() >= V3_PROTECTED_RECEIPT_CAPACITY as usize {
+                return Err(g7_capacity_error());
+            }
+            paths.push(row.get::<_, String>(0)?);
+        }
+        batch_capacity_envelope(&paths, operations)
+    }
+
+    /// Internal children execute with the outer space-exclusive lease rather
+    /// than reacquiring an incompatible space-shared/path claim. Every child
+    /// retains its own existing Core validation and receipt implementation.
+    #[allow(clippy::too_many_arguments)]
+    fn batch_write_file_with_metadata(
+        &self,
+        context: &BatchMutationContext,
+        space_id: &str,
+        path: &str,
+        bytes: &[u8],
+        if_match: Option<&str>,
+        metadata: Option<&FileMetadata>,
+        request_id: &str,
+    ) -> StorageResult<FileRecord> {
+        context.verify(self, space_id)?;
+        self.write_file_fault_with_metadata_using_lease(
+            space_id,
+            path,
+            bytes,
+            if_match,
+            metadata,
+            request_id,
+            AtomicWriteFault::None,
+            Some(&context.lease),
+        )
+    }
+
+    // Retained legacy helper; not part of the active mutation path.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    fn batch_kv_set_outcome(
+        &self,
+        context: &BatchMutationContext,
+        space_id: &str,
+        key: &str,
+        value: &Value,
+        if_version: Option<u64>,
+        if_match: Option<&str>,
+        request_id: &str,
+    ) -> StorageResult<MutationResult<KvRecord>> {
+        context.verify(self, space_id)?;
+        self.kv_set_outcome_using_lease(
+            space_id,
+            key,
+            value,
+            if_version,
+            if_match,
+            request_id,
+            Some(&context.lease),
+        )
+    }
+
+    /// KV is wholly transactional: the value, version, terminal receipt and
+    /// parent credit transfer either all commit, or all roll back. This path
+    /// is private until all other BATCH child kinds are escrow-aware.
+    #[allow(clippy::too_many_arguments)]
+    fn batch_kv_set_with_credit(
+        &self,
+        context: &BatchMutationContext,
+        space_id: &str,
+        index: usize,
+        item_fingerprint: &str,
+        key: &str,
+        value: &Value,
+        if_version: Option<u64>,
+        if_match: Option<&str>,
+        request_id: &str,
+    ) -> StorageResult<MutationResult<KvRecord>> {
+        context.verify(self, space_id)?;
+        self.kv_set_outcome_using_lease_and_credit(
+            space_id,
+            key,
+            value,
+            if_version,
+            if_match,
+            request_id,
+            Some(&context.lease),
+            Some(BatchReceiptCredit {
+                context,
+                item_index: index,
+                item_fingerprint,
+            }),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn batch_delete_path_with_progress<F, P>(
+        &self,
+        context: &BatchMutationContext,
+        space_id: &str,
+        path: &str,
+        recursive: bool,
+        if_match: Option<&str>,
+        request_id: &str,
+        is_cancelled: F,
+        progress: P,
+    ) -> StorageResult<u64>
+    where
+        F: Fn() -> bool,
+        P: FnMut(u64, Option<u64>),
+    {
+        context.verify(self, space_id)?;
+        self.ensure_space_mutable(space_id)?;
+        self.delete_path_in_context(
+            space_id,
+            path,
+            recursive,
+            if_match,
+            request_id,
+            &context.lease,
+            is_cancelled,
+            progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn batch_copy_path_with_progress<F, P>(
+        &self,
+        context: &BatchMutationContext,
+        space_id: &str,
+        from: &str,
+        to: &str,
+        overwrite: bool,
+        request_id: &str,
+        is_cancelled: F,
+        progress: P,
+    ) -> StorageResult<u64>
+    where
+        F: Fn() -> bool,
+        P: FnMut(u64, Option<u64>),
+    {
+        context.verify(self, space_id)?;
+        self.ensure_space_mutable(space_id)?;
+        self.copy_path_in_context(
+            space_id,
+            from,
+            to,
+            overwrite,
+            request_id,
+            &context.lease,
+            is_cancelled,
+            progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn batch_move_path_with_progress<F, P>(
+        &self,
+        context: &BatchMutationContext,
+        space_id: &str,
+        from: &str,
+        to: &str,
+        overwrite: bool,
+        if_match: Option<&str>,
+        request_id: &str,
+        is_cancelled: F,
+        progress: P,
+    ) -> StorageResult<u64>
+    where
+        F: Fn() -> bool,
+        P: FnMut(u64, Option<u64>),
+    {
+        context.verify(self, space_id)?;
+        self.ensure_space_mutable(space_id)?;
+        self.move_path_in_context(
+            space_id,
+            from,
+            to,
+            overwrite,
+            if_match,
+            request_id,
+            &context.lease,
+            is_cancelled,
+            progress,
+        )
+    }
+
+    /// U1/U2: the only active BATCH entry. Space exclusivity extends from
+    /// immutable metadata planning through the synchronous worker's lifetime.
+    /// A resume with an unfinished legacy root lacking escrow fails closed.
+    pub fn begin_batch_execution(
+        &self,
+        owner: &str,
+        space_id: &str,
+        root_request_id: &str,
+        root_fingerprint: &str,
+        item_fingerprints: &[String],
+        plan: &[BatchCapacityOperation],
+    ) -> StorageResult<BatchExecution> {
+        let context = self.try_begin_batch_mutation(owner, space_id, root_request_id)?;
+        self.prepare_batch_items_in_context(
+            &context,
+            space_id,
+            root_request_id,
+            root_fingerprint,
+            item_fingerprints,
+            plan,
+        )?;
+        Ok(BatchExecution {
+            context,
+            item_fingerprints: item_fingerprints.to_vec(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_batch_write(
+        &self,
+        batch: &BatchExecution,
+        index: usize,
+        space_id: &str,
+        path: &str,
+        bytes: &[u8],
+        if_match: Option<&str>,
+        metadata: Option<&FileMetadata>,
+        request_id: &str,
+    ) -> StorageResult<FileRecord> {
+        batch.with_child(self, index, request_id, || {
+            self.batch_write_file_with_metadata(
+                &batch.context,
+                space_id,
+                path,
+                bytes,
+                if_match,
+                metadata,
+                request_id,
+            )
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_batch_delete<F, P>(
+        &self,
+        batch: &BatchExecution,
+        index: usize,
+        space_id: &str,
+        path: &str,
+        recursive: bool,
+        if_match: Option<&str>,
+        request_id: &str,
+        cancelled: F,
+        progress: P,
+    ) -> StorageResult<u64>
+    where
+        F: Fn() -> bool,
+        P: FnMut(u64, Option<u64>),
+    {
+        batch.with_child(self, index, request_id, || {
+            self.batch_delete_path_with_progress(
+                &batch.context,
+                space_id,
+                path,
+                recursive,
+                if_match,
+                request_id,
+                cancelled,
+                progress,
+            )
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_batch_copy<F, P>(
+        &self,
+        batch: &BatchExecution,
+        index: usize,
+        space_id: &str,
+        from: &str,
+        to: &str,
+        overwrite: bool,
+        request_id: &str,
+        cancelled: F,
+        progress: P,
+    ) -> StorageResult<u64>
+    where
+        F: Fn() -> bool,
+        P: FnMut(u64, Option<u64>),
+    {
+        batch.with_child(self, index, request_id, || {
+            self.batch_copy_path_with_progress(
+                &batch.context,
+                space_id,
+                from,
+                to,
+                overwrite,
+                request_id,
+                cancelled,
+                progress,
+            )
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_batch_move<F, P>(
+        &self,
+        batch: &BatchExecution,
+        index: usize,
+        space_id: &str,
+        from: &str,
+        to: &str,
+        overwrite: bool,
+        if_match: Option<&str>,
+        request_id: &str,
+        cancelled: F,
+        progress: P,
+    ) -> StorageResult<u64>
+    where
+        F: Fn() -> bool,
+        P: FnMut(u64, Option<u64>),
+    {
+        batch.with_child(self, index, request_id, || {
+            self.batch_move_path_with_progress(
+                &batch.context,
+                space_id,
+                from,
+                to,
+                overwrite,
+                if_match,
+                request_id,
+                cancelled,
+                progress,
+            )
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_batch_kv(
+        &self,
+        batch: &BatchExecution,
+        index: usize,
+        space_id: &str,
+        key: &str,
+        value: &Value,
+        if_version: Option<u64>,
+        if_match: Option<&str>,
+        request_id: &str,
+    ) -> StorageResult<MutationResult<KvRecord>> {
+        // KV already transfers its credit in the exact SQL transaction.
+        // Do not set the filesystem scoped-credit flag for this path.
+        let fp = batch
+            .item_fingerprints
+            .get(index)
+            .ok_or(StorageError::RequestIdConflict)?;
+        self.batch_kv_set_with_credit(
+            &batch.context,
+            space_id,
+            index,
+            fp,
+            key,
+            value,
+            if_version,
+            if_match,
+            request_id,
+        )
+    }
+
+    /// Claim first, then validate durable health; never wait for admission with a DB lock.
+    fn admit_space(&self, space_id: &str, mut claims: Vec<Claim>) -> StorageResult<AdmissionLease> {
+        claims.push(Claim::global_shared());
+        claims.push(Claim::space_shared(space_id));
+        let lease = self.admit(claims)?;
+        self.ensure_space_mutable(space_id)?;
+        Ok(lease)
+    }
+
+    pub fn try_admit_stream_path(
+        &self,
+        space_id: &str,
+        raw_path: &str,
+    ) -> StorageResult<AdmissionLease> {
+        let logical = LogicalPath::parse(raw_path)?;
+        let lease = self.admission.try_acquire(vec![
+            Claim::global_shared(),
+            Claim::space_shared(space_id),
+            Claim::path(space_id, logical.as_str()),
+        ])?;
+        self.ensure_space_mutable(space_id)?;
+        Ok(lease)
+    }
+
+    fn ensure_space_mutable(&self, space_id: &str) -> StorageResult<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let state: Option<String> = conn
+            .query_row(
+                "SELECT state FROM spaces WHERE id=?1",
+                params![space_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match state.as_deref() {
+            Some("healthy") => {}
+            Some(_) => return Err(StorageError::RecoveryRequired),
+            None => return Err(StorageError::NotFound("space".into())),
+        }
+        let pending: i64 = conn.query_row("SELECT COUNT(*) FROM filesystem_intents WHERE scope_kind='space' AND scope_id=?1 AND state IN ('PREPARED','FS_APPLIED','NEEDS_REPAIR')", params![space_id], |row| row.get(0))?;
+        if pending > 0 {
+            return Err(StorageError::RecoveryRequired);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_fs_intent(
+        &self,
+        intent_id: &str,
+        space_id: &str,
+        request_id: &str,
+        kind: &str,
+        source_rel: Option<&str>,
+        destination_rel: Option<&str>,
+        quarantine_rel: Option<&str>,
+        payload: &Value,
+    ) -> StorageResult<String> {
+        validate_request_id(request_id)?;
+        let fingerprint = semantic_fingerprint(kind, payload)?;
+        let now = now_ms();
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing: Option<String> = tx.query_row("SELECT request_fingerprint FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2",params![space_id,request_id],|row|row.get(0)).optional()?;
+        if let Some(previous) = existing {
+            return Err(if previous == fingerprint {
+                StorageError::RecoveryRequired
+            } else {
+                StorageError::RequestIdConflict
+            });
+        }
+        let owner: String = tx.query_row(
+            "SELECT owner_application_id FROM spaces WHERE id=?1",
+            params![space_id],
+            |row| row.get(0),
+        )?;
+        if request_id.starts_with("request-v3-") {
+            validate_new_v3_request_id(request_id, now)?;
+        }
+        // Every filesystem intent has a durable parent AND may commit a
+        // fingerprinted SQL receipt. Reserve both while the admission
+        // transaction is still open, before any filesystem effect. Counting
+        // only the parent could otherwise reach capacity before the public
+        // terminal evidence is stored.
+        ensure_v3_result_capacity_slots(&tx, now, 2)?;
+        if active_capacity_credit().is_some()
+            && !spend_scoped_proof(&tx, space_id, request_id, "PARENT", &fingerprint, 1)?
+        {
+            return Err(StorageError::RecoveryRequired);
+        }
+        tx.execute("INSERT INTO durable_operations(scope_kind,scope_id,request_id,kind,owner_application_id,identity_version,request_fingerprint,phase,request_started_at_ms,created_at_ms,updated_at_ms) VALUES('space',?1,?2,?3,?4,3,?5,'ADMITTED',?6,?6,?6)",params![space_id,request_id,kind,owner,fingerprint,now])?;
+        tx.execute("INSERT INTO filesystem_intents(intent_id,scope_kind,scope_id,request_id,intent_kind,source_rel,destination_rel,quarantine_rel,state,payload_json,updated_at_ms) VALUES(?1,'space',?2,?3,?4,?5,?6,?7,'PREPARED',?8,?9)",params![intent_id,space_id,request_id,kind,source_rel,destination_rel,quarantine_rel,serde_json::to_string(payload)?,now])?;
+        tx.commit()?;
+        Ok(intent_id.to_owned())
+    }
+
+    fn transition_fs_intent(&self, id: &str, state: &str) -> StorageResult<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let count = conn.execute("UPDATE filesystem_intents SET state=?1,updated_at_ms=?2 WHERE intent_id=?3 AND state IN ('PREPARED','FS_APPLIED','DB_COMMITTED')",params![state,now_ms(),id])?;
+        if count != 1 {
+            return Err(StorageError::RecoveryRequired);
+        }
+        Ok(())
+    }
+
+    fn complete_fs_intent<T: serde::Serialize>(
+        &self,
+        tx: &Transaction<'_>,
+        id: &str,
+        space_id: &str,
+        request_id: &str,
+        operation: &str,
+        value: &T,
+    ) -> StorageResult<()> {
+        let now = now_ms();
+        tx.execute("UPDATE filesystem_intents SET state='DB_COMMITTED',updated_at_ms=?1 WHERE intent_id=?2", params![now,id])?;
+        let updated = tx.execute("UPDATE durable_operations SET phase='COMMITTED',result_json=?1,terminal_at_ms=?2,expires_at_ms=?3,updated_at_ms=?2,cleanup_pending=1 WHERE scope_kind='space' AND scope_id=?4 AND request_id=?5 AND phase='ADMITTED'",
+            params![serde_json::to_string(value)?,now,now.saturating_add(DURABLE_SQL_RECEIPT_TTL_MS),space_id,request_id])?;
+        if updated != 1 {
+            return Err(StorageError::RecoveryRequired);
+        }
+        // CP14-converted DELETE/MOVE/snapshot-delete use fingerprinted receipts.
+        // Remaining FS-intent callers stay on their existing wire contract
+        // until their own admission paths are migrated.
+        if operation.starts_with("fs-delete:")
+            || operation.starts_with("fs-move:")
+            || operation == "snapshot-delete"
+        {
+            let fingerprint: String = tx.query_row(
+                "SELECT request_fingerprint FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 AND phase='COMMITTED'",
+                params![space_id, request_id], |row| row.get(0),
+            )?;
+            sql_atomic_store(
+                tx,
+                false,
+                space_id,
+                request_id,
+                operation,
+                &fingerprint,
+                value,
+            )?;
+        } else {
+            store_receipt(tx, space_id, request_id, operation, value)?;
+        }
+        Ok(())
+    }
+
+    fn mark_fs_intent_aborted(
+        &self,
+        id: &str,
+        space_id: &str,
+        request_id: &str,
+    ) -> StorageResult<()> {
+        let now = now_ms();
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE filesystem_intents SET state='CLEANED',updated_at_ms=?1 WHERE intent_id=?2",
+            params![now, id],
+        )?;
+        tx.execute("UPDATE durable_operations SET phase='ABORTED',terminal_at_ms=?1,expires_at_ms=?2,updated_at_ms=?1 WHERE scope_id=?3 AND request_id=?4 AND phase='ADMITTED' AND NOT EXISTS(SELECT 1 FROM filesystem_intents WHERE scope_id=?3 AND request_id=?4 AND state<>'CLEANED')",params![now,now.saturating_add(DURABLE_SQL_RECEIPT_TTL_MS),space_id,request_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn finish_fs_cleanup(&self, intent_id: &str) -> StorageResult<()> {
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE filesystem_intents SET state='CLEANED',updated_at_ms=?1 WHERE intent_id=?2 AND state='DB_COMMITTED'",params![now_ms(),intent_id])?;
+        tx.execute("UPDATE durable_operations SET cleanup_pending=0,updated_at_ms=?1 WHERE EXISTS (SELECT 1 FROM filesystem_intents WHERE intent_id=?2 AND scope_kind=durable_operations.scope_kind AND scope_id=durable_operations.scope_id AND request_id=durable_operations.request_id) AND NOT EXISTS (SELECT 1 FROM filesystem_intents i WHERE i.scope_kind=durable_operations.scope_kind AND i.scope_id=durable_operations.scope_id AND i.request_id=durable_operations.request_id AND i.state<>'CLEANED')", params![now_ms(),intent_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Reconcile v3 filesystem intents under the exclusively owned storage root.
+    /// Unprovable states fence future writes rather than guessing that an operation failed.
+    fn prepare_composite_copy(
+        &self,
+        space_id: &str,
+        request_id: &str,
+        fingerprint: &str,
+        operation: &str,
+        item_fingerprints: &[String],
+    ) -> StorageResult<()> {
+        let now = now_ms();
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing: Option<(String,String,Option<String>)> = tx.query_row(
+            "SELECT request_fingerprint,phase,result_json FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2",
+            params![space_id,request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional()?;
+        if let Some((previous, phase, original_intent)) = existing {
+            if original_intent
+                .as_deref()
+                .and_then(|v| serde_json::from_str::<Value>(v).ok())
+                .and_then(|v| {
+                    v.get("copyIntent")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .is_some_and(|intent| intent != operation)
+            {
+                return Err(StorageError::RequestIdConflict);
+            }
+            if previous != fingerprint {
+                return Err(StorageError::RecoveryRequired);
+            }
+            if phase == "COMMITTED" || phase == "NEEDS_REPAIR" || phase == "ABORTED" {
+                return Err(StorageError::RecoveryRequired);
+            }
+            return Ok(());
+        }
+        let owner: String = tx.query_row(
+            "SELECT owner_application_id FROM spaces WHERE id=?1",
+            params![space_id],
+            |r| r.get(0),
+        )?;
+        if request_id.starts_with("request-v3-") {
+            validate_new_v3_request_id(request_id, now)?;
+        }
+        let item_slots = i64::try_from(item_fingerprints.len()).map_err(|_| {
+            StorageError::StorageUnavailable("copy plan exceeds receipt capacity".into())
+        })?;
+        ensure_v3_result_capacity_slots(&tx, now, item_slots.saturating_add(2))?;
+        if active_capacity_credit().is_some() {
+            if !spend_scoped_proof(&tx, space_id, request_id, "PARENT", fingerprint, 2)? {
+                return Err(StorageError::RecoveryRequired);
+            }
+            for (index, item_fp) in item_fingerprints.iter().enumerate() {
+                let child_id = format!("{request_id}:copy:{index}");
+                if !spend_scoped_proof(&tx, space_id, &child_id, "PARENT", item_fp, 1)? {
+                    return Err(StorageError::RecoveryRequired);
+                }
+            }
+        }
+        // Store the immutable caller intent separately from the selected
+        // source manifest. This avoids a false collision when a RUNNING
+        // parent is revisited after the source has changed.
+        let intent = serde_json::to_string(&json!({"copyIntent":operation}))?;
+        tx.execute("INSERT INTO durable_operations(scope_kind,scope_id,request_id,kind,owner_application_id,identity_version,request_fingerprint,phase,result_json,request_started_at_ms,created_at_ms,updated_at_ms) VALUES('space',?1,?2,'COPY',?3,3,?4,'RUNNING',?5,?6,?6,?6)",params![space_id,request_id,owner,fingerprint,intent,now])?;
+        // Persist every child reservation atomically with the COPY parent,
+        // not incrementally after its filesystem writes have begun.
+        for (index, item_fingerprint) in item_fingerprints.iter().enumerate() {
+            let child_id = format!("{request_id}:copy:{index}");
+            tx.execute("INSERT INTO durable_operation_items(scope_kind,scope_id,request_id,item_index,item_fingerprint,phase,result_json,updated_at_ms) VALUES('space',?1,?2,?3,?4,'PENDING',?5,?6)",
+                params![space_id,request_id,index as i64,item_fingerprint,
+                    serde_json::to_string(&json!({"childRequestId":child_id}))?,now])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn register_copy_item(
+        &self,
+        space_id: &str,
+        request_id: &str,
+        index: usize,
+        fingerprint: &str,
+    ) -> StorageResult<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let prior: Option<String> = conn.query_row("SELECT item_fingerprint FROM durable_operation_items WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 AND item_index=?3",params![space_id,request_id,index as i64],|r|r.get(0)).optional()?;
+        if let Some(previous) = prior {
+            return if previous == fingerprint {
+                Ok(())
+            } else {
+                Err(StorageError::RequestIdConflict)
+            };
+        }
+        // An unplanned child cannot borrow quota after the first COPY effect.
+        Err(StorageError::RecoveryRequired)
+    }
+
+    fn confirm_copy_item(
+        &self,
+        space_id: &str,
+        request_id: &str,
+        index: usize,
+        record: &FileRecord,
+    ) -> StorageResult<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        conn.execute("UPDATE durable_operation_items SET phase='COMMITTED',result_json=?1,updated_at_ms=?2 WHERE scope_kind='space' AND scope_id=?3 AND request_id=?4 AND item_index=?5 AND phase IN ('PENDING','RUNNING','COMMITTED')",params![serde_json::to_string(record)?,now_ms(),space_id,request_id,index as i64])?;
+        Ok(())
+    }
+
+    fn complete_composite_copy(
+        &self,
+        space_id: &str,
+        request_id: &str,
+        operation: &str,
+        count: u64,
+    ) -> StorageResult<()> {
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = now_ms();
+        let fingerprint: String = tx.query_row(
+            "SELECT request_fingerprint FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 AND kind='COPY' AND phase='RUNNING'",
+            params![space_id,request_id], |row| row.get(0),
+        )?;
+        let updated = tx.execute("UPDATE durable_operations SET phase='COMMITTED',result_json=?1,terminal_at_ms=?2,expires_at_ms=?3,updated_at_ms=?2 WHERE scope_kind='space' AND scope_id=?4 AND request_id=?5 AND phase='RUNNING'",params![serde_json::to_string(&count)?,now,now.saturating_add(DURABLE_SQL_RECEIPT_TTL_MS),space_id,request_id])?;
+        if updated != 1 {
+            return Err(StorageError::RecoveryRequired);
+        }
+        sql_atomic_store(
+            &tx,
+            false,
+            space_id,
+            request_id,
+            operation,
+            &fingerprint,
+            &count,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn recover_filesystem_intents(&self) -> StorageResult<()> {
+        type Row = (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let intents: Vec<Row> = {
+            let conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            let mut stmt = conn.prepare("SELECT intent_id,scope_id,request_id,intent_kind,state,scope_kind,source_rel,destination_rel,quarantine_rel FROM filesystem_intents WHERE state <> 'CLEANED' ORDER BY updated_at_ms,intent_id")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (id, scope, request, kind, state, scope_kind, source, destination, quarantine) in
+            intents
+        {
+            if scope_kind != "space" && scope_kind != "application" {
+                continue;
+            }
+            let parsed = (|| -> StorageResult<()> {
+                let resolve = |rel: &Option<String>| -> StorageResult<Option<PathBuf>> {
+                    let Some(rel) = rel else {
+                        return Ok(None);
+                    };
+                    let path = Path::new(rel);
+                    if path.is_absolute()
+                        || path
+                            .components()
+                            .any(|c| !matches!(c, Component::Normal(_)))
+                    {
+                        return Err(StorageError::PathInvalid(
+                            "filesystem journal path invalid".into(),
+                        ));
+                    }
+                    Ok(Some(self.root.join(path)))
+                };
+                let source = resolve(&source)?;
+                let destination = resolve(&destination)?;
+                let quarantine = resolve(&quarantine)?;
+                // Already committed data wins: cleanup cannot convert a valid receipt into an error.
+                if state == "DB_COMMITTED" {
+                    if let Some(ref quarantine) = quarantine {
+                        if let Ok(meta) = fs::symlink_metadata(quarantine) {
+                            if is_link_like(&meta) {
+                                return Err(StorageError::RecoveryRequired);
+                            }
+                            if meta.is_dir() {
+                                fs::remove_dir_all(quarantine)?;
+                            } else {
+                                fs::remove_file(quarantine)?;
+                            }
+                        }
+                    }
+                    self.finish_fs_cleanup(&id)?;
+                    return Ok(());
+                }
+                if state == "NEEDS_REPAIR" {
+                    return Err(StorageError::RecoveryRequired);
+                }
+                if !matches!(
+                    kind.as_str(),
+                    "DELETE"
+                        | "MOVE"
+                        | "SNAPSHOT_DELETE"
+                        | "SPACE_REPLACE"
+                        | "SPACE_DELETE"
+                        | "APP_DELETE"
+                        | "SPACE_MANIFEST"
+                ) {
+                    return Err(StorageError::RecoveryRequired);
+                }
+                let from = source.as_ref().ok_or(StorageError::RecoveryRequired)?;
+                let to_restore = if kind == "MOVE" {
+                    destination.as_ref()
+                } else {
+                    quarantine.as_ref()
+                }
+                .ok_or(StorageError::RecoveryRequired)?;
+                let staged_exists = fs::symlink_metadata(to_restore).is_ok();
+                let source_exists = fs::symlink_metadata(from).is_ok();
+                if staged_exists && source_exists && kind == "SPACE_MANIFEST" {
+                    atomic_replace(to_restore, from)?;
+                    sync_parent(from.parent());
+                } else if staged_exists && source_exists && kind == "SPACE_REPLACE" {
+                    // Stage was installed but registry never committed: park it safely
+                    // then restore the prior generation from its durable quarantine.
+                    let staging = destination.as_ref().ok_or(StorageError::RecoveryRequired)?;
+                    if fs::symlink_metadata(staging).is_ok() {
+                        return Err(StorageError::RecoveryRequired);
+                    }
+                    if let Some(parent) = staging.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::rename(from, staging)?;
+                    fs::rename(to_restore, from)?;
+                    sync_parent(from.parent());
+                } else if staged_exists && !source_exists {
+                    if let Some(parent) = from.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::rename(to_restore, from)?;
+                    sync_parent(from.parent());
+                } else if staged_exists == source_exists {
+                    // Both or neither are present: a safe automatic decision is impossible.
+                    return Err(StorageError::RecoveryRequired);
+                }
+                if kind == "SPACE_REPLACE" {
+                    // A crash after writing a category manifest but before the
+                    // registry commit leaves old SQL metadata authoritative.
+                    // Recreate its manifest only after old data is restored.
+                    let space = self
+                        .get_space(&scope)?
+                        .ok_or(StorageError::RecoveryRequired)?;
+                    let owner = self
+                        .get_application(&space.owner_application_id)?
+                        .ok_or(StorageError::RecoveryRequired)?;
+                    write_space_manifest(&self.root, &space, &owner)?;
+                }
+                self.mark_fs_intent_aborted(&id, &scope, &request)?;
+                Ok(())
+            })();
+            if parsed.is_err() {
+                let conn = self
+                    .connection
+                    .lock()
+                    .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+                conn.execute("UPDATE filesystem_intents SET state='NEEDS_REPAIR',updated_at_ms=?1 WHERE intent_id=?2 AND state NOT IN ('DB_COMMITTED','CLEANED')",params![now_ms(),id])?;
+                conn.execute("UPDATE durable_operations SET phase='NEEDS_REPAIR',updated_at_ms=?1 WHERE scope_kind=?4 AND scope_id=?2 AND request_id=?3 AND phase NOT IN ('COMMITTED','ABORTED','PARTIALLY_APPLIED')",params![now_ms(),scope,request,scope_kind])?;
+                if scope_kind == "application" {
+                    conn.execute(
+                        "UPDATE spaces SET state='recovery_required' WHERE owner_application_id=?1",
+                        params![scope],
+                    )?;
+                } else {
+                    conn.execute(
+                        "UPDATE spaces SET state='recovery_required' WHERE id=?1",
+                        params![scope],
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Finish a snapshot whose DB records committed before directory publication.
+    /// Check both registry identity and staged content to avoid adopting unknown
+    /// directories or mislabeling an incomplete snapshot as healthy.
+    fn recover_staged_snapshot(
+        &self,
+        space_id: &str,
+        snapshot_id: &str,
+        snapshots_root: &Path,
+    ) -> StorageResult<()> {
+        let staged = snapshots_root.join(format!(".staging-{snapshot_id}"));
+        let final_path = snapshots_root.join(snapshot_id);
+        if let Ok(meta) = fs::symlink_metadata(&final_path) {
+            if !meta.is_dir() || is_link_like(&meta) {
+                return Err(StorageError::RecoveryRequired);
+            }
+            return Ok(());
+        }
+        let staged_meta =
+            fs::symlink_metadata(&staged).map_err(|_| StorageError::RecoveryRequired)?;
+        if is_link_like(&staged_meta) || !staged_meta.is_dir() {
+            return Err(StorageError::RecoveryRequired);
+        }
+        let manifest_path = staged.join("snapshot.json");
+        ensure_no_symlink_escape(&staged, &manifest_path)?;
+        if fs::metadata(&manifest_path)?.len() > MAX_BACKUP_MANIFEST_BYTES {
+            return Err(StorageError::RecoveryRequired);
+        }
+        let manifest: SnapshotDiskManifest = serde_json::from_slice(&fs::read(manifest_path)?)?;
+        if manifest.snapshot.space_id != space_id
+            || manifest.snapshot.id != snapshot_id
+            || manifest.snapshot.file_count != manifest.files.len() as u64
+        {
+            return Err(StorageError::RecoveryRequired);
+        }
+        let (files_in_registry, kv_in_registry): (i64, i64) = {
+            let conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            let file_count = conn.query_row(
+                "SELECT COUNT(*) FROM snapshot_file_entries WHERE snapshot_id=?1",
+                params![snapshot_id],
+                |r| r.get::<_, i64>(0),
+            )?;
+            let kv_count = conn.query_row(
+                "SELECT COUNT(*) FROM snapshot_kv_entries WHERE snapshot_id=?1",
+                params![snapshot_id],
+                |r| r.get::<_, i64>(0),
+            )?;
+            (file_count, kv_count)
+        };
+        if files_in_registry != manifest.files.len() as i64
+            || kv_in_registry != manifest.kv.len() as i64
+        {
+            return Err(StorageError::RecoveryRequired);
+        }
+        // Counts alone are insufficient: a stale staging directory with equal
+        // counts must not be adopted as an unrelated committed generation.
+        {
+            let conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            for record in &manifest.files {
+                let stored: Option<(String,i64)> = conn.query_row(
+                    "SELECT etag,size FROM snapshot_file_entries WHERE snapshot_id=?1 AND logical_path=?2",
+                    params![snapshot_id,record.path],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+                if stored.as_ref().map(|(etag, size)| (etag.as_str(), *size))
+                    != Some((record.etag.as_str(), record.size as i64))
+                {
+                    return Err(StorageError::RecoveryRequired);
+                }
+            }
+            for record in &manifest.kv {
+                let etag: Option<String> = conn
+                    .query_row(
+                        "SELECT etag FROM snapshot_kv_entries WHERE snapshot_id=?1 AND key=?2",
+                        params![snapshot_id, record.key],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if etag.as_deref() != Some(record.etag.as_str()) {
+                    return Err(StorageError::RecoveryRequired);
+                }
+            }
+        }
+        let data_root = staged.join("data");
+        for record in &manifest.files {
+            let logical = LogicalPath::parse(&record.path)?;
+            let path = data_root.join(logical.relative());
+            ensure_no_symlink_escape(&data_root, &path)?;
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|_| StorageError::RecoveryRequired)?;
+            if is_link_like(&metadata)
+                || !metadata.is_file()
+                || metadata.len() != record.size
+                || sha256_file(&path)? != record.etag
+            {
+                return Err(StorageError::RecoveryRequired);
+            }
+        }
+        fs::rename(&staged, &final_path)?;
+        sync_parent(Some(snapshots_root));
+        Ok(())
+    }
+
+    /// An initial space row with state=initializing is the durable creation
+    /// marker. The unlisted layout can be finished after restart, provided the
+    /// directory contains no unknown user files or foreign manifest.
+    fn recover_initializing_spaces(&self) -> StorageResult<()> {
+        let spaces: Vec<SpaceRecord> = {
+            let conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            let mut stmt = conn.prepare("SELECT id,owner_application_id,key,display_name,storage_class,storage_category,created_at_ms,last_used_at_ms,logical_bytes,file_count,format_version,state FROM spaces WHERE state='initializing'")?;
+            let rows = stmt.query_map([], row_space)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for space in spaces {
+            let attempted = (|| -> StorageResult<()> {
+                let app = self
+                    .get_application(&space.owner_application_id)?
+                    .ok_or(StorageError::RecoveryRequired)?;
+                let base = self.root.join("spaces").join(&space.id);
+                if let Ok(meta) = fs::symlink_metadata(&base) {
+                    if is_link_like(&meta) || !meta.is_dir() {
+                        return Err(StorageError::RecoveryRequired);
+                    }
+                    for child in ["data", ".vontaqfs"] {
+                        let path = base.join(child);
+                        if let Ok(meta) = fs::symlink_metadata(&path) {
+                            if is_link_like(&meta) || !meta.is_dir() {
+                                return Err(StorageError::RecoveryRequired);
+                            }
+                        }
+                    }
+                    let data_root = base.join("data");
+                    if data_root.exists() && fs::read_dir(&data_root)?.next().is_some() {
+                        return Err(StorageError::RecoveryRequired);
+                    }
+                    let manifest = base.join(".vontaqfs/manifest.json");
+                    if let Ok(meta) = fs::symlink_metadata(&manifest) {
+                        if is_link_like(&meta) || !meta.is_file() {
+                            return Err(StorageError::RecoveryRequired);
+                        }
+                        let decoded: SpaceManifest = serde_json::from_slice(&fs::read(manifest)?)?;
+                        if decoded.space_id != space.id
+                            || decoded.owner_application_id != app.id
+                            || decoded.storage_category != space.storage_category
+                        {
+                            return Err(StorageError::RecoveryRequired);
+                        }
+                    }
+                }
+                create_space_layout(&self.root, &space, &app)?;
+                let conn = self
+                    .connection
+                    .lock()
+                    .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+                conn.execute(
+                    "UPDATE spaces SET state='healthy' WHERE id=?1 AND state='initializing'",
+                    params![space.id],
+                )?;
+                Ok(())
+            })();
+            if attempted.is_err() {
+                let conn = self
+                    .connection
+                    .lock()
+                    .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+                conn.execute("UPDATE spaces SET state='recovery_required' WHERE id=?1 AND state='initializing'",params![space.id])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A snapshot left between filesystem publication and SQLite metadata commit
+    /// is not a healthy generation. Do not delete unknown user bytes automatically.
+    fn fence_inconsistent_snapshots(&self) -> StorageResult<()> {
+        let spaces: Vec<String> = {
+            let conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            let mut stmt = conn.prepare("SELECT id FROM spaces")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for space_id in spaces {
+            let snapshots_root = self
+                .root
+                .join("spaces")
+                .join(&space_id)
+                .join(".vontaqfs/snapshots");
+            let registered: HashSet<String> = {
+                let conn = self
+                    .connection
+                    .lock()
+                    .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+                let mut stmt = conn.prepare("SELECT id FROM snapshots WHERE space_id=?1")?;
+                let rows = stmt.query_map(params![space_id], |r| r.get::<_, String>(0))?;
+                rows.collect::<Result<HashSet<_>, _>>()?
+            };
+            // Recover the SQL-first snapshot publication window. Unexpected or
+            // mismatching staging data remains fenced for deliberate repair.
+            let mut needs_repair = false;
+            for id in &registered {
+                let path = snapshots_root.join(id);
+                match fs::symlink_metadata(&path) {
+                    Ok(m) if m.is_dir() && !is_link_like(&m) => {}
+                    _ => {
+                        if self
+                            .recover_staged_snapshot(&space_id, id, &snapshots_root)
+                            .is_err()
+                        {
+                            needs_repair = true;
+                        }
+                    }
+                }
+            }
+            if let Ok(meta) = fs::symlink_metadata(&snapshots_root) {
+                if is_link_like(&meta) || !meta.is_dir() {
+                    needs_repair = true;
+                } else {
+                    for item in fs::read_dir(&snapshots_root)? {
+                        let item = item?;
+                        let name = item.file_name().to_string_lossy().to_string();
+                        if name.starts_with(".staging-")
+                            || name.starts_with(".delete-")
+                            || (name.starts_with("snp_") && !registered.contains(&name))
+                        {
+                            needs_repair = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            let conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            if needs_repair {
+                conn.execute(
+                    "UPDATE spaces SET state='recovery_required' WHERE id=?1",
+                    params![space_id],
+                )?;
+            } else {
+                conn.execute("UPDATE spaces SET state='healthy' WHERE id=?1 AND state='snapshot_publication_pending' AND NOT EXISTS(SELECT 1 FROM filesystem_intents WHERE scope_kind='space' AND scope_id=?1 AND state IN ('PREPARED','FS_APPLIED','NEEDS_REPAIR'))",params![space_id])?;
+            }
+        }
+        Ok(())
     }
 
     pub fn register_application(
@@ -451,15 +3032,26 @@ impl StorageEngine {
         })
     }
 
-    /// Terminal journal outcomes outlive core's 24h mutation-receipt window.
-    /// Unresolved records are never automatically evicted; a full journal blocks new
-    /// streams instead of losing the evidence needed for safe reconciliation.
+    /// Terminal stream evidence is retained for at least the v3 replay window.
+    /// Unresolved records are never age-evicted; a full journal blocks admission
+    /// rather than discarding the only evidence of an uncertain file commit.
+    /// This is necessary but NOT sufficient to advertise durableReplay: deleting
+    /// an owner/space and other CP14/CP17 paths still require retained status.
     fn prune_stream_operations(&self) -> StorageResult<()> {
         let conn = self
             .connection
             .lock()
             .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-        conn.execute("DELETE FROM stream_operations WHERE phase IN ('COMMITTED','ABORTED','EXPIRED_FENCED') AND updated_at_ms<?1",params![now_ms()-48*60*60*1000_i64])?;
+        conn.execute(
+            "DELETE FROM stream_operations WHERE stream_id IN (
+            SELECT stream_id FROM stream_operations
+            WHERE phase IN ('COMMITTED','ABORTED','EXPIRED_FENCED') AND updated_at_ms<?1
+            ORDER BY updated_at_ms,stream_id LIMIT ?2)",
+            params![
+                now_ms().saturating_sub(DURABLE_SQL_RECEIPT_TTL_MS),
+                V3_GC_BATCH_ROWS
+            ],
+        )?;
         Ok(())
     }
 
@@ -468,11 +3060,37 @@ impl StorageEngine {
         validate_opaque_id(&op.pairing_id)?;
         validate_opaque_id(&op.space_id)?;
         validate_request_id(&op.request_id)?;
+        let fingerprint = op.request_fingerprint.as_deref().ok_or_else(|| {
+            StorageError::RequestInvalid(
+                "stream begin requires a semantic request fingerprint".into(),
+            )
+        })?;
+        if fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(StorageError::RequestInvalid(
+                "invalid stream begin fingerprint".into(),
+            ));
+        }
         let conn = self
             .connection
             .lock()
             .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-        conn.execute("DELETE FROM stream_operations WHERE phase IN ('COMMITTED','ABORTED','EXPIRED_FENCED') AND updated_at_ms<?1",params![now_ms()-48*60*60*1000_i64])?;
+        // This is first admission only: resolve_stream_operation has already
+        // handled same-ID history before Runtime invokes this method.
+        if op.request_id.starts_with("request-v3-") {
+            validate_new_v3_request_id(&op.request_id, now_ms())?;
+            // The file receipt is keyed by (spaceId, requestId), not pairing.
+            // Reserve that identity across pairings so a later pairing cannot
+            // confuse a committed v3 receipt with its own stream outcome.
+            let collision: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM stream_operations WHERE space_id=?1 AND request_id=?2)",
+                params![op.space_id,op.request_id], |row| row.get(0),
+            )?;
+            if collision {
+                return Err(StorageError::RequestIdConflict);
+            }
+        }
+        // No global journal scan from an individual stream admission. Bounded
+        // background maintenance owns expiry; capacity fails closed instead.
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM stream_operations", [], |row| {
             row.get(0)
         })?;
@@ -489,8 +3107,8 @@ impl StorageEngine {
                 "stream path has unresolved durable outcome".into(),
             ));
         }
-        conn.execute("INSERT INTO stream_operations(pairing_id,space_id,request_id,stream_id,chunk_method,logical_path,declared_size,phase,state_revision,next_seq,confirmed_bytes,last_chunk_len,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,'OPEN',1,0,0,0,?8)",
-            params![op.pairing_id,op.space_id,op.request_id,op.stream_id,op.method,op.path,op.declared_size.map(|v|v as i64),now_ms()])?;
+        conn.execute("INSERT INTO stream_operations(pairing_id,space_id,request_id,stream_id,chunk_method,logical_path,declared_size,request_fingerprint,phase,state_revision,next_seq,confirmed_bytes,last_chunk_len,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?9,'OPEN',1,0,0,0,?8)",
+            params![op.pairing_id,op.space_id,op.request_id,op.stream_id,op.method,op.path,op.declared_size.map(|v|v as i64),now_ms(),fingerprint])?;
         Ok(())
     }
 
@@ -576,18 +3194,18 @@ impl StorageEngine {
             result_json,
         )) = value
         else {
-            return Ok(None);
+            return retained_stream_for_pairing(&conn, pairing_id, space_id, request_id);
         };
         let path = path.ok_or_else(|| StorageError::Internal("missing journal path".into()))?;
         let mut result: Option<FileRecord> =
             result_json.map(|v| serde_json::from_str(&v)).transpose()?;
-        if phase == "COMMITTING" || phase == "UNCERTAIN" {
+        if phase == "COMMITTING" || phase == "UNCERTAIN" || phase == "RECONCILING" {
             if let Some(receipt_result) =
-                receipt::<FileRecord>(&conn, space_id, request_id, &file_write_operation(&path))?
+                confirmed_stream_file_receipt(&conn, space_id, request_id, &path)?
             {
                 // The core receipt was recovered and committed to registry after atomic swap.
                 result = Some(receipt_result.clone());
-                conn.execute("UPDATE stream_operations SET phase='COMMITTED',result_json=?1,state_revision=state_revision+1,updated_at_ms=?2 WHERE stream_id=?3 AND phase IN ('COMMITTING','UNCERTAIN')", params![serde_json::to_string(&receipt_result)?,now_ms(),stream_id])?;
+                conn.execute("UPDATE stream_operations SET phase='COMMITTED',result_json=?1,state_revision=state_revision+1,updated_at_ms=?2 WHERE stream_id=?3 AND phase IN ('COMMITTING','UNCERTAIN','RECONCILING')", params![serde_json::to_string(&receipt_result)?,now_ms(),stream_id])?;
                 phase = "COMMITTED".to_owned();
                 revision += 1;
             }
@@ -595,6 +3213,12 @@ impl StorageEngine {
             // After a crash, recover_stream_operations() has already marked it UNCERTAIN.
             // Never infer abort from absence of a receipt while commit can still finish.
         }
+        // The persisted semantic identity remains available after Runtime restart;
+        // old v2 journals have NULL and must not be presented as v3-safe replay.
+        let request_fingerprint: Option<String> = conn.query_row(
+            "SELECT request_fingerprint FROM stream_operations WHERE pairing_id=?1 AND space_id=?2 AND request_id=?3",
+            params![pairing_id,space_id,request_id], |row| row.get(0),
+        ).optional()?.flatten();
         Ok(Some(StreamOperationRecord {
             pairing_id: pairing_id.into(),
             space_id: space_id.into(),
@@ -603,6 +3227,7 @@ impl StorageEngine {
             method,
             path,
             declared_size: declared_size.map(|n| n as u64),
+            request_fingerprint,
             phase,
             state_revision: revision,
             next_seq: next_seq as u64,
@@ -624,7 +3249,11 @@ impl StorageEngine {
                 .connection
                 .lock()
                 .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-            conn.query_row("SELECT space_id,request_id FROM stream_operations WHERE pairing_id=?1 AND stream_id=?2",params![pairing_id,stream_id],|row|Ok((row.get(0)?,row.get(1)?))).optional()?
+            let live = conn.query_row("SELECT space_id,request_id FROM stream_operations WHERE pairing_id=?1 AND stream_id=?2",params![pairing_id,stream_id],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+            match live {
+                Some(pair) => Some(pair),
+                None => conn.query_row("SELECT space_id,request_id FROM retained_stream_outcomes WHERE pairing_id=?1 AND stream_id=?2 AND expires_at_ms>?3",params![pairing_id,stream_id,now_ms()],|row|Ok((row.get(0)?,row.get(1)?))).optional()?,
+            }
         };
         match lookup {
             Some((space, request)) => self.resolve_stream_operation(pairing_id, &space, &request),
@@ -632,14 +3261,322 @@ impl StorageEngine {
         }
     }
 
+    /// Status-only fallback for an already deleted space. Authorization must
+    /// still come from the LIVE authenticated pairing; archived pairing ids are
+    /// never treated as credentials or new permissions.
+    pub fn retained_stream_owned_by(
+        &self,
+        application_id: &str,
+        pairing_id: &str,
+        space_id: &str,
+        request_id: &str,
+    ) -> StorageResult<bool> {
+        validate_opaque_id(application_id)?;
+        validate_opaque_id(pairing_id)?;
+        validate_opaque_id(space_id)?;
+        validate_request_id(request_id)?;
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let authorized: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM retained_stream_outcomes h              JOIN pairings p ON p.id=h.pairing_id              WHERE h.owner_application_id=?1 AND h.pairing_id=?2              AND h.space_id=?3 AND h.request_id=?4              AND p.application_id=?1 AND p.revoked_at_ms IS NULL              AND h.expires_at_ms>?5)",
+             params![application_id,pairing_id,space_id,request_id,now_ms()], |r| r.get(0))?;
+        Ok(authorized)
+    }
+
+    /// Match the immutable archived owner and pairing, without authorizing
+    /// a new or revoked pairing for ordinary VFS operations.
+    pub fn retained_stream_owner_matches(
+        &self,
+        owner_id: &str,
+        pairing_id: &str,
+        space_id: &str,
+        request_id: &str,
+    ) -> StorageResult<bool> {
+        validate_opaque_id(owner_id)?;
+        validate_opaque_id(pairing_id)?;
+        validate_opaque_id(space_id)?;
+        validate_request_id(request_id)?;
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let found: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM retained_stream_outcomes WHERE
+             owner_application_id=?1 AND pairing_id=?2 AND space_id=?3 AND request_id=?4
+             AND expires_at_ms>?5)",
+            params![owner_id, pairing_id, space_id, request_id, now_ms()],
+            |r| r.get(0),
+        )?;
+        Ok(found)
+    }
+
+    /// Historical ordinary receipt lookup, bound to the original application
+    /// identity. This is NOT a way to authorize deleted application credentials.
+    pub fn retained_space_receipt(
+        &self,
+        application_id: &str,
+        space_id: &str,
+        request_id: &str,
+    ) -> StorageResult<Option<serde_json::Value>> {
+        validate_opaque_id(application_id)?;
+        validate_opaque_id(space_id)?;
+        validate_request_id(request_id)?;
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let json: Option<String> = conn.query_row(
+            "SELECT result_json FROM retained_space_outcomes WHERE owner_application_id=?1 AND space_id=?2 AND request_id=?3 AND expires_at_ms>?4",
+            params![application_id,space_id,request_id,now_ms()],|r|r.get(0)).optional()?;
+        json.map(|value| serde_json::from_str(&value).map_err(StorageError::from))
+            .transpose()
+    }
+
+    /// Read-only typed receipt from the FK-independent history. Authorization
+    /// is ALWAYS performed by Runtime before this method (original archived
+    /// pairing proof or current live session); the query is additionally bound
+    /// to the original immutable application owner and exact scope ID.
+    /// This never admits/replays a mutation and does not infer legacy identity.
+    pub fn retained_sql_receipt(
+        &self,
+        owner_id: &str,
+        scope_kind: &str,
+        scope_id: &str,
+        request_id: &str,
+    ) -> StorageResult<Option<serde_json::Value>> {
+        validate_opaque_id(owner_id)?;
+        validate_opaque_id(scope_id)?;
+        validate_request_id(request_id)?;
+        let (table, selector) = match scope_kind {
+            "space" => ("retained_space_outcomes", "space_id"),
+            "application" if scope_id == owner_id => {
+                ("retained_application_outcomes", "owner_application_id")
+            }
+            "application" => {
+                return Err(StorageError::RequestInvalid(
+                    "application receipt must match original owner".into(),
+                ))
+            }
+            _ => return Err(StorageError::RequestInvalid("invalid receipt scope".into())),
+        };
+        // Table and selector are hard-coded above; neither is taken from input.
+        let sql = format!("SELECT operation,result_json,identity_version,request_fingerprint,created_at_ms,terminal_at_ms,expires_at_ms FROM {table} WHERE owner_application_id=?1 AND {selector}=?2 AND request_id=?3");
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let row: Option<SqlReceiptStatusRow> = conn
+            .query_row(&sql, params![owner_id, scope_id, request_id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            })
+            .optional()?;
+        sql_receipt_status_outcome(scope_kind, scope_id, request_id, row)
+    }
+
+    /// Typed status for an *existing* owner. Unlike retained history proof,
+    /// this requires a live authenticated session at Runtime. A space receipt
+    /// is joined to its current owner in the same read, preventing a known
+    /// space ID from becoming a cross-application status oracle.
+    pub fn live_sql_receipt(
+        &self,
+        owner_id: &str,
+        scope_kind: &str,
+        scope_id: &str,
+        request_id: &str,
+    ) -> StorageResult<Option<serde_json::Value>> {
+        validate_opaque_id(owner_id)?;
+        validate_opaque_id(scope_id)?;
+        validate_request_id(request_id)?;
+        let sql = match scope_kind {
+            "space" => "SELECT r.operation,r.result_json,r.identity_version,r.request_fingerprint,r.created_at_ms,r.terminal_at_ms,r.expires_at_ms \
+                        FROM mutation_receipts r JOIN spaces s ON s.id=r.space_id \
+                        WHERE s.owner_application_id=?1 AND r.space_id=?2 AND r.request_id=?3",
+            "application" if owner_id == scope_id =>
+                "SELECT r.operation,r.result_json,r.identity_version,r.request_fingerprint,r.created_at_ms,r.terminal_at_ms,r.expires_at_ms \
+                 FROM application_mutation_receipts r JOIN applications a ON a.id=r.application_id \
+                 WHERE a.id=?1 AND r.application_id=?2 AND r.request_id=?3",
+            "application" => return Err(StorageError::RequestInvalid(
+                "application receipt must match authenticated owner".into())),
+            _ => return Err(StorageError::RequestInvalid("invalid receipt scope".into())),
+        };
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let row: Option<SqlReceiptStatusRow> = conn
+            .query_row(sql, params![owner_id, scope_id, request_id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            })
+            .optional()?;
+        if row.is_none() {
+            // A missing receipt is NOT evidence that a known filesystem or
+            // picker parent was never executed. Restrict this lookup to the
+            // authenticated owner's exact scope and surface uncertainty.
+            let exists: bool = match scope_kind {
+                "space" => conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM durable_operations d JOIN spaces s ON s.id=d.scope_id \
+                     WHERE d.scope_kind='space' AND d.scope_id=?1 AND d.request_id=?2 AND d.owner_application_id=?3 AND s.owner_application_id=?3)",
+                    params![scope_id,request_id,owner_id],|r|r.get(0))?,
+                "application" => conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM durable_operations WHERE scope_kind='application' \
+                     AND scope_id=?1 AND request_id=?2 AND owner_application_id=?1)",
+                    params![owner_id,request_id],|r|r.get(0))?,
+                _ => false,
+            };
+            if exists {
+                return Err(StorageError::RecoveryRequired);
+            }
+        }
+        sql_receipt_status_outcome(scope_kind, scope_id, request_id, row)
+    }
+
+    /// Verify an original 256-bit pairing credential for status-only access
+    /// after application deletion. This never reactivates the pairing and
+    /// cannot be used as application/space authorization.
+    pub fn retained_status_owner(
+        &self,
+        client_instance_id: &str,
+        credential_hash: &str,
+    ) -> StorageResult<Option<(String, String)>> {
+        validate_client_instance_id(client_instance_id)?;
+        validate_credential_hash(credential_hash)?;
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        conn.query_row(
+            "SELECT h.owner_application_id,h.pairing_id FROM retained_pairing_owners h
+             WHERE h.client_instance_id=?1 AND h.credential_hash=?2
+             AND h.expires_at_ms>?3
+             AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.id=h.owner_application_id)
+             AND NOT EXISTS (SELECT 1 FROM pairings p WHERE p.id=h.pairing_id)",
+            params![client_instance_id, credential_hash, now_ms()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Return the original archived pairing verifier for a *read-only*
+    /// runtime-identity challenge. No deleted owner or pairing is reactivated.
+    /// If more than one archived pairing shares an identity, refuse ambiguity.
+    pub fn retained_challenge_hash(
+        &self,
+        kind: ApplicationKind,
+        external_id: &str,
+        client_instance_id: &str,
+    ) -> StorageResult<Option<String>> {
+        validate_client_instance_id(client_instance_id)?;
+        if external_id.trim().is_empty() || external_id.len() > 512 {
+            return Err(StorageError::RequestInvalid(
+                "invalid historical application identity".into(),
+            ));
+        }
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT h.credential_hash FROM retained_pairing_owners h
+            WHERE h.application_kind=?1 AND h.application_external_id=?2
+            AND h.client_instance_id=?3 AND h.credential_hash IS NOT NULL
+            AND h.expires_at_ms>?4
+            AND NOT EXISTS(SELECT 1 FROM applications a WHERE a.id=h.owner_application_id)
+            AND NOT EXISTS(SELECT 1 FROM pairings p WHERE p.id=h.pairing_id)
+            LIMIT 2",
+        )?;
+        let mut rows = stmt.query(params![
+            kind.as_db(),
+            external_id,
+            client_instance_id,
+            now_ms()
+        ])?;
+        let Some(first) = rows.next()? else {
+            return Ok(None);
+        };
+        let hash: String = first.get(0)?;
+        if rows.next()?.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(hash))
+    }
+
+    /// Read only a proven, unexpired terminal long-job result. An uncommitted
+    /// journal can never be used to impersonate a successful operation.
+    pub fn retained_terminal_operation(
+        &self,
+        owner_id: &str,
+        operation_id: &str,
+    ) -> StorageResult<Option<Value>> {
+        validate_opaque_id(owner_id)?;
+        validate_request_id(operation_id)?;
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT result_json FROM durable_operations
+             WHERE scope_kind='application' AND scope_id=?1
+             AND owner_application_id=?1 AND request_id=?2
+             AND phase IN ('COMMITTED','ABORTED','PARTIALLY_APPLIED')
+             AND expires_at_ms>?3 AND result_json IS NOT NULL",
+                params![owner_id, operation_id, now_ms()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.map(|text| serde_json::from_str(&text).map_err(StorageError::from))
+            .transpose()
+    }
+
+    /// A proof may read an archived stream only when its original pairing,
+    /// space and request IDs all match. Other pairings are never substituted.
+    pub fn retained_terminal_stream_for_proof(
+        &self,
+        pairing_id: &str,
+        space_id: &str,
+        request_id: &str,
+    ) -> StorageResult<Option<StreamOperationRecord>> {
+        validate_opaque_id(pairing_id)?;
+        validate_opaque_id(space_id)?;
+        validate_request_id(request_id)?;
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        retained_stream_for_pairing(&conn, pairing_id, space_id, request_id)
+    }
+
     /// At startup temp files have already been quarantined by core recovery.
-    /// Only pre-commit OPEN streams can be conclusively fenced; COMMITTING is unresolved.
+    /// OPEN may be fenced, and ABORTING is conclusively aborted because the
+    /// abort fence was persisted BEFORE temporary-file cleanup began. The
+    /// orphan-temp quarantine must succeed before this recovery is invoked.
+    /// COMMITTING remains uncertain until a matching file receipt proves commit.
     fn recover_stream_operations(&self) -> StorageResult<()> {
         let conn = self
             .connection
             .lock()
             .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
         conn.execute("UPDATE stream_operations SET phase='EXPIRED_FENCED',state_revision=state_revision+1,updated_at_ms=?1 WHERE phase='OPEN'",params![now_ms()])?;
+        conn.execute("UPDATE stream_operations SET phase='ABORTED',state_revision=state_revision+1,updated_at_ms=?1 WHERE phase='ABORTING'",params![now_ms()])?;
         conn.execute("UPDATE stream_operations SET phase='UNCERTAIN',state_revision=state_revision+1,updated_at_ms=?1 WHERE phase='COMMITTING'",params![now_ms()])?;
         Ok(())
     }
@@ -655,6 +3592,86 @@ impl StorageEngine {
             params![space_id],
             row_space,
         ).optional().map_err(Into::into)
+    }
+
+    /// Category changes update the authoritative manifest and SQLite in one
+    /// recoverable intent. PREPARED restores the previous manifest; COMMITTED
+    /// only removes its quarantine copy.
+    fn change_space_category_with_manifest(
+        &self,
+        space: &SpaceRecord,
+        application: &ApplicationRecord,
+        category: StorageCategory,
+        now: i64,
+    ) -> StorageResult<()> {
+        let source = self
+            .root
+            .join("spaces")
+            .join(&space.id)
+            .join(".vontaqfs/manifest.json");
+        let metadata = fs::symlink_metadata(&source).map_err(|_| StorageError::RecoveryRequired)?;
+        if is_link_like(&metadata) || !metadata.is_file() {
+            return Err(StorageError::RecoveryRequired);
+        }
+        let intent_id = Uuid::new_v4().to_string();
+        let quarantine = source.with_file_name(format!("manifest-old-{intent_id}.json"));
+        let source_rel = format!("spaces/{}/.vontaqfs/manifest.json", space.id);
+        let quarantine_rel = format!(
+            "spaces/{}/.vontaqfs/manifest-old-{intent_id}.json",
+            space.id
+        );
+        let request_id = format!("space-category-{intent_id}");
+        let payload = json!({"spaceId":space.id,"from":space.storage_category,"to":category});
+        self.prepare_fs_intent(
+            &intent_id,
+            &space.id,
+            &request_id,
+            "SPACE_MANIFEST",
+            Some(&source_rel),
+            None,
+            Some(&quarantine_rel),
+            &payload,
+        )?;
+        if let Err(error) = fs::rename(&source, &quarantine) {
+            self.mark_fs_intent_aborted(&intent_id, &space.id, &request_id)?;
+            return Err(error.into());
+        }
+        let mut updated = space.clone();
+        updated.storage_category = category;
+        let change = (|| -> StorageResult<()> {
+            write_space_manifest(&self.root, &updated, application)?;
+            let _ = self.transition_fs_intent(&intent_id, "FS_APPLIED");
+            let mut conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            let tx = conn.transaction()?;
+            tx.execute(
+                "UPDATE spaces SET storage_category=?1,last_used_at_ms=?2 WHERE id=?3",
+                params![category.as_db(), now, space.id],
+            )?;
+            self.complete_fs_intent(
+                &tx,
+                &intent_id,
+                &space.id,
+                &request_id,
+                "space-category",
+                &category.as_db(),
+            )?;
+            tx.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = change {
+            // If the old bytes cannot be restored, leave the intent unresolved.
+            atomic_replace(&quarantine, &source)?;
+            sync_parent(source.parent());
+            self.mark_fs_intent_aborted(&intent_id, &space.id, &request_id)?;
+            return Err(error);
+        }
+        if fs::remove_file(&quarantine).is_ok() {
+            let _ = self.finish_fs_cleanup(&intent_id);
+        }
+        Ok(())
     }
 
     pub fn open_space(
@@ -676,6 +3693,31 @@ impl StorageEngine {
         display_name: Option<&str>,
     ) -> StorageResult<SpaceRecord> {
         validate_space_key(key)?;
+        // Prevent application deletion from racing a new/updated space layout.
+        let _application_lease = self.admit(vec![
+            Claim::global_shared(),
+            Claim::shared(format!("application:{application_id}")),
+        ])?;
+        self.open_space_with_category_context(
+            application_id,
+            key,
+            storage_class,
+            storage_category,
+            display_name,
+        )
+    }
+
+    /// Caller holds the application owner admission; do not reacquire it in a
+    /// nested helper. Category manifest replacement obtains its own space
+    /// exclusive claim and keeps existing journal/recovery semantics.
+    fn open_space_with_category_context(
+        &self,
+        application_id: &str,
+        key: &str,
+        storage_class: StorageClass,
+        storage_category: Option<StorageCategory>,
+        display_name: Option<&str>,
+    ) -> StorageResult<SpaceRecord> {
         let now = now_ms();
         let conn = self
             .connection
@@ -689,16 +3731,20 @@ impl StorageEngine {
             "SELECT id,owner_application_id,key,display_name,storage_class,storage_category,created_at_ms,last_used_at_ms,logical_bytes,file_count,format_version,state FROM spaces WHERE owner_application_id=?1 AND key=?2 AND storage_class=?3",
             params![application_id, key, storage_class.as_db()], row_space,
         ).optional()? {
+            if space.state != "healthy" { return Err(StorageError::RecoveryRequired); }
             if let Some(category) = storage_category {
                 if space.storage_category != category {
-                    conn.execute("UPDATE spaces SET storage_category=?1,last_used_at_ms=?2 WHERE id=?3", params![category.as_db(), now, space.id])?;
+                    // Never block for admission while holding the connection mutex.
+                    drop(conn);
+                    let _space_lease = self.admit(vec![Claim::space_exclusive(&space.id)])?;
+                    self.ensure_space_mutable(&space.id)?;
+                    self.change_space_category_with_manifest(&space,&application,category,now)?;
                     space.storage_category = category;
-                    write_space_manifest(&self.root, &space, &application)?;
                 } else {
-                    conn.execute("UPDATE spaces SET last_used_at_ms=?1 WHERE id=?2", params![now, space.id])?;
+                    conn.execute("UPDATE spaces SET last_used_at_ms=?1 WHERE id=?2", params![now,space.id])?;
                 }
             } else {
-                conn.execute("UPDATE spaces SET last_used_at_ms=?1 WHERE id=?2", params![now, space.id])?;
+                conn.execute("UPDATE spaces SET last_used_at_ms=?1 WHERE id=?2", params![now,space.id])?;
             }
             space.last_used_at_ms = now;
             return Ok(space);
@@ -718,11 +3764,476 @@ impl StorageEngine {
             format_version: SPACE_FORMAT_VERSION,
             state: "healthy".into(),
         };
-        create_space_layout(&self.root, &space, &application)?;
+        // SQL row first: interrupted creation leaves an explicit initializing
+        // state instead of an unowned manifest on disk.
         conn.execute(
-            "INSERT INTO spaces(id,owner_application_id,key,display_name,storage_class,storage_category,created_at_ms,last_used_at_ms,logical_bytes,file_count,format_version,state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,0,?9,'healthy')",
+            "INSERT INTO spaces(id,owner_application_id,key,display_name,storage_class,storage_category,created_at_ms,last_used_at_ms,logical_bytes,file_count,format_version,state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,0,?9,'initializing')",
             params![space.id, space.owner_application_id, space.key, space.display_name, space.storage_class.as_db(), space.storage_category.as_db(), space.created_at_ms, space.last_used_at_ms, space.format_version],
         )?;
+        drop(conn);
+        // Retain `initializing` to allow source-checked startup recovery;
+        // never discard a partially created layout on an I/O error.
+        create_space_layout(&self.root, &space, &application)?;
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        conn.execute(
+            "UPDATE spaces SET state='healthy' WHERE id=?1 AND state='initializing'",
+            params![space.id],
+        )?;
+        Ok(space)
+    }
+
+    /// SQL-only fast path for an existing space when no manifest update is needed.
+    /// Creation/category changes use the separate recoverable filesystem path.
+    pub fn open_existing_space_with_request(
+        &self,
+        application_id: &str,
+        key: &str,
+        storage_class: StorageClass,
+        storage_category: Option<StorageCategory>,
+        display_name: Option<&str>,
+        request_id: &str,
+    ) -> StorageResult<Option<SpaceRecord>> {
+        validate_space_key(key)?;
+        validate_request_id(request_id)?;
+        let _application_lease = self.admit(vec![
+            Claim::global_shared(),
+            Claim::shared(format!("application:{application_id}")),
+        ])?;
+        let fingerprint = semantic_fingerprint(
+            "space-open-existing",
+            &json!({
+                "applicationId": application_id, "key": key, "storageClass": storage_class.as_db(),
+                "storageCategory": storage_category.map(|category| category.as_db()),
+                "displayName": display_name
+            }),
+        )?;
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction()?;
+        if let Some(previous) =
+            sql_atomic_receipt(&tx, true, application_id, request_id, &fingerprint)?
+        {
+            return Ok(Some(previous));
+        }
+        let current = tx.query_row(
+            "SELECT id,owner_application_id,key,display_name,storage_class,storage_category,created_at_ms,last_used_at_ms,logical_bytes,file_count,format_version,state FROM spaces WHERE owner_application_id=?1 AND key=?2 AND storage_class=?3",
+            params![application_id,key,storage_class.as_db()], row_space,
+        ).optional()?;
+        let Some(mut current) = current else {
+            return Ok(None);
+        };
+        if storage_category.is_some_and(|category| current.storage_category != category) {
+            return Ok(None);
+        }
+        let now = now_ms();
+        tx.execute(
+            "UPDATE spaces SET last_used_at_ms=?1 WHERE id=?2",
+            params![now, current.id],
+        )?;
+        current.last_used_at_ms = now;
+        sql_atomic_store(
+            &tx,
+            true,
+            application_id,
+            request_id,
+            "space-open-existing",
+            &fingerprint,
+            &current,
+        )?;
+        tx.commit()?;
+        Ok(Some(current))
+    }
+
+    /// Startup-only resolution of an interrupted public SPACE_OPEN. The
+    /// fingerprinted plan is persisted before any physical change. A healthy
+    /// registry row AND an exact, safe on-disk manifest establish the outcome;
+    /// a missing newly-created row establishes no side effect (row-first
+    /// creation). Anything ambiguous remains NEEDS_REPAIR, not success.
+    fn reconcile_interrupted_space_opens(&self) -> StorageResult<()> {
+        let interrupted: Vec<(String, String, String, Option<String>, i64)> = {
+            let conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            let mut stmt = conn.prepare(
+                "SELECT scope_id,request_id,request_fingerprint,result_json,request_started_at_ms FROM durable_operations \
+                 WHERE scope_kind='application' AND kind='SPACE_OPEN' AND phase='ADMITTED'"
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (owner, request, fingerprint, plan_json, admitted_at) in interrupted {
+            let plan = plan_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<SpaceOpenRecoveryPlan>(raw).ok());
+            let Some(plan) = plan else {
+                self.finish_unresolved_space_open(&owner, &request, None)?;
+                continue;
+            };
+            let expected = semantic_fingerprint(
+                "space-open-existing",
+                &json!({
+                    "applicationId": plan.application_id,
+                    "key": plan.key,
+                    "storageClass": plan.storage_class.as_db(),
+                    "storageCategory": plan.storage_category.map(|v| v.as_db()),
+                    "displayName": plan.display_name,
+                }),
+            )?;
+            if plan.application_id != owner || expected != fingerprint {
+                self.finish_unresolved_space_open(
+                    &owner,
+                    &request,
+                    plan.before.as_ref().map(|s| s.id.as_str()),
+                )?;
+                continue;
+            }
+            let current: Option<SpaceRecord> = {
+                let conn = self
+                    .connection
+                    .lock()
+                    .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+                conn.query_row(
+                    "SELECT id,owner_application_id,key,display_name,storage_class,storage_category,created_at_ms,last_used_at_ms,logical_bytes,file_count,format_version,state FROM spaces \
+                     WHERE owner_application_id=?1 AND key=?2 AND storage_class=?3",
+                    params![owner,plan.key,plan.storage_class.as_db()],row_space,
+                ).optional()?
+            };
+            if current.is_none() && plan.before.is_none() {
+                // open_space_with_category_context inserts the registry row
+                // before any filesystem writes. No row means it never started.
+                self.finish_unapplied_space_open(&owner, &request, &fingerprint)?;
+                continue;
+            }
+            let Some(space) = current else {
+                self.finish_unresolved_space_open(
+                    &owner,
+                    &request,
+                    plan.before.as_ref().map(|s| s.id.as_str()),
+                )?;
+                continue;
+            };
+            let id_matches = plan
+                .before
+                .as_ref()
+                .map_or(space.created_at_ms >= admitted_at, |before| {
+                    before.id == space.id
+                });
+            let category_matches = plan
+                .storage_category
+                .is_none_or(|want| want == space.storage_category);
+            // Existing-space open never changes display_name. A newly-created
+            // result must also agree with the originally admitted display name.
+            let display_matches = plan.before.is_some() || plan.display_name == space.display_name;
+            let new_space_is_empty = plan.before.is_some()
+                || (space.logical_bytes == 0
+                    && space.file_count == 0
+                    && fs::read_dir(self.root.join("spaces").join(&space.id).join("data"))
+                        .map(|mut entries| entries.next().is_none())
+                        .unwrap_or(false));
+            let manifest_matches = self.space_open_manifest_matches(&space);
+            if !id_matches
+                || !category_matches
+                || !display_matches
+                || !new_space_is_empty
+                || space.state != "healthy"
+                || !manifest_matches
+            {
+                self.finish_unresolved_space_open(&owner, &request, Some(&space.id))?;
+                continue;
+            }
+            let mut conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let now = now_ms();
+            let changed = tx.execute(
+                "UPDATE durable_operations SET phase='COMMITTED',result_json=?1,terminal_at_ms=?2,expires_at_ms=?3,updated_at_ms=?2 \
+                 WHERE scope_kind='application' AND scope_id=?4 AND request_id=?5 AND kind='SPACE_OPEN' AND request_fingerprint=?6 AND phase='ADMITTED'",
+                params![serde_json::to_string(&space)?,now,now.saturating_add(DURABLE_SQL_RECEIPT_TTL_MS),owner,request,fingerprint],
+            )?;
+            if changed != 1 {
+                return Err(StorageError::RecoveryRequired);
+            }
+            // Atomic public receipt + recovered terminal result, same as the
+            // non-crash path; no duplicate event or filesystem mutation.
+            sql_atomic_store(
+                &tx,
+                true,
+                &owner,
+                &request,
+                "space-open-existing",
+                &fingerprint,
+                &space,
+            )?;
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    fn space_open_manifest_matches(&self, space: &SpaceRecord) -> bool {
+        let base = self.root.join("spaces").join(&space.id);
+        let data = base.join("data");
+        let metadata_dir = base.join(".vontaqfs");
+        let manifest_path = metadata_dir.join("manifest.json");
+        for dir in [&base, &data, &metadata_dir] {
+            match fs::symlink_metadata(dir) {
+                Ok(meta) if meta.is_dir() && !is_link_like(&meta) => {}
+                _ => return false,
+            }
+        }
+        match fs::symlink_metadata(&manifest_path) {
+            Ok(meta) if meta.is_file() && !is_link_like(&meta) => {}
+            _ => return false,
+        }
+        let Ok(bytes) = fs::read(&manifest_path) else {
+            return false;
+        };
+        let Ok(manifest) = serde_json::from_slice::<SpaceManifest>(&bytes) else {
+            return false;
+        };
+        let Ok(Some(application)) = self.get_application(&space.owner_application_id) else {
+            return false;
+        };
+        // Application display name is mutable on registration and does not
+        // rewrite old manifests; match immutable owner identity only.
+        manifest.application_kind == application.kind
+            && manifest.application_external_id == application.external_id
+            && manifest.format == "vontaqfs-space"
+            && manifest.format_version == space.format_version
+            && manifest.space_id == space.id
+            && manifest.owner_application_id == space.owner_application_id
+            && manifest.key == space.key
+            && manifest.display_name == space.display_name
+            && manifest.storage_class == space.storage_class
+            && manifest.storage_category == space.storage_category
+            && manifest.created_at_ms == space.created_at_ms
+    }
+
+    fn finish_unapplied_space_open(
+        &self,
+        owner: &str,
+        request: &str,
+        fingerprint: &str,
+    ) -> StorageResult<()> {
+        let now = now_ms();
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        conn.execute(
+            "UPDATE durable_operations SET phase='ABORTED',result_json=NULL,error_code='SPACE_OPEN_NOT_APPLIED',terminal_at_ms=?1,expires_at_ms=?2,updated_at_ms=?1 \
+             WHERE scope_kind='application' AND scope_id=?3 AND request_id=?4 AND kind='SPACE_OPEN' AND request_fingerprint=?5 AND phase='ADMITTED'",
+            params![now,now.saturating_add(DURABLE_SQL_RECEIPT_TTL_MS),owner,request,fingerprint],
+        )?;
+        Ok(())
+    }
+
+    fn finish_unresolved_space_open(
+        &self,
+        owner: &str,
+        request: &str,
+        space_id: Option<&str>,
+    ) -> StorageResult<()> {
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE durable_operations SET phase='NEEDS_REPAIR',error_code='SPACE_OPEN_RECOVERY_UNPROVEN',updated_at_ms=?1 \
+             WHERE scope_kind='application' AND scope_id=?2 AND request_id=?3 AND kind='SPACE_OPEN' AND phase='ADMITTED'",
+            params![now_ms(),owner,request],
+        )?;
+        if let Some(id) = space_id {
+            tx.execute("UPDATE spaces SET state='recovery_required' WHERE id=?1 AND owner_application_id=?2 AND state='healthy'",params![id,owner])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Public space open identity covering *both* the SQL-only existing fast path
+    /// and filesystem-backed space creation / category manifest changes. The
+    /// durable parent is recorded before any filesystem effects; a lost ACK
+    /// never authorizes a second creation or a second manifest rewrite.
+    /// A crashed ADMITTED operation remains uncertain until the Core recovery
+    /// coordinator resolves it. This is intentionally NOT a claim that every
+    /// public mutation is ready for the v3 durableReplay handshake.
+    pub fn open_space_with_request(
+        &self,
+        application_id: &str,
+        key: &str,
+        storage_class: StorageClass,
+        storage_category: Option<StorageCategory>,
+        display_name: Option<&str>,
+        request_id: &str,
+    ) -> StorageResult<SpaceRecord> {
+        validate_space_key(key)?;
+        validate_request_id(request_id)?;
+        // One owner lease for admission, filesystem work and final receipt.
+        // The keyed claim serializes concurrent open/category writes to the
+        // same logical space without blocking unrelated spaces.
+        let _lease = self.admit(vec![
+            Claim::global_shared(),
+            Claim::shared(format!("application:{application_id}")),
+            Claim::exclusive(format!(
+                "space-key:{application_id}:{}:{key}",
+                storage_class.as_db()
+            )),
+        ])?;
+        let fingerprint = semantic_fingerprint(
+            "space-open-existing",
+            &json!({
+                "applicationId": application_id, "key": key,
+                "storageClass": storage_class.as_db(),
+                "storageCategory": storage_category.map(|category| category.as_db()),
+                "displayName": display_name,
+            }),
+        )?;
+        // The connection is only held for a short IMMEDIATE admission. Never
+        // hold SQLite while acquiring the space/application lease or writing
+        // the manifest. The unique application request ID closes concurrent
+        // duplicate starts even if their worker threads race.
+        {
+            let mut conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let previous: Option<DurableOperationDbRow> = tx.query_row(
+                "SELECT kind,request_fingerprint,phase,result_json,expires_at_ms FROM durable_operations \
+                 WHERE scope_kind='application' AND scope_id=?1 AND request_id=?2 AND owner_application_id=?1",
+                params![application_id,request_id],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+            ).optional()?;
+            if let Some((kind, prior_fingerprint, phase, result, expiry)) = previous {
+                if kind != "SPACE_OPEN" || prior_fingerprint != fingerprint {
+                    return Err(StorageError::RequestIdConflict);
+                }
+                if matches!(
+                    phase.as_str(),
+                    "COMMITTED" | "ABORTED" | "PARTIALLY_APPLIED"
+                ) && expiry.is_none_or(|limit| limit <= now_ms())
+                {
+                    return Err(StorageError::ResultExpired);
+                }
+                if phase == "ABORTED" {
+                    return Err(StorageError::Conflict(
+                        "SPACE_OPEN_ABORTED: original request had no side effect".into(),
+                    ));
+                }
+                if phase != "COMMITTED" {
+                    return Err(StorageError::RecoveryRequired);
+                }
+                return Ok(serde_json::from_str(
+                    &result.ok_or(StorageError::RecoveryRequired)?,
+                )?);
+            }
+            // Respect existing receipts from before this parent-based route:
+            // identical requests replay; legacy NULL fingerprints are unknown.
+            if let Some(replayed) = sql_atomic_receipt::<SpaceRecord>(
+                &tx,
+                true,
+                application_id,
+                request_id,
+                &fingerprint,
+            )? {
+                return Ok(replayed);
+            }
+            // Read the owner and pre-effect space snapshot in the same short
+            // admission transaction. These are required to prove the outcome
+            // after a crash without rerunning any filesystem operation.
+            let owner_exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM applications WHERE id=?1)",
+                params![application_id],
+                |r| r.get(0),
+            )?;
+            if !owner_exists {
+                return Err(StorageError::NotFound("application".into()));
+            }
+            let before = tx.query_row(
+                "SELECT id,owner_application_id,key,display_name,storage_class,storage_category,created_at_ms,last_used_at_ms,logical_bytes,file_count,format_version,state FROM spaces \
+                 WHERE owner_application_id=?1 AND key=?2 AND storage_class=?3",
+                params![application_id,key,storage_class.as_db()],row_space,
+            ).optional()?;
+            if before
+                .as_ref()
+                .is_some_and(|space: &SpaceRecord| space.state != "healthy")
+            {
+                return Err(StorageError::RecoveryRequired);
+            }
+            let plan = SpaceOpenRecoveryPlan {
+                application_id: application_id.to_owned(),
+                key: key.to_owned(),
+                storage_class,
+                storage_category,
+                display_name: display_name.map(str::to_owned),
+                before,
+            };
+            let now = now_ms();
+            if request_id.starts_with("request-v3-") {
+                validate_new_v3_request_id(request_id, now)?;
+            }
+            // Parent + application receipt are both protected replay rows.
+            ensure_v3_result_capacity_slots(&tx, now, 2)?;
+            tx.execute(
+                "INSERT INTO durable_operations(scope_kind,scope_id,request_id,kind,owner_application_id,identity_version,request_fingerprint,phase,result_json,request_started_at_ms,created_at_ms,updated_at_ms) \
+                 VALUES('application',?1,?2,'SPACE_OPEN',?1,3,?3,'ADMITTED',?4,?5,?5,?5)",
+                params![application_id,request_id,fingerprint,serde_json::to_string(&plan)?,now],
+            )?;
+            tx.commit()?;
+        }
+        // The existing implementation owns its manifest recovery and leases.
+        // An I/O error must NOT turn the parent into ABORTED: its physical
+        // outcome may still be ambiguous until startup reconciliation.
+        let space = self.open_space_with_category_context(
+            application_id,
+            key,
+            storage_class,
+            storage_category,
+            display_name,
+        )?;
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = now_ms();
+        let changed = tx.execute(
+            "UPDATE durable_operations SET phase='COMMITTED',result_json=?1,terminal_at_ms=?2,expires_at_ms=?3,updated_at_ms=?2 \
+             WHERE scope_kind='application' AND scope_id=?4 AND request_id=?5 AND kind='SPACE_OPEN' AND request_fingerprint=?6 AND phase='ADMITTED'",
+            params![serde_json::to_string(&space)?,now,now.saturating_add(DURABLE_SQL_RECEIPT_TTL_MS),application_id,request_id,fingerprint],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::RecoveryRequired);
+        }
+        // The v3 result and its application-level receipt become visible in
+        // the SAME SQL transaction, avoiding a terminal parent without a
+        // matching fingerprinted receipt.
+        sql_atomic_store(
+            &tx,
+            true,
+            application_id,
+            request_id,
+            "space-open-existing",
+            &fingerprint,
+            &space,
+        )?;
+        tx.commit()?;
         Ok(space)
     }
 
@@ -762,8 +4273,78 @@ impl StorageEngine {
         if_match: Option<&str>,
         request_id: &str,
     ) -> StorageResult<KvRecord> {
+        Ok(self
+            .kv_set_outcome(space_id, key, value, if_version, if_match, request_id)?
+            .value)
+    }
+
+    pub fn kv_set_outcome(
+        &self,
+        space_id: &str,
+        key: &str,
+        value: &Value,
+        if_version: Option<u64>,
+        if_match: Option<&str>,
+        request_id: &str,
+    ) -> StorageResult<MutationResult<KvRecord>> {
+        self.kv_set_outcome_using_lease(
+            space_id, key, value, if_version, if_match, request_id, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn kv_set_outcome_using_lease(
+        &self,
+        space_id: &str,
+        key: &str,
+        value: &Value,
+        if_version: Option<u64>,
+        if_match: Option<&str>,
+        request_id: &str,
+        existing_lease: Option<&AdmissionLease>,
+    ) -> StorageResult<MutationResult<KvRecord>> {
+        self.kv_set_outcome_using_lease_and_credit(
+            space_id,
+            key,
+            value,
+            if_version,
+            if_match,
+            request_id,
+            existing_lease,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn kv_set_outcome_using_lease_and_credit(
+        &self,
+        space_id: &str,
+        key: &str,
+        value: &Value,
+        if_version: Option<u64>,
+        if_match: Option<&str>,
+        request_id: &str,
+        existing_lease: Option<&AdmissionLease>,
+        credit: Option<BatchReceiptCredit<'_>>,
+    ) -> StorageResult<MutationResult<KvRecord>> {
         validate_kv_key(key)?;
         validate_request_id(request_id)?;
+        // Standalone KV retains independent key parallelism. A BATCH child
+        // reuses its exclusive space lease, never tries to claim a nested key.
+        let _owned_lease = if let Some(lease) = existing_lease {
+            if !lease.covers(&Claim::space_exclusive(space_id)) {
+                return Err(StorageError::RequestInvalid(
+                    "invalid KV mutation context".into(),
+                ));
+            }
+            self.ensure_space_mutable(space_id)?;
+            None
+        } else {
+            Some(self.admit_space(
+                space_id,
+                vec![Claim::exclusive(format!("kv:{space_id}:{key}"))],
+            )?)
+        };
         let encoded = serde_json::to_vec(value)?;
         if encoded.len() > 512 * 1024 {
             return Err(StorageError::RequestInvalid(
@@ -774,10 +4355,52 @@ impl StorageEngine {
             .connection
             .lock()
             .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-        let tx = conn.transaction()?;
+        // Escrow must be transferred in an IMMEDIATE critical section. The
+        // public, non-escrow KV path preserves its existing transaction mode.
+        let tx = if credit.is_some() {
+            conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?
+        } else {
+            conn.transaction()?
+        };
         let receipt_operation = format!("kv-set:{key}");
-        if let Some(receipt) = receipt::<KvRecord>(&tx, space_id, request_id, &receipt_operation)? {
-            return Ok(receipt);
+        let fingerprint = semantic_fingerprint(
+            "kv-set",
+            &json!({
+                "spaceId":space_id, "key":key, "value":value,
+                "ifVersion":if_version, "ifMatch":if_match
+            }),
+        )?;
+        if let Some(proof) = credit.as_ref() {
+            proof.context.verify(self, space_id)?;
+            validate_batch_receipt_credit(&tx, proof, space_id, request_id, "kv-set")?;
+        }
+        if let Some(receipt) = sql_atomic_receipt_with_reserved::<KvRecord>(
+            &tx,
+            false,
+            space_id,
+            request_id,
+            &fingerprint,
+            credit.is_some(),
+        )? {
+            if let Some(proof) = credit.as_ref() {
+                // Another caller's receipt is not evidence owned by this
+                // BATCH, even if it happens to share an identical payload.
+                verify_capacity_escrow_spend(
+                    &tx,
+                    "space",
+                    space_id,
+                    &proof.context.root_request_id,
+                    proof.item_index as i64,
+                    request_id,
+                    "RECEIPT",
+                    &fingerprint,
+                    1,
+                )?;
+            }
+            return Ok(MutationResult {
+                value: receipt,
+                disposition: MutationDisposition::Replayed,
+            });
         }
         ensure_space_exists(&tx, space_id)?;
         let current = kv_row(&tx, space_id, key)?;
@@ -798,9 +4421,62 @@ impl StorageEngine {
             etag,
             updated_at_ms: now,
         };
-        store_receipt(&tx, space_id, request_id, &receipt_operation, &result)?;
+        if let Some(proof) = credit.as_ref() {
+            // Debit is in the SAME SQL transaction as the KV change and the
+            // fingerprinted receipt; a failure leaves all three untouched.
+            if !spend_capacity_escrow(
+                &tx,
+                "space",
+                space_id,
+                &proof.context.root_request_id,
+                &proof.context.owner_application_id,
+                proof.item_index as i64,
+                request_id,
+                "RECEIPT",
+                &fingerprint,
+                1,
+            )? {
+                // A saved debit without a matching durable receipt cannot
+                // authorize another mutation; it requires recovery.
+                return Err(StorageError::RecoveryRequired);
+            }
+        }
+        sql_atomic_store(
+            &tx,
+            false,
+            space_id,
+            request_id,
+            &receipt_operation,
+            &fingerprint,
+            &result,
+        )?;
         tx.commit()?;
-        Ok(result)
+        Ok(MutationResult {
+            value: result,
+            disposition: MutationDisposition::Applied,
+        })
+    }
+
+    /// Check authoritative terminal proof before an event-producing mutation.
+    /// This is internal to Core/Runtime, not a public protocol endpoint. An
+    /// unfinished parent or an intent without a terminal receipt is NOT proof.
+    pub fn committed_space_request(&self, space_id: &str, request_id: &str) -> StorageResult<bool> {
+        validate_request_id(request_id)?;
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let committed: i64 = conn.query_row(
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM mutation_receipts
+                  WHERE space_id=?1 AND request_id=?2)
+                OR EXISTS (SELECT 1 FROM durable_operations
+                  WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2
+                    AND phase='COMMITTED' AND result_json IS NOT NULL)
+              THEN 1 ELSE 0 END",
+            params![space_id, request_id],
+            |row| row.get(0),
+        )?;
+        Ok(committed != 0)
     }
 
     pub fn write_file(
@@ -842,6 +4518,11 @@ impl StorageEngine {
                 "cannot read space root as a file".into(),
             ));
         }
+        // The registry record is the expected content identity. Hash exactly the
+        // bytes returned; never do a second disk pass that could see other content.
+        let expected = self
+            .stat_file(space_id, logical.as_str())?
+            .ok_or_else(|| StorageError::NotFound(logical.as_str().into()))?;
         let data_root = self.space_data_root(space_id)?;
         let target = data_root.join(logical.relative());
         ensure_no_symlink_escape(&data_root, &target)?;
@@ -854,6 +4535,12 @@ impl StorageEngine {
         })?;
         let mut out = Vec::new();
         file.read_to_end(&mut out)?;
+        if out.len() as u64 != expected.size || sha256_hex(&out) != expected.etag {
+            return Err(StorageError::StorageCorrupt(format!(
+                "read-small source changed while reading: {}",
+                logical.as_str()
+            )));
+        }
         Ok(out)
     }
 
@@ -1014,6 +4701,28 @@ impl StorageEngine {
         metadata: Option<&FileMetadata>,
         request_id: &str,
     ) -> StorageResult<FileRecord> {
+        let logical = LogicalPath::parse(raw_path)?;
+        let lease = self.admit_space(space_id, vec![Claim::path(space_id, logical.as_str())])?;
+        self.commit_stream_file_with_metadata_using_lease(
+            space_id, raw_path, temp, etag, size, if_match, metadata, request_id, &lease,
+        )
+    }
+
+    /// Use the lease already held by a stream from begin through its final journal ACK.
+    /// Composite file copies also reuse their enclosing path/subtree lease.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_stream_file_with_metadata_using_lease(
+        &self,
+        space_id: &str,
+        raw_path: &str,
+        temp: &Path,
+        etag: &str,
+        size: u64,
+        if_match: Option<&str>,
+        metadata: Option<&FileMetadata>,
+        request_id: &str,
+        _lease: &AdmissionLease,
+    ) -> StorageResult<FileRecord> {
         validate_file_metadata(metadata)?;
         validate_request_id(request_id)?;
         let logical = LogicalPath::parse(raw_path)?;
@@ -1054,9 +4763,14 @@ impl StorageEngine {
             .connection
             .lock()
             .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-        let tx = conn.transaction()?;
-        let receipt_operation = file_write_operation(logical.as_str());
-        if let Some(result) = receipt::<FileRecord>(&tx, space_id, request_id, &receipt_operation)?
+        let tx = if active_capacity_credit().is_some() {
+            conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?
+        } else {
+            conn.transaction()?
+        };
+        let fingerprint = file_write_fingerprint(logical.as_str(), etag, size, if_match, metadata)?;
+        if let Some(result) =
+            sql_atomic_receipt::<FileRecord>(&tx, false, space_id, request_id, &fingerprint)?
         {
             let _ = fs::remove_file(temp);
             return Ok(result);
@@ -1102,8 +4816,8 @@ impl StorageEngine {
             .to_string_lossy()
             .replace('\\', "/");
         tx.execute(
-            "INSERT INTO pending_mutations(id,space_id,operation,logical_path,collision_key,temp_rel_path,etag,size,next_version,created_at_ms,content_type,format_id,opaque) VALUES(?1,?2,'file-write',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-            params![request_id, space_id, logical.as_str(), logical.collision_key(), relative_temp, etag, size as i64, version as i64, now, metadata.and_then(|value| value.content_type.as_deref()), metadata.and_then(|value| value.format_id.as_deref()), metadata.and_then(|value| value.opaque).map(bool_to_db)],
+            "INSERT INTO pending_mutations(id,space_id,operation,logical_path,collision_key,temp_rel_path,etag,size,next_version,created_at_ms,content_type,format_id,opaque,request_fingerprint) VALUES(?1,?2,'file-write',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![request_id, space_id, logical.as_str(), logical.collision_key(), relative_temp, etag, size as i64, version as i64, now, metadata.and_then(|value| value.content_type.as_deref()), metadata.and_then(|value| value.format_id.as_deref()), metadata.and_then(|value| value.opaque).map(bool_to_db), fingerprint],
         )?;
         tx.commit()?;
         drop(conn);
@@ -1115,7 +4829,11 @@ impl StorageEngine {
             .connection
             .lock()
             .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-        let tx = conn.transaction()?;
+        let tx = if active_capacity_credit().is_some() {
+            conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?
+        } else {
+            conn.transaction()?
+        };
         let result = finalize_file_write(
             &tx,
             space_id,
@@ -1174,6 +4892,36 @@ impl StorageEngine {
         if_match: Option<&str>,
         request_id: &str,
         is_cancelled: F,
+        progress: P,
+    ) -> StorageResult<u64>
+    where
+        F: Fn() -> bool,
+        P: FnMut(u64, Option<u64>),
+    {
+        let logical = LogicalPath::parse(raw_path)?;
+        let lease = self.admit_space(space_id, vec![Claim::path(space_id, logical.as_str())])?;
+        self.delete_path_in_context(
+            space_id,
+            raw_path,
+            recursive,
+            if_match,
+            request_id,
+            &lease,
+            is_cancelled,
+            progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn delete_path_in_context<F, P>(
+        &self,
+        space_id: &str,
+        raw_path: &str,
+        recursive: bool,
+        if_match: Option<&str>,
+        request_id: &str,
+        _lease: &AdmissionLease,
+        is_cancelled: F,
         mut progress: P,
     ) -> StorageResult<u64>
     where
@@ -1188,12 +4936,17 @@ impl StorageEngine {
             ));
         }
         let operation = format!("fs-delete:{}:{}", logical.as_str(), recursive);
+        let payload =
+            json!({"path": logical.as_str(), "recursive": recursive, "ifMatch": if_match});
+        let fingerprint = semantic_fingerprint("DELETE", &payload)?;
         {
             let conn = self
                 .connection
                 .lock()
                 .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-            if let Some(done) = receipt::<u64>(&conn, space_id, request_id, &operation)? {
+            if let Some(done) =
+                fs_operation_replay::<u64>(&conn, space_id, request_id, "DELETE", &fingerprint)?
+            {
                 progress(done, Some(done));
                 return Ok(done);
             }
@@ -1230,46 +4983,79 @@ impl StorageEngine {
                     return Err(StorageError::Conflict("file ETag changed".into()));
                 }
             }
-            if is_cancelled() {
-                return Err(StorageError::OperationCancelled);
-            }
-            fs::remove_file(&target)?;
-            progress(1, Some(1));
-        } else {
-            if if_match.is_some() {
-                return Err(StorageError::RequestInvalid(
-                    "ifMatch is only valid for file delete".into(),
-                ));
-            }
-            // Destructive traversal is a safe cancellation boundary: once remove_dir_all starts,
-            // finish the filesystem mutation and registry reconciliation instead of reporting a
-            // cancelled operation with partially deleted registry state.
-            if is_cancelled() {
-                return Err(StorageError::OperationCancelled);
-            }
-            fs::remove_dir_all(&target)?;
+        } else if if_match.is_some() {
+            return Err(StorageError::RequestInvalid(
+                "ifMatch is only valid for file delete".into(),
+            ));
         }
-
+        if is_cancelled() {
+            return Err(StorageError::OperationCancelled);
+        }
+        // PREPARED is durable before rename; reconciliation restores the prior
+        // pathname after a crash unless the SQL commit and receipt are proven.
+        let intent_id = Uuid::new_v4().to_string();
+        let quarantine_root = self.root.join("runtime/fs-intent-quarantine");
+        fs::create_dir_all(&quarantine_root)?;
+        let quarantine = quarantine_root.join(&intent_id);
+        let source_rel = format!("spaces/{space_id}/data{}", logical.as_str());
+        let quarantine_rel = format!("runtime/fs-intent-quarantine/{intent_id}");
+        let durable_id = self.prepare_fs_intent(
+            &intent_id,
+            space_id,
+            request_id,
+            "DELETE",
+            Some(&source_rel),
+            None,
+            Some(&quarantine_rel),
+            &payload,
+        )?;
+        if let Err(error) = fs::rename(&target, &quarantine) {
+            self.mark_fs_intent_aborted(&durable_id, space_id, request_id)?;
+            return Err(error.into());
+        }
+        sync_parent(target.parent());
+        // The recovery resolver also recognizes PREPARED with an existing quarantine.
+        let _ = self.transition_fs_intent(&durable_id, "FS_APPLIED");
         let bytes_removed: u64 = affected.iter().map(|entry| entry.size).sum();
         let count = affected.len() as u64;
-        progress(count, Some(count));
-        let mut conn = self
-            .connection
-            .lock()
-            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-        let tx = conn.transaction()?;
-        for entry in &affected {
-            tx.execute(
-                "DELETE FROM file_entries WHERE space_id=?1 AND logical_path=?2",
-                params![space_id, entry.path],
-            )?;
+        let db_result = (|| -> StorageResult<()> {
+            let mut conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            let tx = if active_capacity_credit().is_some() {
+                conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?
+            } else {
+                conn.transaction()?
+            };
+            for entry in &affected {
+                tx.execute(
+                    "DELETE FROM file_entries WHERE space_id=?1 AND logical_path=?2",
+                    params![space_id, entry.path],
+                )?;
+            }
+            tx.execute("UPDATE spaces SET logical_bytes=MAX(0,logical_bytes - ?1),file_count=MAX(0,file_count - ?2),last_used_at_ms=?3 WHERE id=?4",params![bytes_removed as i64,count as i64,now_ms(),space_id])?;
+            self.complete_fs_intent(&tx, &durable_id, space_id, request_id, &operation, &count)?;
+            tx.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = db_result {
+            // A failed rollback is not silence: retain the durable intent for repair.
+            fs::rename(&quarantine, &target)?;
+            sync_parent(target.parent());
+            self.mark_fs_intent_aborted(&durable_id, space_id, request_id)?;
+            return Err(error);
         }
-        tx.execute(
-            "UPDATE spaces SET logical_bytes=MAX(0,logical_bytes - ?1),file_count=MAX(0,file_count - ?2),last_used_at_ms=?3 WHERE id=?4",
-            params![bytes_removed as i64, count as i64, now_ms(), space_id],
-        )?;
-        store_receipt(&tx, space_id, request_id, &operation, &count)?;
-        tx.commit()?;
+        progress(count, Some(count));
+        let cleanup = if metadata.is_dir() {
+            fs::remove_dir_all(&quarantine)
+        } else {
+            fs::remove_file(&quarantine)
+        };
+        if cleanup.is_ok() {
+            let _ = self.finish_fs_cleanup(&durable_id);
+        }
+        // SQL receipt is committed even if background cleanup must finish on restart.
         Ok(count)
     }
 
@@ -1301,6 +5087,43 @@ impl StorageEngine {
         overwrite: bool,
         request_id: &str,
         is_cancelled: F,
+        progress: P,
+    ) -> StorageResult<u64>
+    where
+        F: Fn() -> bool,
+        P: FnMut(u64, Option<u64>),
+    {
+        let from = LogicalPath::parse(raw_from)?;
+        let to = LogicalPath::parse(raw_to)?;
+        let lease = self.admit_space(
+            space_id,
+            vec![
+                Claim::path(space_id, from.as_str()),
+                Claim::path(space_id, to.as_str()),
+            ],
+        )?;
+        self.copy_path_in_context(
+            space_id,
+            raw_from,
+            raw_to,
+            overwrite,
+            request_id,
+            &lease,
+            is_cancelled,
+            progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_path_in_context<F, P>(
+        &self,
+        space_id: &str,
+        raw_from: &str,
+        raw_to: &str,
+        overwrite: bool,
+        request_id: &str,
+        _lease: &AdmissionLease,
+        is_cancelled: F,
         mut progress: P,
     ) -> StorageResult<u64>
     where
@@ -1327,12 +5150,18 @@ impl StorageEngine {
             ));
         }
         let operation = format!("fs-copy:{}:{}:{}", from.as_str(), to.as_str(), overwrite);
+        // A successful COPY is immutable even when its source is subsequently
+        // edited or removed. Check the original parent + exact SQL outcome
+        // BEFORE reading the *current* source manifest. Incomplete parents
+        // must still reconcile against their original manifest below.
         {
             let conn = self
                 .connection
                 .lock()
                 .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-            if let Some(done) = receipt::<u64>(&conn, space_id, request_id, &operation)? {
+            if let Some(done) =
+                committed_copy_replay_before_source(&conn, space_id, request_id, &operation)?
+            {
                 progress(done, Some(done));
                 return Ok(done);
             }
@@ -1343,24 +5172,74 @@ impl StorageEngine {
         let data_root = self.space_data_root(space_id)?;
         let source = data_root.join(from.relative());
         ensure_no_symlink_escape(&data_root, &source)?;
-        let source_meta = fs::symlink_metadata(&source).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                StorageError::NotFound(from.as_str().into())
-            } else {
-                error.into()
+        let source_meta = match fs::symlink_metadata(&source) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A prior unfinished COPY must never be classified as a fresh
+                // missing-source request. Preserve its uncertain outcome.
+                let conn = self
+                    .connection
+                    .lock()
+                    .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+                let prior: Option<i64> = conn.query_row(
+                    "SELECT 1 FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 AND kind='COPY'",
+                    params![space_id,request_id], |r|r.get(0),
+                ).optional()?;
+                return Err(if prior.is_some() {
+                    StorageError::RecoveryRequired
+                } else {
+                    StorageError::NotFound(from.as_str().into())
+                });
             }
-        })?;
+            Err(error) => return Err(error.into()),
+        };
         if is_link_like(&source_meta) {
             return Err(StorageError::PathInvalid(
                 "symlink/reparse copy is not allowed".into(),
             ));
         }
         let records = self.file_records_under(space_id, from.as_str())?;
+        let fingerprint = semantic_fingerprint(
+            "COPY",
+            &json!({
+                "from":from.as_str(),"to":to.as_str(),"overwrite":overwrite,
+                "records":records.iter().map(|r| json!({"path":r.path,"etag":r.etag,"size":r.size,"version":r.version})).collect::<Vec<_>>()
+            }),
+        )?;
+        {
+            let conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            // The COPY manifest itself is part of the intent. Replays are
+            // checked before preparing new items; an unfinished matching
+            // parent may continue through existing per-child receipt checks.
+            if let Some(done) =
+                composite_copy_replay::<u64>(&conn, space_id, request_id, &fingerprint)?
+            {
+                progress(done, Some(done));
+                return Ok(done);
+            }
+        }
         if source_meta.is_file() && records.is_empty() {
             return Err(StorageError::StorageCorrupt(
                 "file exists without registry metadata".into(),
             ));
         }
+        let item_fingerprints = records.iter().map(|record| {
+            let suffix = if record.path == from.as_str() { "" } else { &record.path[from.as_str().len()..] };
+            let target = format!("{}{}",to.as_str(),suffix);
+            semantic_fingerprint("COPY_ITEM",&json!({
+                "from":record.path,"to":target,"etag":record.etag,"size":record.size,"version":record.version
+            }))
+        }).collect::<StorageResult<Vec<_>>>()?;
+        self.prepare_composite_copy(
+            space_id,
+            request_id,
+            &fingerprint,
+            &operation,
+            &item_fingerprints,
+        )?;
         if source_meta.is_dir() && records.is_empty() {
             let destination = data_root.join(to.relative());
             ensure_no_symlink_escape(&data_root, &destination)?;
@@ -1375,13 +5254,7 @@ impl StorageEngine {
             }
             fs::create_dir_all(&destination)?;
             ensure_no_symlink_escape(&data_root, &destination)?;
-            let mut conn = self
-                .connection
-                .lock()
-                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-            let tx = conn.transaction()?;
-            store_receipt(&tx, space_id, request_id, &operation, &0_u64)?;
-            tx.commit()?;
+            self.complete_composite_copy(space_id, request_id, &operation, 0)?;
             progress(0, Some(0));
             return Ok(0);
         }
@@ -1398,6 +5271,40 @@ impl StorageEngine {
                 &record.path[from.as_str().len()..]
             };
             let destination_path = format!("{}{}", to.as_str(), suffix);
+            let child_request_id = format!("{request_id}:copy:{index}");
+            let item_fingerprint = semantic_fingerprint(
+                "COPY_ITEM",
+                &json!({
+                    "from":record.path,"to":destination_path,"etag":record.etag,"size":record.size,"version":record.version
+                }),
+            )?;
+            self.register_copy_item(space_id, request_id, index, &item_fingerprint)?;
+            let already_committed = {
+                let conn = self
+                    .connection
+                    .lock()
+                    .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+                receipt::<FileRecord>(
+                    &conn,
+                    space_id,
+                    &child_request_id,
+                    &file_write_operation(&destination_path),
+                )?
+            };
+            if let Some(done) = already_committed {
+                if self
+                    .stat_file(space_id, &destination_path)?
+                    .as_ref()
+                    .map(|row| row.etag.as_str())
+                    != Some(done.etag.as_str())
+                {
+                    return Err(StorageError::RecoveryRequired);
+                }
+                self.confirm_copy_item(space_id, request_id, index, &done)?;
+                copied += 1;
+                progress(copied, Some(total));
+                continue;
+            }
             if !overwrite && self.stat_file(space_id, &destination_path)?.is_some() {
                 return Err(StorageError::Conflict(format!(
                     "destination exists: {destination_path}"
@@ -1405,7 +5312,6 @@ impl StorageEngine {
             }
             let source_logical = LogicalPath::parse(&record.path)?;
             let source_file = data_root.join(source_logical.relative());
-            let child_request_id = format!("{request_id}:copy:{index}");
             self.ensure_write_capacity(space_id, record.size)?;
             let temp = self.prepare_stream_temp(space_id, &destination_path, &child_request_id)?;
             fs::copy(source_file, &temp)?;
@@ -1414,7 +5320,7 @@ impl StorageEngine {
                 return Err(StorageError::OperationCancelled);
             }
             let metadata = record.metadata();
-            self.commit_stream_file_with_metadata(
+            let committed = self.commit_stream_file_with_metadata_using_lease(
                 space_id,
                 &destination_path,
                 &temp,
@@ -1423,17 +5329,342 @@ impl StorageEngine {
                 None,
                 Some(&metadata),
                 &child_request_id,
+                _lease,
             )?;
+            self.confirm_copy_item(space_id, request_id, index, &committed)?;
             copied += 1;
             progress(copied, Some(total));
+        }
+        self.complete_composite_copy(space_id, request_id, &operation, copied)?;
+        Ok(copied)
+    }
+
+    // CP14: destination-present MOVE is a durable two-item composite, not an
+    // unjournaled copy followed by an unrelated delete. The source plan is
+    // immutable even after a successful delete removes its registry records.
+    fn prepare_composite_move(
+        &self,
+        space_id: &str,
+        request_id: &str,
+        fingerprint: &str,
+        plan: &MoveFallbackPlan,
+    ) -> StorageResult<()> {
+        let now = now_ms();
+        let copy_fp = move_copy_fingerprint(plan)?;
+        let delete_fp = move_delete_fingerprint(plan)?;
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if tx.query_row("SELECT 1 FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2",
+            params![space_id,request_id],|row|row.get::<_,i64>(0)).optional()?.is_some() {
+            return Err(StorageError::RecoveryRequired);
+        }
+        let owner: String = tx.query_row(
+            "SELECT owner_application_id FROM spaces WHERE id=?1",
+            params![space_id],
+            |r| r.get(0),
+        )?;
+        if request_id.starts_with("request-v3-") {
+            validate_new_v3_request_id(request_id, now)?;
+        }
+        if active_capacity_credit().is_none() {
+            // The parent occupies one actual slot; the nested COPY/DELETE
+            // subtree and final MOVE receipt are escrowed before any effect.
+            ensure_v3_result_capacity_slots(&tx, now, budget_move_fallback(plan.records.len())?)?;
+        } else {
+            ensure_v3_result_capacity_slots(&tx, now, 1)?;
+            if !spend_scoped_proof(&tx, space_id, request_id, "PARENT", fingerprint, 1)? {
+                return Err(StorageError::RecoveryRequired);
+            }
+        }
+        tx.execute("INSERT INTO durable_operations(scope_kind,scope_id,request_id,kind,owner_application_id,identity_version,request_fingerprint,phase,result_json,request_started_at_ms,created_at_ms,updated_at_ms) VALUES('space',?1,?2,'MOVE_COMPOSITE',?3,3,?4,'RUNNING',?5,?6,?6,?6)",
+            params![space_id,request_id,owner,fingerprint,serde_json::to_string(plan)?,now])?;
+        for (index, item_fp) in [(0_i64, copy_fp), (1_i64, delete_fp)] {
+            tx.execute("INSERT INTO durable_operation_items(scope_kind,scope_id,request_id,item_index,item_fingerprint,phase,updated_at_ms) VALUES('space',?1,?2,?3,?4,'PENDING',?5)",
+                params![space_id,request_id,index,item_fp,now])?;
+        }
+        if active_capacity_credit().is_none() {
+            reserve_capacity_escrow(
+                &tx,
+                "space",
+                space_id,
+                request_id,
+                &owner,
+                fingerprint,
+                budget_move_fallback(plan.records.len())? - 1,
+                true,
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    // A RUNNING item without a proven child COMMITTED result must *never* be
+    // started again. The Core child parent is the authoritative durable proof.
+    fn composite_move_child(
+        &self,
+        space_id: &str,
+        request_id: &str,
+        index: i64,
+        child_id: &str,
+        child_kind: &str,
+        expected_fingerprint: &str,
+    ) -> StorageResult<(bool, Option<u64>)> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let (item_fp,item_phase): (String,String) = conn.query_row(
+            "SELECT item_fingerprint,phase FROM durable_operation_items WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 AND item_index=?3",
+            params![space_id,request_id,index],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        if item_fp != expected_fingerprint {
+            return Err(StorageError::RequestIdConflict);
+        }
+        let parent: Option<DurableOperationDbRow> = conn.query_row(
+            "SELECT kind,request_fingerprint,phase,result_json,expires_at_ms FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2",
+            params![space_id,child_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+        if let Some((kind, fp, phase, result, expires)) = parent {
+            if kind != child_kind || fp != expected_fingerprint {
+                return Err(StorageError::RequestIdConflict);
+            }
+            if phase != "COMMITTED" {
+                return Err(StorageError::RecoveryRequired);
+            }
+            if expires.is_none_or(|at| at <= now_ms()) {
+                return Err(StorageError::ResultExpired);
+            }
+            let value: u64 = serde_json::from_str(&result.ok_or(StorageError::RecoveryRequired)?)?;
+            return Ok((false, Some(value)));
+        }
+        if item_phase != "PENDING" {
+            return Err(StorageError::RecoveryRequired);
+        }
+        // No parent evidence AND item is still PENDING: no child call has been made.
+        Ok((true, None))
+    }
+
+    fn set_composite_move_item(
+        &self,
+        space_id: &str,
+        request_id: &str,
+        index: i64,
+        phase: &str,
+        value: Option<u64>,
+    ) -> StorageResult<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let expected = if phase == "RUNNING" {
+            "PENDING"
+        } else {
+            "RUNNING"
+        };
+        let updated = conn.execute("UPDATE durable_operation_items SET phase=?1,result_json=?2,updated_at_ms=?3 WHERE scope_kind='space' AND scope_id=?4 AND request_id=?5 AND item_index=?6 AND phase=?7",
+            params![phase,value.map(|v|serde_json::to_string(&v)).transpose()?,now_ms(),space_id,request_id,index,expected])?;
+        if updated == 0 && phase == "COMMITTED" {
+            let actual: Option<String> = conn.query_row("SELECT phase FROM durable_operation_items WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 AND item_index=?3",
+                params![space_id,request_id,index],|r|r.get(0)).optional()?;
+            if actual.as_deref() == Some("COMMITTED") {
+                return Ok(());
+            }
+        }
+        if updated != 1 {
+            return Err(StorageError::RecoveryRequired);
+        }
+        Ok(())
+    }
+
+    fn verify_composite_move_source(
+        &self,
+        space_id: &str,
+        plan: &MoveFallbackPlan,
+    ) -> StorageResult<()> {
+        if self.file_records_under(space_id, &plan.from)? != plan.records {
+            return Err(StorageError::RecoveryRequired);
+        }
+        let root = self.space_data_root(space_id)?;
+        let source = root.join(LogicalPath::parse(&plan.from)?.relative());
+        ensure_no_symlink_escape(&root, &source)?;
+        let meta = fs::symlink_metadata(&source).map_err(|_| StorageError::RecoveryRequired)?;
+        if is_link_like(&meta) {
+            return Err(StorageError::RecoveryRequired);
+        }
+        Ok(())
+    }
+
+    fn verify_composite_move_destination(
+        &self,
+        space_id: &str,
+        plan: &MoveFallbackPlan,
+    ) -> StorageResult<()> {
+        let root = self.space_data_root(space_id)?;
+        let target = root.join(LogicalPath::parse(&plan.to)?.relative());
+        ensure_no_symlink_escape(&root, &target)?;
+        let meta = fs::symlink_metadata(&target).map_err(|_| StorageError::RecoveryRequired)?;
+        if is_link_like(&meta) {
+            return Err(StorageError::RecoveryRequired);
+        }
+        for original in &plan.records {
+            let suffix = if original.path == plan.from {
+                ""
+            } else {
+                &original.path[plan.from.len()..]
+            };
+            let target_path = format!("{}{}", plan.to, suffix);
+            let actual = self
+                .stat_file(space_id, &target_path)?
+                .ok_or(StorageError::RecoveryRequired)?;
+            if actual.etag != original.etag || actual.size != original.size {
+                return Err(StorageError::RecoveryRequired);
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_composite_move<F, P>(
+        &self,
+        space_id: &str,
+        request_id: &str,
+        fingerprint: &str,
+        operation: &str,
+        plan: &MoveFallbackPlan,
+        lease: &AdmissionLease,
+        is_cancelled: &F,
+        progress: &mut P,
+        fresh: bool,
+    ) -> StorageResult<u64>
+    where
+        F: Fn() -> bool,
+        P: FnMut(u64, Option<u64>),
+    {
+        if fresh {
+            self.prepare_composite_move(space_id, request_id, fingerprint, plan)?;
+        }
+        let _standalone_credit = if active_capacity_credit().is_none() {
+            let owner = {
+                let conn = self
+                    .connection
+                    .lock()
+                    .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+                let record: Option<(String,String)> = conn.query_row(
+                    "SELECT owner_application_id,request_fingerprint FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 AND kind='MOVE_COMPOSITE' AND phase='RUNNING'",
+                    params![space_id,request_id],|r|Ok((r.get(0)?,r.get(1)?)),
+                ).optional()?;
+                let (owner, prior_fp) = record.ok_or(StorageError::RecoveryRequired)?;
+                if prior_fp != fingerprint {
+                    return Err(StorageError::RequestIdConflict);
+                }
+                owner
+            };
+            Some(enter_capacity_credit(ScopedCapacityCredit {
+                owner,
+                space_id: space_id.to_owned(),
+                root_id: request_id.to_owned(),
+                item_index: 0,
+                item_fingerprint: fingerprint.to_owned(),
+                child_id: request_id.to_owned(),
+                standalone_move: true,
+            }))
+        } else {
+            None
+        };
+        let copied_id = format!("{request_id}:copy");
+        let deleted_id = format!("{request_id}:delete");
+        let copy_fp = move_copy_fingerprint(plan)?;
+        let delete_fp = move_delete_fingerprint(plan)?;
+        let total = plan.records.len() as u64;
+        let (can_copy, copied_proof) =
+            self.composite_move_child(space_id, request_id, 0, &copied_id, "COPY", &copy_fp)?;
+        let copied = if let Some(value) = copied_proof {
+            self.verify_composite_move_destination(space_id, plan)?;
+            self.set_composite_move_item(space_id, request_id, 0, "COMMITTED", Some(value))?;
+            value
+        } else {
+            if !can_copy || is_cancelled() {
+                return Err(StorageError::RecoveryRequired);
+            }
+            self.verify_composite_move_source(space_id, plan)?;
+            self.set_composite_move_item(space_id, request_id, 0, "RUNNING", None)?;
+            let result = self.copy_path_in_context(
+                space_id,
+                &plan.from,
+                &plan.to,
+                plan.overwrite,
+                &copied_id,
+                lease,
+                is_cancelled,
+                |done, _| progress(done, Some(total.saturating_mul(2))),
+            )?;
+            self.verify_composite_move_destination(space_id, plan)?;
+            self.set_composite_move_item(space_id, request_id, 0, "COMMITTED", Some(result))?;
+            result
+        };
+        let (can_delete, deleted_proof) =
+            self.composite_move_child(space_id, request_id, 1, &deleted_id, "DELETE", &delete_fp)?;
+        if let Some(value) = deleted_proof {
+            let source_root = self.space_data_root(space_id)?;
+            let old_source = source_root.join(LogicalPath::parse(&plan.from)?.relative());
+            if fs::symlink_metadata(&old_source).is_ok()
+                || !self.file_records_under(space_id, &plan.from)?.is_empty()
+            {
+                return Err(StorageError::RecoveryRequired);
+            }
+            self.set_composite_move_item(space_id, request_id, 1, "COMMITTED", Some(value))?;
+        } else {
+            if !can_delete || is_cancelled() {
+                return Err(StorageError::RecoveryRequired);
+            }
+            self.verify_composite_move_source(space_id, plan)?;
+            self.verify_composite_move_destination(space_id, plan)?;
+            self.set_composite_move_item(space_id, request_id, 1, "RUNNING", None)?;
+            let deleted = self.delete_path_in_context(
+                space_id,
+                &plan.from,
+                true,
+                plan.if_match.as_deref(),
+                &deleted_id,
+                lease,
+                is_cancelled,
+                |done, _| progress(copied.saturating_add(done), Some(total.saturating_mul(2))),
+            )?;
+            self.set_composite_move_item(space_id, request_id, 1, "COMMITTED", Some(deleted))?;
         }
         let mut conn = self
             .connection
             .lock()
             .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-        let tx = conn.transaction()?;
-        store_receipt(&tx, space_id, request_id, &operation, &copied)?;
+        let tx = if active_capacity_credit().is_some() {
+            conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?
+        } else {
+            conn.transaction()?
+        };
+        let now = now_ms();
+        let affected = tx.execute("UPDATE durable_operations SET phase='COMMITTED',result_json=?1,terminal_at_ms=?2,expires_at_ms=?3,updated_at_ms=?2 WHERE scope_kind='space' AND scope_id=?4 AND request_id=?5 AND kind='MOVE_COMPOSITE' AND request_fingerprint=?6 AND phase='RUNNING' AND NOT EXISTS(SELECT 1 FROM durable_operation_items WHERE scope_kind='space' AND scope_id=?4 AND request_id=?5 AND phase<>'COMMITTED')",
+            params![serde_json::to_string(&copied)?,now,now.saturating_add(DURABLE_SQL_RECEIPT_TTL_MS),space_id,request_id,fingerprint])?;
+        if affected != 1 {
+            return Err(StorageError::RecoveryRequired);
+        }
+        sql_atomic_store(
+            &tx,
+            false,
+            space_id,
+            request_id,
+            operation,
+            fingerprint,
+            &copied,
+        )?;
+        if active_capacity_credit()
+            .as_ref()
+            .is_some_and(|grant| grant.standalone_move && grant.root_id == request_id)
+        {
+            close_capacity_escrow(&tx, "space", space_id, request_id)?;
+        }
         tx.commit()?;
+        progress(copied, Some(copied));
         Ok(copied)
     }
 
@@ -1468,6 +5699,45 @@ impl StorageEngine {
         if_match: Option<&str>,
         request_id: &str,
         is_cancelled: F,
+        progress: P,
+    ) -> StorageResult<u64>
+    where
+        F: Fn() -> bool,
+        P: FnMut(u64, Option<u64>),
+    {
+        let from = LogicalPath::parse(raw_from)?;
+        let to = LogicalPath::parse(raw_to)?;
+        let lease = self.admit_space(
+            space_id,
+            vec![
+                Claim::path(space_id, from.as_str()),
+                Claim::path(space_id, to.as_str()),
+            ],
+        )?;
+        self.move_path_in_context(
+            space_id,
+            raw_from,
+            raw_to,
+            overwrite,
+            if_match,
+            request_id,
+            &lease,
+            is_cancelled,
+            progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn move_path_in_context<F, P>(
+        &self,
+        space_id: &str,
+        raw_from: &str,
+        raw_to: &str,
+        overwrite: bool,
+        if_match: Option<&str>,
+        request_id: &str,
+        lease: &AdmissionLease,
+        is_cancelled: F,
         mut progress: P,
     ) -> StorageResult<u64>
     where
@@ -1493,12 +5763,66 @@ impl StorageEngine {
             ));
         }
         let operation = format!("fs-move:{}:{}:{}", from.as_str(), to.as_str(), overwrite);
+        let move_payload =
+            json!({"from":from.as_str(),"to":to.as_str(),"overwrite":overwrite,"ifMatch":if_match});
+        let move_fingerprint = semantic_fingerprint("MOVE", &move_payload)?;
+        // Resolve an already admitted composite before dereferencing the source:
+        // after DELETE committed it legitimately no longer exists on disk.
+        let prior_composite: Option<DurableOperationDbRow> = {
+            let conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            conn.query_row("SELECT kind,request_fingerprint,phase,result_json,expires_at_ms FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2",
+                params![space_id,request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?
+        };
+        if let Some((kind, prior_fp, phase, result, expiry)) = prior_composite {
+            if kind == "MOVE_COMPOSITE" {
+                if prior_fp != move_fingerprint {
+                    return Err(StorageError::RequestIdConflict);
+                }
+                if phase == "COMMITTED" {
+                    if expiry.is_none_or(|at| at <= now_ms()) {
+                        return Err(StorageError::ResultExpired);
+                    }
+                    let count: u64 =
+                        serde_json::from_str(&result.ok_or(StorageError::RecoveryRequired)?)?;
+                    progress(count, Some(count));
+                    return Ok(count);
+                }
+                if phase != "RUNNING" {
+                    return Err(StorageError::RecoveryRequired);
+                }
+                let plan: MoveFallbackPlan =
+                    serde_json::from_str(&result.ok_or(StorageError::RecoveryRequired)?)?;
+                if plan.from != from.as_str()
+                    || plan.to != to.as_str()
+                    || plan.overwrite != overwrite
+                    || plan.if_match.as_deref() != if_match
+                {
+                    return Err(StorageError::RequestIdConflict);
+                }
+                return self.run_composite_move(
+                    space_id,
+                    request_id,
+                    &move_fingerprint,
+                    &operation,
+                    &plan,
+                    lease,
+                    &is_cancelled,
+                    &mut progress,
+                    false,
+                );
+            }
+        }
         {
             let conn = self
                 .connection
                 .lock()
                 .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-            if let Some(done) = receipt::<u64>(&conn, space_id, request_id, &operation)? {
+            if let Some(done) =
+                fs_operation_replay::<u64>(&conn, space_id, request_id, "MOVE", &move_fingerprint)?
+            {
                 progress(done, Some(done));
                 return Ok(done);
             }
@@ -1583,6 +5907,20 @@ impl StorageEngine {
             if is_cancelled() {
                 return Err(StorageError::OperationCancelled);
             }
+            // Durable MOVE intent binds the exact source, target and preconditions.
+            let intent_id = Uuid::new_v4().to_string();
+            let source_rel = format!("spaces/{space_id}/data{}", from.as_str());
+            let destination_rel = format!("spaces/{space_id}/data{}", to.as_str());
+            let journal = self.prepare_fs_intent(
+                &intent_id,
+                space_id,
+                request_id,
+                "MOVE",
+                Some(&source_rel),
+                Some(&destination_rel),
+                None,
+                &move_payload,
+            )?;
             if fs::rename(&source, &destination).is_ok() {
                 sync_parent(source.parent());
                 if source.parent() != destination.parent() {
@@ -1594,7 +5932,11 @@ impl StorageEngine {
                     .connection
                     .lock()
                     .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-                let tx = conn.transaction()?;
+                let tx = if active_capacity_credit().is_some() {
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?
+                } else {
+                    conn.transaction()?
+                };
                 for (record, destination_path) in mapped {
                     tx.execute(
                         "DELETE FROM file_entries WHERE space_id=?1 AND logical_path=?2",
@@ -1609,44 +5951,51 @@ impl StorageEngine {
                     "UPDATE spaces SET last_used_at_ms=?1 WHERE id=?2",
                     params![now, space_id],
                 )?;
-                store_receipt(&tx, space_id, request_id, &operation, &moved)?;
-                tx.commit()?;
+                self.complete_fs_intent(&tx, &journal, space_id, request_id, &operation, &moved)?;
+                if let Err(error) = tx.commit() {
+                    // The committed prefix is not proven: restore original path or fence via journal.
+                    drop(conn);
+                    fs::rename(&destination, &source)?;
+                    self.mark_fs_intent_aborted(&journal, space_id, request_id)?;
+                    return Err(error.into());
+                }
+                drop(conn);
+                let _ = self.finish_fs_cleanup(&journal);
                 progress(moved, Some(moved));
                 return Ok(moved);
             }
+            self.mark_fs_intent_aborted(&journal, space_id, request_id)?;
+            // A failed same-root rename is an authoritative FS failure, not
+            // permission to run an unjournaled copy/delete under this identity.
+            return Err(StorageError::StorageUnavailable(
+                "journaled move rename failed; source left intact".into(),
+            ));
         }
 
-        let total = records.len() as u64;
-        let copied = self.copy_path_with_progress(
-            space_id,
-            raw_from,
-            raw_to,
+        if !overwrite {
+            return Err(StorageError::Conflict(format!(
+                "destination exists: {}",
+                to.as_str()
+            )));
+        }
+        let plan = MoveFallbackPlan {
+            from: from.as_str().to_owned(),
+            to: to.as_str().to_owned(),
             overwrite,
-            &format!("{request_id}:copy"),
-            &is_cancelled,
-            |done, _| {
-                progress(done, Some(total.saturating_mul(2)));
-            },
-        )?;
-        self.delete_path_with_progress(
+            if_match: if_match.map(str::to_owned),
+            records,
+        };
+        self.run_composite_move(
             space_id,
-            raw_from,
-            true,
-            if_match,
-            &format!("{request_id}:delete"),
+            request_id,
+            &move_fingerprint,
+            &operation,
+            &plan,
+            lease,
             &is_cancelled,
-            |done, _| {
-                progress(copied.saturating_add(done), Some(total.saturating_mul(2)));
-            },
-        )?;
-        let mut conn = self
-            .connection
-            .lock()
-            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-        let tx = conn.transaction()?;
-        store_receipt(&tx, space_id, request_id, &operation, &copied)?;
-        tx.commit()?;
-        Ok(copied)
+            &mut progress,
+            true,
+        )
     }
 
     fn file_records_under(&self, space_id: &str, prefix: &str) -> StorageResult<Vec<FileRecord>> {
@@ -1730,19 +6079,25 @@ impl StorageEngine {
         validate_optional_metadata_text(Some(display_name), 128, "displayName")?;
         validate_optional_metadata_text(content_type, 128, "contentType")?;
         let now = now_ms();
-        let conn = self
+        let mut conn = self
             .connection
             .lock()
             .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-        if let Some(result) = application_receipt(
-            &conn,
-            application_id,
-            request_id,
-            &format!("format-register:{id}"),
-        )? {
+        let tx = conn.transaction()?;
+
+        let fingerprint = semantic_fingerprint(
+            "format-register",
+            &json!({
+                "applicationId":application_id, "id":id, "extension":extension,
+                "displayName":display_name, "contentType":content_type, "opaque":opaque
+            }),
+        )?;
+        if let Some(result) =
+            sql_atomic_receipt(&tx, true, application_id, request_id, &fingerprint)?
+        {
             return Ok(result);
         }
-        let exists: bool = conn.query_row(
+        let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM applications WHERE id=?1)",
             params![application_id],
             |row| row.get(0),
@@ -1750,7 +6105,7 @@ impl StorageEngine {
         if !exists {
             return Err(StorageError::NotFound("application".into()));
         }
-        let created_at_ms = conn
+        let created_at_ms = tx
             .query_row(
                 "SELECT created_at_ms FROM application_formats WHERE application_id=?1 AND id=?2",
                 params![application_id, id],
@@ -1758,7 +6113,7 @@ impl StorageEngine {
             )
             .optional()?
             .unwrap_or(now);
-        conn.execute(
+        tx.execute(
             "INSERT INTO application_formats(application_id,id,extension,display_name,content_type,opaque,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(application_id,id) DO UPDATE SET extension=excluded.extension,display_name=excluded.display_name,content_type=excluded.content_type,opaque=excluded.opaque,updated_at_ms=excluded.updated_at_ms",
             params![application_id, id, extension, display_name, content_type, bool_to_db(opaque), created_at_ms, now],
         )?;
@@ -1772,13 +6127,16 @@ impl StorageEngine {
             created_at_ms,
             updated_at_ms: now,
         };
-        store_application_receipt(
-            &conn,
+        sql_atomic_store(
+            &tx,
+            true,
             application_id,
             request_id,
             &format!("format-register:{id}"),
+            &fingerprint,
             &result,
         )?;
+        tx.commit()?;
         Ok(result)
     }
 
@@ -1804,29 +6162,35 @@ impl StorageEngine {
     ) -> StorageResult<bool> {
         validate_opaque_id(application_id)?;
         validate_format_id(id)?;
-        let conn = self
+        let mut conn = self
             .connection
             .lock()
             .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-        if let Some(result) = application_receipt(
-            &conn,
-            application_id,
-            request_id,
-            &format!("format-delete:{id}"),
-        )? {
+        let tx = conn.transaction()?;
+
+        let fingerprint = semantic_fingerprint(
+            "format-delete",
+            &json!({"applicationId":application_id, "id":id}),
+        )?;
+        if let Some(result) =
+            sql_atomic_receipt(&tx, true, application_id, request_id, &fingerprint)?
+        {
             return Ok(result);
         }
-        let deleted = conn.execute(
+        let deleted = tx.execute(
             "DELETE FROM application_formats WHERE application_id=?1 AND id=?2",
             params![application_id, id],
         )? > 0;
-        store_application_receipt(
-            &conn,
+        sql_atomic_store(
+            &tx,
+            true,
             application_id,
             request_id,
             &format!("format-delete:{id}"),
+            &fingerprint,
             &deleted,
         )?;
+        tx.commit()?;
         Ok(deleted)
     }
 
@@ -1862,40 +6226,135 @@ impl StorageEngine {
         self.space_data_root(space_id)
     }
 
+    /// Privileged Desktop-only status of a persisted owner deletion. Query by
+    /// the stable operation/request identity; never infer success from a missing
+    /// owner row or from an unfinished filesystem intent. Ambiguous duplicate
+    /// identities fail closed instead of choosing an arbitrary operation.
+    pub fn desktop_owner_deletion_status(&self, request_id: &str) -> StorageResult<Option<Value>> {
+        validate_request_id(request_id)?;
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT kind,scope_id,phase,result_json,request_started_at_ms,updated_at_ms,expires_at_ms \
+             FROM durable_operations WHERE request_id=?1 AND \
+             ((scope_kind='space' AND kind='SPACE_DELETE') OR \
+              (scope_kind='application' AND kind='APP_DELETE')) LIMIT 2",
+        )?;
+        let mut rows = stmt.query(params![request_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let kind: String = row.get(0)?;
+        let target_id: String = row.get(1)?;
+        let phase: String = row.get(2)?;
+        let result_json: Option<String> = row.get(3)?;
+        let started_at: i64 = row.get(4)?;
+        let updated_at: i64 = row.get(5)?;
+        let expires_at: Option<i64> = row.get(6)?;
+        if rows.next()?.is_some() {
+            return Err(StorageError::RequestIdConflict);
+        }
+        if matches!(
+            phase.as_str(),
+            "COMMITTED" | "ABORTED" | "PARTIALLY_APPLIED"
+        ) && expires_at.is_none_or(|expiry| expiry <= now_ms())
+        {
+            return Err(StorageError::ResultExpired);
+        }
+        let result: Option<Value> = result_json
+            .map(|raw| serde_json::from_str(&raw))
+            .transpose()?;
+        if phase == "COMMITTED" && result.is_none() {
+            return Err(StorageError::RecoveryRequired);
+        }
+        Ok(Some(json!({
+            "kind":kind, "targetId":target_id, "phase":phase, "result":result,
+            "startedAtMs":started_at,"updatedAtMs":updated_at,
+        })))
+    }
+
     /// Delete only a locally managed space. External exports are never touched.
     /// Both standalone and application removal use the same FK-complete registry cleanup.
     pub fn delete_space(&self, space_id: &str) -> StorageResult<(u64, u64)> {
+        self.delete_space_with_request(space_id, &format!("delete-v3-{}", Uuid::new_v4().simple()))
+    }
+
+    /// A caller-supplied stable request identity survives removal of the space row.
+    /// The durable parent is consulted before looking up the deleted resource.
+    pub fn delete_space_with_request(
+        &self,
+        space_id: &str,
+        request_id: &str,
+    ) -> StorageResult<(u64, u64)> {
+        validate_request_id(request_id)?;
+        validate_opaque_id(space_id)?;
+        let _lease = self.admit(vec![
+            Claim::global_shared(),
+            Claim::space_exclusive(space_id),
+        ])?;
+        {
+            let conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            if let Some(prior) = owner_deletion_replay::<(u64, u64)>(
+                &conn,
+                "space",
+                space_id,
+                request_id,
+                "SPACE_DELETE",
+                space_id,
+            )? {
+                return Ok(prior);
+            }
+        }
+        self.ensure_space_mutable(space_id)?;
         let space = self
             .get_space(space_id)?
             .ok_or_else(|| StorageError::NotFound("space".into()))?;
-        let moved = self.quarantine_space_root(space_id)?;
+        self.preflight_owner_deletion(None, std::slice::from_ref(&space))?;
+        let (request_id, paths) = self.prepare_owner_deletion(
+            "space",
+            space_id,
+            request_id,
+            &space.owner_application_id,
+            std::slice::from_ref(&space),
+        )?;
+        let (_, source, quarantine, _) = &paths[0];
+        if let Err(error) = fs::rename(source, quarantine) {
+            self.abort_owner_deletion("space", space_id, &request_id)?;
+            return Err(error.into());
+        }
+        sync_parent(source.parent());
+        let _ = self.transition_fs_intent(&paths[0].0, "FS_APPLIED");
+        let result = (space.logical_bytes, space.file_count);
         let db_result = (|| -> StorageResult<()> {
             let mut conn = self
                 .connection
                 .lock()
                 .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
             let tx = conn.transaction()?;
+            archive_space_outcomes(&tx, space_id, &space.owner_application_id)?;
             delete_space_registry_rows(&tx, space_id)?;
+            self.commit_owner_deletion(&tx, "space", space_id, &request_id, &result)?;
             tx.commit()?;
             Ok(())
         })();
         if let Err(error) = db_result {
-            if let Some(quarantine) = moved.as_ref() {
-                let source = self.root.join("spaces").join(space_id);
-                if let Err(restore_error) = fs::rename(quarantine, source) {
-                    return Err(StorageError::StorageUnavailable(format!(
-                        "deletion failed: {error}; managed data is preserved in deletion-quarantine but restore failed: {restore_error}"
-                    )));
-                }
-            }
+            // If restoration fails, keep the PREPARED/FS_APPLIED durable intent
+            // for startup reconciliation. Never claim rollback succeeded.
+            fs::rename(quarantine, source)?;
+            sync_parent(source.parent());
+            self.abort_owner_deletion("space", space_id, &request_id)?;
             return Err(error);
         }
-        if let Some(quarantine) = moved {
-            // After a successful registry commit, quarantine is disposable and will also
-            // be collected on startup if filesystem removal is interrupted.
-            fs::remove_dir_all(quarantine)?;
+        // Logical deletion is committed; cleanup is retryable after restart.
+        if fs::remove_dir_all(quarantine).is_ok() {
+            let _ = self.finish_fs_cleanup(&paths[0].0);
         }
-        Ok((space.logical_bytes, space.file_count))
+        Ok(result)
     }
 
     /// Remove one application identity, all its managed spaces, pairings, formats,
@@ -1903,6 +6362,43 @@ impl StorageEngine {
     /// A single registry transaction prevents a half-removed application on SQL errors.
     /// Caller must fence live sessions/streams and lock all of this application's spaces.
     pub fn delete_application_data(&self, application_id: &str) -> StorageResult<(u64, u64, u64)> {
+        self.delete_application_data_with_request(
+            application_id,
+            &format!("delete-v3-{}", Uuid::new_v4().simple()),
+        )
+    }
+
+    /// Privileged application deletion with a durable, stable caller identity.
+    /// The outcome is available even after application/pairing rows are removed.
+    pub fn delete_application_data_with_request(
+        &self,
+        application_id: &str,
+        request_id: &str,
+    ) -> StorageResult<(u64, u64, u64)> {
+        validate_request_id(request_id)?;
+        validate_opaque_id(application_id)?;
+        // First fence opens/manifest writes for this application. The set of
+        // spaces is dynamic, so determine it only after the parent is held.
+        let _owner_lease = self.admit(vec![
+            Claim::global_shared(),
+            Claim::exclusive(format!("application:{application_id}")),
+        ])?;
+        {
+            let conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            if let Some(prior) = owner_deletion_replay::<(u64, u64, u64)>(
+                &conn,
+                "application",
+                application_id,
+                request_id,
+                "APP_DELETE",
+                application_id,
+            )? {
+                return Ok(prior);
+            }
+        }
         self.get_application(application_id)?
             .ok_or_else(|| StorageError::NotFound("application".into()))?;
         let spaces = self
@@ -1910,6 +6406,22 @@ impl StorageEngine {
             .into_iter()
             .filter(|space| space.owner_application_id == application_id)
             .collect::<Vec<_>>();
+        // Space claims are disjoint from the held application owner claim.
+        // Acquiring them afterwards avoids locking the SQLite registry while
+        // computing this dynamically sized claim set.
+        let claims = spaces
+            .iter()
+            .map(|space| Claim::space_exclusive(&space.id))
+            .collect::<Vec<_>>();
+        let _space_lease = if claims.is_empty() {
+            None
+        } else {
+            Some(self.admit(claims)?)
+        };
+        for space in &spaces {
+            self.ensure_space_mutable(&space.id)?;
+        }
+        self.preflight_owner_deletion(Some(application_id), &spaces)?;
         let pending: i64 = self.connection.lock()
             .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?
             .query_row("SELECT COUNT(*) FROM stream_operations WHERE pairing_id IN (SELECT id FROM pairings WHERE application_id=?1) AND phase NOT IN ('COMMITTED','ABORTED','EXPIRED_FENCED')",
@@ -1919,17 +6431,24 @@ impl StorageEngine {
                 "application has unresolved stream operations".into(),
             ));
         }
+        let (request_id, paths) = self.prepare_owner_deletion(
+            "application",
+            application_id,
+            request_id,
+            application_id,
+            &spaces,
+        )?;
         let mut moved = Vec::<(String, PathBuf)>::new();
-        // Stage all managed directories before making any durable registry changes.
-        for space in &spaces {
-            match self.quarantine_space_root(&space.id) {
-                Ok(Some(path)) => moved.push((space.id.clone(), path)),
-                Ok(None) => {}
-                Err(error) => {
-                    restore_quarantined_spaces(&self.root, &moved)?;
-                    return Err(error);
-                }
+        for (id, source, quarantine, space_id) in &paths {
+            if let Err(error) = fs::rename(source, quarantine) {
+                // A restore error retains durable recovery evidence instead of deleting user data.
+                restore_quarantined_spaces(&self.root, &moved)?;
+                self.abort_owner_deletion("application", application_id, &request_id)?;
+                return Err(error.into());
             }
+            moved.push((space_id.clone(), quarantine.clone()));
+            sync_parent(source.parent());
+            let _ = self.transition_fs_intent(id, "FS_APPLIED");
         }
         let db_result = (|| -> StorageResult<()> {
             let mut conn = self
@@ -1948,13 +6467,27 @@ impl StorageEngine {
                 ));
             }
             for space in &spaces {
+                archive_space_outcomes(&tx, &space.id, application_id)?;
                 delete_space_registry_rows(&tx, &space.id)?;
             }
+            archive_application_outcomes(&tx, application_id)?;
             tx.execute(
                 "DELETE FROM grants WHERE subject_application_id=?1",
                 params![application_id],
             )?;
+            archive_application_streams(&tx, application_id)?;
             tx.execute("DELETE FROM stream_operations WHERE pairing_id IN (SELECT id FROM pairings WHERE application_id=?1)", params![application_id])?;
+            // Preserve only a status-only proof for a pairing ACTIVE at the
+            // instant of deletion. Already revoked pairing credentials get NULL.
+            tx.execute("INSERT INTO retained_pairing_owners(pairing_id,owner_application_id,deleted_at_ms,expires_at_ms,client_instance_id,credential_hash,application_kind,application_external_id)
+                SELECT p.id,p.application_id,?2,?3,
+                    CASE WHEN p.revoked_at_ms IS NULL THEN p.client_instance_id ELSE NULL END,
+                    CASE WHEN p.revoked_at_ms IS NULL THEN p.credential_hash ELSE NULL END,
+                    CASE WHEN p.revoked_at_ms IS NULL THEN a.kind ELSE NULL END,
+                    CASE WHEN p.revoked_at_ms IS NULL THEN a.external_id ELSE NULL END
+                FROM pairings p JOIN applications a ON a.id=p.application_id
+                WHERE p.application_id=?1",
+                params![application_id,now_ms(),now_ms().saturating_add(DURABLE_SQL_RECEIPT_TTL_MS)])?;
             tx.execute("DELETE FROM pairing_transport_policies WHERE pairing_id IN (SELECT id FROM pairings WHERE application_id=?1)", params![application_id])?;
             tx.execute(
                 "DELETE FROM pairings WHERE application_id=?1",
@@ -1983,17 +6516,26 @@ impl StorageEngine {
             if affected != 1 {
                 return Err(StorageError::NotFound("application".into()));
             }
+            let result = (
+                spaces.len() as u64,
+                spaces.iter().map(|s| s.logical_bytes).sum::<u64>(),
+                spaces.iter().map(|s| s.file_count).sum::<u64>(),
+            );
+            self.commit_owner_deletion(&tx, "application", application_id, &request_id, &result)?;
             tx.commit()?;
             Ok(())
         })();
         if let Err(error) = db_result {
             restore_quarantined_spaces(&self.root, &moved)?;
+            self.abort_owner_deletion("application", application_id, &request_id)?;
             return Err(error);
         }
         // A post-commit cleanup failure must remain observable to the caller;
         // startup cleanup can safely retry for deleted registry identities.
-        for (_, quarantine) in moved {
-            fs::remove_dir_all(quarantine)?;
+        for (id, _, quarantine, _) in &paths {
+            if fs::remove_dir_all(quarantine).is_ok() {
+                let _ = self.finish_fs_cleanup(id);
+            }
         }
         Ok((
             spaces.len() as u64,
@@ -2002,6 +6544,140 @@ impl StorageEngine {
         ))
     }
 
+    /// Fail before touching user bytes if a space/application delete would discard
+    /// an unexpired v3 receipt. The v3 FK stays authoritative; no trigger bypass.
+    fn preflight_owner_deletion(
+        &self,
+        application_id: Option<&str>,
+        spaces: &[SpaceRecord],
+    ) -> StorageResult<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        // Receipt rows will be archived in the SAME transaction as owner deletion.
+        // The SQL retention triggers accept deletion only after an exact copy exists.
+        if let Some(application_id) = application_id {
+            let unresolved: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM durable_operations WHERE owner_application_id=?1 AND phase IN ('ADMITTED','RUNNING','CANCEL_REQUESTED','RECONCILING','NEEDS_REPAIR')",
+                params![application_id],|r|r.get(0))?;
+            if unresolved != 0 {
+                return Err(StorageError::RecoveryRequired);
+            }
+        }
+        for space in spaces {
+            let active: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND phase NOT IN ('COMMITTED','ABORTED','PARTIALLY_APPLIED')",
+                params![space.id],|r|r.get(0))?;
+            if active > 0 {
+                return Err(StorageError::RecoveryRequired);
+            }
+        }
+        Ok(())
+    }
+
+    /// A single durable parent owns all child space-directory intents. Its result
+    /// remains independent of the deleted spaces/applications and their FK rows.
+    fn prepare_owner_deletion(
+        &self,
+        scope_kind: &str,
+        scope_id: &str,
+        request_id: &str,
+        owner_application_id: &str,
+        spaces: &[SpaceRecord],
+    ) -> StorageResult<(String, Vec<NativeDeletionEntry>)> {
+        validate_request_id(request_id)?;
+        let now = now_ms();
+        let kind = if scope_kind == "application" {
+            "APP_DELETE"
+        } else {
+            "SPACE_DELETE"
+        };
+        let mut paths = Vec::with_capacity(spaces.len());
+        for space in spaces {
+            let source = self.root.join("spaces").join(&space.id);
+            let meta = fs::symlink_metadata(&source).map_err(|_| StorageError::RecoveryRequired)?;
+            if is_link_like(&meta) || !meta.is_dir() {
+                return Err(StorageError::RecoveryRequired);
+            }
+            let intent_id = Uuid::new_v4().to_string();
+            let quarantine = self
+                .root
+                .join("runtime/deletion-quarantine")
+                .join(format!("{}-{intent_id}", space.id));
+            paths.push((intent_id, source, quarantine, space.id.clone()));
+        }
+        fs::create_dir_all(self.root.join("runtime/deletion-quarantine"))?;
+        // Bind the stable request to the owner and target, not to the enumerated
+        // children: the latter cease to exist after a committed deletion.
+        let fingerprint = owner_deletion_fingerprint(kind, scope_id)?;
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction()?;
+        ensure_v3_result_capacity(&tx, now)?;
+        tx.execute("INSERT INTO durable_operations(scope_kind,scope_id,request_id,kind,owner_application_id,identity_version,request_fingerprint,phase,request_started_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,3,?6,'ADMITTED',?7,?7,?7)",
+            params![scope_kind,scope_id,request_id,kind,owner_application_id,fingerprint,now])?;
+        for (id, source, quarantine, space_id) in &paths {
+            let relative_source = source
+                .strip_prefix(&self.root)
+                .map_err(|_| StorageError::RecoveryRequired)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let relative_quarantine = quarantine
+                .strip_prefix(&self.root)
+                .map_err(|_| StorageError::RecoveryRequired)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            tx.execute("INSERT INTO filesystem_intents(intent_id,scope_kind,scope_id,request_id,intent_kind,source_rel,quarantine_rel,state,payload_json,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,'PREPARED',?8,?9)",
+                params![id,scope_kind,scope_id,request_id,kind,relative_source,relative_quarantine,json!({"spaceId":space_id}).to_string(),now])?;
+        }
+        tx.commit()?;
+        Ok((request_id.to_owned(), paths))
+    }
+
+    fn commit_owner_deletion<T: serde::Serialize>(
+        &self,
+        tx: &Transaction<'_>,
+        scope_kind: &str,
+        scope_id: &str,
+        request_id: &str,
+        result: &T,
+    ) -> StorageResult<()> {
+        let now = now_ms();
+        tx.execute("UPDATE filesystem_intents SET state='DB_COMMITTED',updated_at_ms=?1 WHERE scope_kind=?2 AND scope_id=?3 AND request_id=?4 AND state IN ('PREPARED','FS_APPLIED')",
+            params![now,scope_kind,scope_id,request_id])?;
+        let changed = tx.execute("UPDATE durable_operations SET phase='COMMITTED',result_json=?1,terminal_at_ms=?2,expires_at_ms=?3,updated_at_ms=?2,cleanup_pending=CASE WHEN EXISTS(SELECT 1 FROM filesystem_intents WHERE scope_kind=?4 AND scope_id=?5 AND request_id=?6) THEN 1 ELSE 0 END WHERE scope_kind=?4 AND scope_id=?5 AND request_id=?6 AND phase='ADMITTED'",
+            params![serde_json::to_string(result)?,now,now.saturating_add(DURABLE_SQL_RECEIPT_TTL_MS),scope_kind,scope_id,request_id])?;
+        if changed != 1 {
+            return Err(StorageError::RecoveryRequired);
+        }
+        Ok(())
+    }
+
+    fn abort_owner_deletion(
+        &self,
+        scope_kind: &str,
+        scope_id: &str,
+        request_id: &str,
+    ) -> StorageResult<()> {
+        let now = now_ms();
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE filesystem_intents SET state='CLEANED',updated_at_ms=?1 WHERE scope_kind=?2 AND scope_id=?3 AND request_id=?4 AND state IN ('PREPARED','FS_APPLIED')",
+            params![now,scope_kind,scope_id,request_id])?;
+        tx.execute("UPDATE durable_operations SET phase='ABORTED',terminal_at_ms=?1,expires_at_ms=?2,updated_at_ms=?1 WHERE scope_kind=?3 AND scope_id=?4 AND request_id=?5 AND phase='ADMITTED' AND NOT EXISTS(SELECT 1 FROM filesystem_intents WHERE scope_kind=?3 AND scope_id=?4 AND request_id=?5 AND state<>'CLEANED')",
+            params![now,now.saturating_add(DURABLE_SQL_RECEIPT_TTL_MS),scope_kind,scope_id,request_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // Retained legacy helper; not part of the active mutation path.
+    #[allow(dead_code)]
     fn quarantine_space_root(&self, space_id: &str) -> StorageResult<Option<PathBuf>> {
         validate_opaque_id(space_id)?;
         // Fail before a filesystem rename when an unresolved durable ACK/commit
@@ -2061,6 +6737,40 @@ impl StorageEngine {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Read-only physical usage verification. No registry, manifest or index adoption.
+    /// The shared admission claim is intentionally scoped to this space; external
+    /// out-of-band writers are still untrusted and cannot be accepted here.
+    pub fn verify_space_usage<F>(
+        &self,
+        space_id: &str,
+        is_cancelled: F,
+    ) -> StorageResult<(u64, u64)>
+    where
+        F: Fn() -> bool,
+    {
+        let _lease = self.admit(vec![
+            Claim::global_shared(),
+            Claim::space_exclusive(space_id),
+        ])?;
+        self.get_space(space_id)?
+            .ok_or_else(|| StorageError::NotFound("space".into()))?;
+        let scan = scan_file_index(&self.space_data_root(space_id)?, &is_cancelled, |_| {})?;
+        if !scan.unsafe_items.is_empty() {
+            return Err(StorageError::RecoveryRequired);
+        }
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        if !scan_matches_index(&conn, space_id, &scan)? {
+            return Err(StorageError::RecoveryRequired);
+        }
+        Ok((scan.logical_bytes, scan.files.len() as u64))
+    }
+
+    /// Explicit counter reconciliation only. External files or modified content
+    /// must first be adopted via the separately authorized `repair_space` flow;
+    /// a maintenance job must never silently import them into usage counters.
     pub fn reconcile_space_usage<F>(
         &self,
         space_id: &str,
@@ -2069,22 +6779,147 @@ impl StorageEngine {
     where
         F: Fn() -> bool,
     {
-        let data_root = self.space_data_root(space_id)?;
-        let (bytes, files) = scan_usage_cancellable(&data_root, &is_cancelled)?;
-        let conn = self
+        let _lease = self.admit(vec![
+            Claim::global_shared(),
+            Claim::space_exclusive(space_id),
+        ])?;
+        self.ensure_space_mutable(space_id)?;
+        let scan = scan_file_index(&self.space_data_root(space_id)?, &is_cancelled, |_| {})?;
+        if !scan.unsafe_items.is_empty() {
+            return Err(StorageError::RecoveryRequired);
+        }
+        if is_cancelled() {
+            return Err(StorageError::OperationCancelled);
+        }
+        let mut conn = self
             .connection
             .lock()
             .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-        conn.execute(
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if !scan_matches_index(&tx, space_id, &scan)? {
+            return Err(StorageError::RecoveryRequired);
+        }
+        if is_cancelled() {
+            return Err(StorageError::OperationCancelled);
+        }
+        tx.execute(
             "UPDATE spaces SET logical_bytes=?1,file_count=?2,last_used_at_ms=?3 WHERE id=?4",
-            params![bytes as i64, files as i64, now_ms(), space_id],
+            params![
+                scan.logical_bytes as i64,
+                scan.files.len() as i64,
+                now_ms(),
+                space_id
+            ],
         )?;
+        tx.commit()?;
         drop(conn);
         self.get_space(space_id)?
             .ok_or_else(|| StorageError::NotFound("space".into()))
     }
 
+    /// Legacy internal clear entry-point. The public Runtime uses the request-
+    /// bound variant below; preserve this helper for existing Core consumers.
     pub fn clear_disposable_space(&self, space_id: &str) -> StorageResult<SpaceClearReport> {
+        Ok(self.clear_disposable_space_inner(space_id, None)?.value)
+    }
+
+    /// The public whole-space clear has a durable identity independent of its
+    /// internal SPACE_REPLACE intent. Never repeat an uncertain prior clear,
+    /// even if its successful response was lost after the data swap.
+    pub fn clear_disposable_space_with_request(
+        &self,
+        space_id: &str,
+        request_id: &str,
+    ) -> StorageResult<MutationResult<SpaceClearReport>> {
+        validate_request_id(request_id)?;
+        self.clear_disposable_space_inner(space_id, Some(request_id))
+    }
+
+    /// Authenticated Runtime calls this read-only lookup *before* starting a
+    /// long operation or taking API-level stream locks. A lost response must
+    /// return its committed result without scheduling a second worker.
+    pub fn replayed_space_clear(
+        &self,
+        space_id: &str,
+        request_id: &str,
+    ) -> StorageResult<Option<SpaceClearReport>> {
+        validate_request_id(request_id)?;
+        let fingerprint = semantic_fingerprint("space-clear", &json!({"spaceId":space_id}))?;
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        fs_operation_replay(&conn, space_id, request_id, "SPACE_CLEAR", &fingerprint)
+    }
+
+    fn clear_disposable_space_inner(
+        &self,
+        space_id: &str,
+        request_id: Option<&str>,
+    ) -> StorageResult<MutationResult<SpaceClearReport>> {
+        let _lease = self.admit(vec![
+            Claim::global_shared(),
+            Claim::space_exclusive(space_id),
+        ])?;
+        // Check identity before the mutable-space fence: a prior COMMITTED
+        // result is still replayable after the scope entered recovery state.
+        let fingerprint = if request_id.is_some() {
+            Some(semantic_fingerprint(
+                "space-clear",
+                &json!({"spaceId":space_id}),
+            )?)
+        } else {
+            None
+        };
+        if let (Some(request), Some(fingerprint)) = (request_id, fingerprint.as_deref()) {
+            let mut conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if let Some(previous) = fs_operation_replay::<SpaceClearReport>(
+                &tx,
+                space_id,
+                request,
+                "SPACE_CLEAR",
+                fingerprint,
+            )? {
+                return Ok(MutationResult {
+                    value: previous,
+                    disposition: MutationDisposition::Replayed,
+                });
+            }
+            // A fresh receipt cannot be admitted if replay capacity is full.
+            // Both the parent and the public receipt consume protected slots.
+            let now = now_ms();
+            if request.starts_with("request-v3-") {
+                validate_new_v3_request_id(request, now)?;
+            }
+            ensure_v3_result_capacity_slots(&tx, now, 2)?;
+            let owner: String = tx.query_row(
+                "SELECT owner_application_id FROM spaces WHERE id=?1",
+                params![space_id],
+                |r| r.get(0),
+            )?;
+            // Reject an unsupported space before persisting a mutating identity.
+            let storage_class: String = tx.query_row(
+                "SELECT storage_class FROM spaces WHERE id=?1",
+                params![space_id],
+                |r| r.get(0),
+            )?;
+            if storage_class != "cache" && storage_class != "temporary" {
+                return Err(StorageError::RequestInvalid(
+                    "whole-space clear is only valid for cache or temporary spaces".into(),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO durable_operations(scope_kind,scope_id,request_id,kind,owner_application_id,identity_version,request_fingerprint,phase,request_started_at_ms,created_at_ms,updated_at_ms) \
+                 VALUES('space',?1,?2,'SPACE_CLEAR',?3,3,?4,'ADMITTED',?5,?5,?5)",
+                params![space_id,request,owner,fingerprint,now],
+            )?;
+            tx.commit()?;
+        }
+        self.ensure_space_mutable(space_id)?;
         let space = self
             .get_space(space_id)?
             .ok_or_else(|| StorageError::NotFound("space".into()))?;
@@ -2096,7 +6931,6 @@ impl StorageEngine {
                 "whole-space clear is only valid for cache or temporary spaces".into(),
             ));
         }
-
         let deleted_kv_entries = {
             let conn = self
                 .connection
@@ -2109,50 +6943,41 @@ impl StorageEngine {
             )?
             .max(0) as u64
         };
-
-        let data_root = self.space_data_root(space_id)?;
-        clear_directory_contents_preserving_root(&data_root)?;
-
-        // With runtime stream/exclusive guards in place there must be no live temp writer.
-        // Remove abandoned stream temps together with their pending registry state so the
-        // disposable space is actually empty without touching snapshots or other internal data.
-        let tmp_root = self.space_internal_root(space_id)?.join("tmp");
-        if tmp_root.exists() {
-            clear_directory_contents_preserving_root(&tmp_root)?;
-        }
-
-        let mut conn = self
-            .connection
-            .lock()
-            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            "DELETE FROM kv_entries WHERE space_id=?1",
-            params![space_id],
-        )?;
-        tx.execute(
-            "DELETE FROM file_entries WHERE space_id=?1",
-            params![space_id],
-        )?;
-        tx.execute(
-            "DELETE FROM pending_mutations WHERE space_id=?1",
-            params![space_id],
-        )?;
-        tx.execute(
-            "DELETE FROM mutation_receipts WHERE space_id=?1",
-            params![space_id],
-        )?;
-        tx.execute(
-            "UPDATE spaces SET logical_bytes=0,file_count=0,state='healthy',last_used_at_ms=?1 WHERE id=?2",
-            params![now_ms(), space_id],
-        )?;
-        tx.commit()?;
-
-        Ok(SpaceClearReport {
+        let report = SpaceClearReport {
             space_id: space_id.to_owned(),
             deleted_files: space.file_count,
             deleted_kv_entries,
             released_bytes: space.logical_bytes,
+        };
+        // The staged replacement owns its own internal FS intent. The public
+        // parent and its receipt must be committed in the SAME SQL transaction
+        // as the registry swap, never as a second optimistic acknowledgment.
+        let staging_root = self
+            .root
+            .join("runtime/restore-staging")
+            .join(format!("clear-{}", Uuid::new_v4().simple()));
+        let staging_data = staging_root.join("data");
+        fs::create_dir_all(&staging_data)?;
+        let public_completion = match (request_id, fingerprint.as_deref()) {
+            (Some(request), Some(fp)) => Some((request, fp, &report)),
+            _ => None,
+        };
+        let result = commit_staged_space_replace(
+            self,
+            space_id,
+            &staging_data,
+            &[],
+            &[],
+            None,
+            public_completion,
+        );
+        if result.is_ok() {
+            let _ = fs::remove_dir_all(&staging_root);
+        }
+        result?;
+        Ok(MutationResult {
+            value: report,
+            disposition: MutationDisposition::Applied,
         })
     }
 
@@ -2218,6 +7043,31 @@ impl StorageEngine {
         F: Fn() -> bool,
         P: FnMut(&str, u64, Option<u64>, bool),
     {
+        // Hold one Core-owned exclusive space mutation lease from the first
+        // read until the final index/manifest/quarantine commit. This must be
+        // outside the SQLite mutex, and every early return drops the lease.
+        let _lease = self.admit(vec![
+            Claim::global_shared(),
+            Claim::space_exclusive(space_id),
+        ])?;
+        // Repair is an explicitly authorized adoption of external file changes.
+        // Unresolved durable effects are not external changes and must never
+        // be overwritten by a fresh full-index scan.
+        {
+            let conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            let unfinished: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM filesystem_intents WHERE scope_kind='space' AND scope_id=?1 AND state NOT IN ('CLEANED','DB_COMMITTED')",
+                params![space_id], |row| row.get(0))?;
+            let pending_ops: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND phase NOT IN ('COMMITTED','ABORTED','PARTIALLY_APPLIED')",
+                params![space_id], |row| row.get(0))?;
+            if unfinished != 0 || pending_ops != 0 {
+                return Err(StorageError::RecoveryRequired);
+            }
+        }
         let space = self
             .get_space(space_id)?
             .ok_or_else(|| StorageError::NotFound("space".into()))?;
@@ -2343,6 +7193,249 @@ impl StorageEngine {
         })
     }
 
+    /// The grant picker is an OS side effect: admission must be durable before
+    /// the picker is opened, otherwise a lost ACK can open it a second time.
+    /// A matching incomplete request is deliberately NOT re-executed.
+    pub fn admit_directory_grant_request(
+        &self,
+        application_id: &str,
+        request_id: &str,
+        label: Option<&str>,
+        capability: DirectoryGrantCapability,
+        initial_id: Option<&str>,
+        reuse: bool,
+    ) -> StorageResult<DestinationGrantAdmission> {
+        validate_opaque_id(application_id)?;
+        validate_request_id(request_id)?;
+        let fingerprint =
+            destination_request_fingerprint(application_id, label, capability, initial_id, reuse)?;
+        let now = now_ms();
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let prior: Option<DurableOperationDbRow> = tx.query_row(
+            "SELECT kind,request_fingerprint,phase,result_json,expires_at_ms FROM durable_operations \
+             WHERE scope_kind='application' AND scope_id=?1 AND request_id=?2 AND owner_application_id=?1",
+            params![application_id,request_id],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+        ).optional()?;
+        if let Some((kind, saved_fingerprint, phase, result, expires)) = prior {
+            if kind != "DESTINATION_CREATE" || saved_fingerprint != fingerprint {
+                return Err(StorageError::RequestIdConflict);
+            }
+            if matches!(phase.as_str(), "COMMITTED" | "ABORTED")
+                && expires.is_none_or(|until| until <= now)
+            {
+                return Err(StorageError::ResultExpired);
+            }
+            return match phase.as_str() {
+                "COMMITTED" => {
+                    let json = result.ok_or(StorageError::RecoveryRequired)?;
+                    Ok(DestinationGrantAdmission::Replayed(serde_json::from_str(
+                        &json,
+                    )?))
+                }
+                "ABORTED" if result.as_deref() == Some(r#"{"userCancelled":true}"#) => {
+                    Ok(DestinationGrantAdmission::UserCancelled)
+                }
+                _ => Err(StorageError::RecoveryRequired),
+            };
+        }
+        // Ownership, timestamp and capacity are checked in the admission txn,
+        // BEFORE the OS picker and before touching any grant or filesystem data.
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM applications WHERE id=?1)",
+            params![application_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(StorageError::NotFound("application not found".into()));
+        }
+        if request_id.starts_with("request-v3-") {
+            validate_new_v3_request_id(request_id, now)?;
+        }
+        ensure_v3_result_capacity_slots(&tx, now, 2)?;
+        tx.execute("INSERT INTO durable_operations(scope_kind,scope_id,request_id,kind,owner_application_id,identity_version,request_fingerprint,phase,request_started_at_ms,created_at_ms,updated_at_ms) \
+                    VALUES('application',?1,?2,'DESTINATION_CREATE',?1,3,?3,'ADMITTED',?4,?4,?4)",
+            params![application_id,request_id,fingerprint,now])?;
+        tx.commit()?;
+        Ok(DestinationGrantAdmission::New)
+    }
+
+    /// Confirmed user cancellation (picker explicitly returned None), not an
+    /// inferred rollback of an interrupted or failed picker.
+    pub fn cancel_directory_grant_request(
+        &self,
+        application_id: &str,
+        request_id: &str,
+    ) -> StorageResult<()> {
+        let now = now_ms();
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let saved: Option<String> = tx.query_row(
+            "SELECT request_fingerprint FROM durable_operations WHERE scope_kind='application' AND scope_id=?1 AND request_id=?2 AND kind='DESTINATION_CREATE' AND phase='ADMITTED'",
+            params![application_id,request_id], |r|r.get(0)).optional()?;
+        let fingerprint = saved.ok_or(StorageError::RecoveryRequired)?;
+        let result = json!({"userCancelled":true});
+        sql_atomic_store(
+            &tx,
+            true,
+            application_id,
+            request_id,
+            "DESTINATION_CREATE",
+            &fingerprint,
+            &result,
+        )?;
+        let changed = tx.execute("UPDATE durable_operations SET phase='ABORTED',result_json=?1,terminal_at_ms=?2,expires_at_ms=?3,updated_at_ms=?2 \
+            WHERE scope_kind='application' AND scope_id=?4 AND request_id=?5 AND kind='DESTINATION_CREATE' AND phase='ADMITTED'",
+            params![result.to_string(),now,now.saturating_add(DURABLE_SQL_RECEIPT_TTL_MS),application_id,request_id])?;
+        if changed != 1 {
+            return Err(StorageError::RecoveryRequired);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Selected directory and native root identity are checked before the SQL
+    /// transaction. Binding, grant issuance (or exact same-folder reuse), the
+    /// terminal parent and its application receipt commit atomically.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_directory_grant_request(
+        &self,
+        application_id: &str,
+        request_id: &str,
+        physical_path: &Path,
+        label: Option<&str>,
+        capability: DirectoryGrantCapability,
+        initial_id: Option<&str>,
+        reuse: bool,
+    ) -> StorageResult<DirectoryGrantRecord> {
+        let fingerprint =
+            destination_request_fingerprint(application_id, label, capability, initial_id, reuse)?;
+        let canonical = fs::canonicalize(physical_path)?;
+        let metadata = fs::symlink_metadata(&canonical)?;
+        if !metadata.is_dir() || is_link_like(&metadata) {
+            return Err(StorageError::RequestInvalid(
+                "selected destination must be a real directory".into(),
+            ));
+        }
+        #[cfg(any(unix, windows))]
+        let root_identity = {
+            let selected = NativeDirectory::open(&canonical)?;
+            selected.ensure_root_identity(&metadata)?;
+            Some(selected.identity()?)
+        };
+        #[cfg(not(any(unix, windows)))]
+        let root_identity: Option<String> = None;
+        let safe_label = label
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                canonical
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "Selected folder".into());
+        if safe_label.len() > 128 {
+            return Err(StorageError::RequestInvalid(
+                "destination label is too long".into(),
+            ));
+        }
+        let now = now_ms();
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let saved: Option<(String,String)> = tx.query_row(
+            "SELECT request_fingerprint,phase FROM durable_operations WHERE scope_kind='application' AND scope_id=?1 AND request_id=?2 AND kind='DESTINATION_CREATE'",
+            params![application_id,request_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        match saved {
+            Some((prior, _)) if prior != fingerprint => {
+                return Err(StorageError::RequestIdConflict)
+            }
+            Some((_, phase)) if phase != "ADMITTED" => return Err(StorageError::RecoveryRequired),
+            None => return Err(StorageError::RecoveryRequired),
+            _ => {}
+        }
+        let mut reused = None;
+        if reuse {
+            if let Some(initial_id) = initial_id {
+                let candidate: Option<DirectoryGrantRecord> = tx.query_row(
+                    "SELECT id,application_id,label,physical_path,capability,created_at_ms,last_used_at_ms,revoked_at_ms FROM directory_grants \
+                     WHERE application_id=?1 AND id=?2 AND revoked_at_ms IS NULL",
+                    params![application_id,initial_id],row_directory_grant).optional()?;
+                if let Some(existing) = candidate {
+                    // Never reuse a grant whose original path or capability no
+                    // longer matches the directory the user actually selected.
+                    // On supported platforms, a replaced directory at the
+                    // same path is NOT the previously approved grant root.
+                    let bound_identity: Option<String> = tx.query_row(
+                        "SELECT root_identity FROM directory_grant_root_bindings WHERE grant_id=?1",
+                        params![initial_id], |r|r.get(0)).optional()?;
+                    if fs::canonicalize(&existing.physical_path).ok().as_deref()
+                        == Some(canonical.as_path())
+                        && existing.capability.can_read() >= capability.can_read()
+                        && existing.capability.can_write() >= capability.can_write()
+                        && root_identity
+                            .as_deref()
+                            .is_none_or(|selected| bound_identity.as_deref() == Some(selected))
+                    {
+                        tx.execute("UPDATE directory_grants SET last_used_at_ms=?1 WHERE id=?2 AND application_id=?3 AND revoked_at_ms IS NULL",
+                            params![now,existing.id,application_id])?;
+                        let mut touched = existing;
+                        touched.last_used_at_ms = Some(now);
+                        reused = Some(touched);
+                    }
+                }
+            }
+        }
+        let record = if let Some(existing) = reused {
+            existing
+        } else {
+            let record = DirectoryGrantRecord {
+                id: format!("dst_{}", Uuid::new_v4().simple()),
+                application_id: application_id.into(),
+                label: safe_label,
+                physical_path: canonical.to_string_lossy().to_string(),
+                capability,
+                created_at_ms: now,
+                last_used_at_ms: None,
+                revoked_at_ms: None,
+            };
+            tx.execute("INSERT INTO directory_grants(id,application_id,label,physical_path,capability,created_at_ms,last_used_at_ms,revoked_at_ms) VALUES(?1,?2,?3,?4,?5,?6,NULL,NULL)",
+                params![record.id,record.application_id,record.label,record.physical_path,record.capability.as_db(),record.created_at_ms])?;
+            if let Some(identity) = root_identity.as_deref() {
+                tx.execute("INSERT INTO directory_grant_root_bindings(grant_id,root_identity) VALUES(?1,?2)",params![record.id,identity])?;
+            }
+            record
+        };
+        sql_atomic_store(
+            &tx,
+            true,
+            application_id,
+            request_id,
+            "DESTINATION_CREATE",
+            &fingerprint,
+            &record,
+        )?;
+        let changed=tx.execute("UPDATE durable_operations SET phase='COMMITTED',result_json=?1,terminal_at_ms=?2,expires_at_ms=?3,updated_at_ms=?2 \
+            WHERE scope_kind='application' AND scope_id=?4 AND request_id=?5 AND kind='DESTINATION_CREATE' AND phase='ADMITTED' AND request_fingerprint=?6",
+            params![serde_json::to_string(&record)?,now,now.saturating_add(DURABLE_SQL_RECEIPT_TTL_MS),application_id,request_id,fingerprint])?;
+        if changed != 1 {
+            return Err(StorageError::RecoveryRequired);
+        }
+        tx.commit()?;
+        Ok(record)
+    }
+
     pub fn create_directory_grant(
         &self,
         application_id: &str,
@@ -2357,6 +7450,16 @@ impl StorageEngine {
                 "selected destination must be a real directory".into(),
             ));
         }
+        // The picker path is canonicalized once during issuance. Persist the
+        // identity from the opened descriptor, not from a later path stat.
+        #[cfg(any(unix, windows))]
+        let bound_root_identity = {
+            let selected = NativeDirectory::open(&canonical)?;
+            selected.ensure_root_identity(&metadata)?;
+            Some(selected.identity()?)
+        };
+        #[cfg(not(any(unix, windows)))]
+        let bound_root_identity: Option<String> = None;
         let safe_label = label
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -2388,7 +7491,21 @@ impl StorageEngine {
             .connection
             .lock()
             .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-        conn.execute("INSERT INTO directory_grants(id,application_id,label,physical_path,capability,created_at_ms,last_used_at_ms,revoked_at_ms) VALUES(?1,?2,?3,?4,?5,?6,NULL,NULL)", params![record.id,record.application_id,record.label,record.physical_path,record.capability.as_db(),record.created_at_ms])?;
+        // Grant and directory identity are one SQL commit. No grant may appear
+        // usable after a failed binding write.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let outcome = (|| -> StorageResult<()> {
+            conn.execute("INSERT INTO directory_grants(id,application_id,label,physical_path,capability,created_at_ms,last_used_at_ms,revoked_at_ms) VALUES(?1,?2,?3,?4,?5,?6,NULL,NULL)", params![record.id,record.application_id,record.label,record.physical_path,record.capability.as_db(),record.created_at_ms])?;
+            if let Some(root_identity) = bound_root_identity.as_deref() {
+                conn.execute("INSERT INTO directory_grant_root_bindings(grant_id,root_identity) VALUES(?1,?2)", params![record.id,root_identity])?;
+            }
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        })();
+        if outcome.is_err() {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        outcome?;
         Ok(record)
     }
 
@@ -2440,6 +7557,46 @@ impl StorageEngine {
         Ok(changed > 0)
     }
 
+    pub fn revoke_directory_grant_with_request(
+        &self,
+        application_id: &str,
+        grant_id: &str,
+        request_id: &str,
+    ) -> StorageResult<bool> {
+        validate_request_id(request_id)?;
+        validate_opaque_id(application_id)?;
+        let fingerprint = semantic_fingerprint(
+            "grant-revoke",
+            &json!({
+                "applicationId":application_id, "destinationId":grant_id
+            }),
+        )?;
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction()?;
+        if let Some(previous) =
+            sql_atomic_receipt(&tx, true, application_id, request_id, &fingerprint)?
+        {
+            return Ok(previous);
+        }
+        ensure_application_exists(&tx, application_id)?;
+        let revoked = tx.execute("UPDATE directory_grants SET revoked_at_ms=?1 WHERE id=?2 AND application_id=?3 AND revoked_at_ms IS NULL",
+            params![now_ms(),grant_id,application_id])? > 0;
+        sql_atomic_store(
+            &tx,
+            true,
+            application_id,
+            request_id,
+            "grant-revoke",
+            &fingerprint,
+            &revoked,
+        )?;
+        tx.commit()?;
+        Ok(revoked)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn save_export_preset(
         &self,
@@ -2452,31 +7609,90 @@ impl StorageEngine {
         source_path: &str,
         archive_format: Option<&str>,
     ) -> StorageResult<ExportPresetRecord> {
-        let name = name.trim();
-        if name.is_empty() || name.len() > 128 {
-            return Err(StorageError::RequestInvalid(
-                "preset name is empty or too long".into(),
-            ));
+        self.save_export_preset_internal(
+            application_id,
+            id,
+            name,
+            destination_grant_id,
+            mode,
+            conflict_policy,
+            source_path,
+            archive_format,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_export_preset_with_request(
+        &self,
+        application_id: &str,
+        id: Option<&str>,
+        name: &str,
+        destination_grant_id: &str,
+        mode: NativeExportMode,
+        conflict_policy: ExportConflictPolicy,
+        source_path: &str,
+        archive_format: Option<&str>,
+        request_id: &str,
+    ) -> StorageResult<ExportPresetRecord> {
+        self.save_export_preset_internal(
+            application_id,
+            id,
+            name,
+            destination_grant_id,
+            mode,
+            conflict_policy,
+            source_path,
+            archive_format,
+            Some(request_id),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_export_preset_internal(
+        &self,
+        application_id: &str,
+        id: Option<&str>,
+        name: &str,
+        destination_grant_id: &str,
+        mode: NativeExportMode,
+        conflict_policy: ExportConflictPolicy,
+        source_path: &str,
+        archive_format: Option<&str>,
+        request_id: Option<&str>,
+    ) -> StorageResult<ExportPresetRecord> {
+        if let Some(request_id) = request_id {
+            validate_request_id(request_id)?;
         }
-        let _ = LogicalPath::parse(source_path)?;
-        if let Some(format) = archive_format {
-            if !matches!(mode, NativeExportMode::Archive) || !format.eq_ignore_ascii_case("zip") {
-                return Err(StorageError::RequestInvalid(
-                    "archive format is unsupported".into(),
-                ));
+        let fingerprint = semantic_fingerprint(
+            "preset-save",
+            &json!({
+                "applicationId":application_id, "id":id, "name":name,
+                "destinationId":destination_grant_id, "mode":export_mode_db(mode),
+                "conflict":export_conflict_db(conflict_policy), "sourcePath":source_path,
+                "archiveFormat":archive_format
+            }),
+        )?;
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction()?;
+        if let Some(request_id) = request_id {
+            if let Some(previous) =
+                sql_atomic_receipt(&tx, true, application_id, request_id, &fingerprint)?
+            {
+                return Ok(previous);
             }
         }
-        let grant = self
-            .get_directory_grant(application_id, destination_grant_id)?
-            .ok_or_else(|| StorageError::NotFound("destination grant".into()))?;
-        if grant.revoked_at_ms.is_some() {
+        ensure_application_exists(&tx, application_id)?;
+        let grant = tx.query_row(
+            "SELECT id,application_id,label,physical_path,capability,created_at_ms,last_used_at_ms,revoked_at_ms FROM directory_grants WHERE application_id=?1 AND id=?2",
+            params![application_id,destination_grant_id], row_directory_grant,
+        ).optional()?.ok_or_else(|| StorageError::NotFound("destination grant".into()))?;
+        if grant.revoked_at_ms.is_some() || !grant.capability.can_write() {
             return Err(StorageError::RequestInvalid(
-                "destination grant is revoked".into(),
-            ));
-        }
-        if !grant.capability.can_write() {
-            return Err(StorageError::RequestInvalid(
-                "destination grant does not allow writes".into(),
+                "destination grant is revoked or not writable".into(),
             ));
         }
         if matches!(conflict_policy, ExportConflictPolicy::UpdateChanged)
@@ -2502,11 +7718,20 @@ impl StorageEngine {
             created_at_ms: now,
             updated_at_ms: now,
         };
-        let conn = self
-            .connection
-            .lock()
-            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-        let changed = conn.execute(
+        // Retain the original creation timestamp on updates; never forge a new one.
+        let created_at_ms = tx
+            .query_row(
+                "SELECT created_at_ms FROM export_presets WHERE id=?1 AND application_id=?2",
+                params![record.id, application_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(now);
+        let record = ExportPresetRecord {
+            created_at_ms,
+            ..record
+        };
+        let changed = tx.execute(
             "INSERT INTO export_presets(id,application_id,name,destination_grant_id,mode,conflict_policy,source_path,archive_format,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(id) DO UPDATE SET name=excluded.name,destination_grant_id=excluded.destination_grant_id,mode=excluded.mode,conflict_policy=excluded.conflict_policy,source_path=excluded.source_path,archive_format=excluded.archive_format,updated_at_ms=excluded.updated_at_ms WHERE export_presets.application_id=excluded.application_id",
             params![record.id,record.application_id,record.name,record.destination_grant_id,export_mode_db(record.mode),export_conflict_db(record.conflict_policy),record.source_path,record.archive_format,record.created_at_ms,record.updated_at_ms],
         )?;
@@ -2515,6 +7740,18 @@ impl StorageEngine {
                 "export preset id belongs to another application".into(),
             ));
         }
+        if let Some(request_id) = request_id {
+            sql_atomic_store(
+                &tx,
+                true,
+                application_id,
+                request_id,
+                "preset-save",
+                &fingerprint,
+                &record,
+            )?;
+        }
+        tx.commit()?;
         Ok(record)
     }
 
@@ -2543,6 +7780,194 @@ impl StorageEngine {
         )? > 0)
     }
 
+    pub fn delete_export_preset_with_request(
+        &self,
+        application_id: &str,
+        id: &str,
+        request_id: &str,
+    ) -> StorageResult<bool> {
+        validate_request_id(request_id)?;
+        validate_opaque_id(application_id)?;
+        let fingerprint = semantic_fingerprint(
+            "preset-delete",
+            &json!({"applicationId":application_id, "id":id}),
+        )?;
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction()?;
+        if let Some(previous) =
+            sql_atomic_receipt(&tx, true, application_id, request_id, &fingerprint)?
+        {
+            return Ok(previous);
+        }
+        ensure_application_exists(&tx, application_id)?;
+        let deleted = tx.execute(
+            "DELETE FROM export_presets WHERE id=?1 AND application_id=?2",
+            params![id, application_id],
+        )? > 0;
+        sql_atomic_store(
+            &tx,
+            true,
+            application_id,
+            request_id,
+            "preset-delete",
+            &fingerprint,
+            &deleted,
+        )?;
+        tx.commit()?;
+        Ok(deleted)
+    }
+
+    /// The application operation parent is already bound to the authenticated
+    /// request fingerprint by Runtime; this immutable child plan is committed
+    /// before any destination journal/file is touched.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_native_export_items(
+        &self,
+        owner: &str,
+        operation_id: &str,
+        selected: &[ScannedFile],
+        mode: NativeExportMode,
+        conflict: ExportConflictPolicy,
+        prune: ExportPrunePolicy,
+        allow_resume: bool,
+    ) -> StorageResult<()> {
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let phase: Option<String> = tx.query_row("SELECT phase FROM durable_operations WHERE scope_kind='application' AND scope_id=?1 AND request_id=?2 AND owner_application_id=?1 AND kind='native-export'",
+            params![owner,operation_id],|r|r.get(0)).optional()?;
+        if !matches!(phase.as_deref(), Some("ADMITTED" | "RUNNING")) {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        let existing: i64 = tx.query_row("SELECT COUNT(*) FROM durable_operation_items WHERE scope_kind='application' AND scope_id=?1 AND request_id=?2",
+            params![owner,operation_id],|r|r.get(0))?;
+        let now = now_ms();
+        if existing != 0 && (!allow_resume || existing != selected.len() as i64) {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        for (index, item) in selected.iter().enumerate() {
+            let fp = semantic_fingerprint(
+                "native-export-item",
+                &json!({"source":item.path,"etag":item.etag,"size":item.size,"mode":mode,"conflict":conflict,"prune":prune}),
+            )?;
+            if allow_resume {
+                let saved: Option<(String,String)> = tx.query_row(
+                    "SELECT item_fingerprint,phase FROM durable_operation_items WHERE scope_kind='application' AND scope_id=?1 AND request_id=?2 AND item_index=?3",
+                    params![owner,operation_id,index as i64],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+                let (previous_fp, phase) = saved.ok_or(StorageError::OutcomeUnknown)?;
+                if previous_fp != fp {
+                    return Err(StorageError::RequestIdConflict);
+                }
+                if !matches!(phase.as_str(), "PENDING" | "COMMITTED" | "SKIPPED") {
+                    return Err(StorageError::OutcomeUnknown);
+                }
+            } else {
+                tx.execute("INSERT INTO durable_operation_items(scope_kind,scope_id,request_id,item_index,item_fingerprint,phase,updated_at_ms) VALUES('application',?1,?2,?3,?4,'PENDING',?5)",
+                    params![owner,operation_id,index as i64,fp,now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    fn start_native_export_item(
+        &self,
+        owner: &str,
+        operation_id: &str,
+        index: usize,
+    ) -> StorageResult<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let changed = conn.execute("UPDATE durable_operation_items SET phase='RUNNING',updated_at_ms=?1 WHERE scope_kind='application' AND scope_id=?2 AND request_id=?3 AND item_index=?4 AND phase='PENDING'",
+            params![now_ms(),owner,operation_id,index as i64])?;
+        if changed != 1 {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        Ok(())
+    }
+    fn finish_native_export_item(
+        &self,
+        owner: &str,
+        operation_id: &str,
+        index: usize,
+        phase: &str,
+        result: &Value,
+    ) -> StorageResult<()> {
+        if !matches!(phase, "COMMITTED" | "SKIPPED") {
+            return Err(StorageError::RequestInvalid(
+                "native export item phase invalid".into(),
+            ));
+        }
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let changed = conn.execute("UPDATE durable_operation_items SET phase=?1,result_json=?2,updated_at_ms=?3 WHERE scope_kind='application' AND scope_id=?4 AND request_id=?5 AND item_index=?6 AND phase='RUNNING'",
+            params![phase,serde_json::to_string(result)?,now_ms(),owner,operation_id,index as i64])?;
+        if changed != 1 {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        Ok(())
+    }
+    /// Immutable item evidence for a resumed native export. Never infer an
+    /// external side effect from an absent row or a PENDING phase.
+    fn prior_native_export_item(
+        &self,
+        owner: &str,
+        operation_id: &str,
+        index: usize,
+    ) -> StorageResult<Option<(String, Value)>> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let row: Option<(String,Option<String>)> = conn.query_row(
+            "SELECT phase,result_json FROM durable_operation_items WHERE scope_kind='application' AND scope_id=?1 AND request_id=?2 AND item_index=?3",
+            params![owner,operation_id,index as i64],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let (phase, raw) = row.ok_or(StorageError::OutcomeUnknown)?;
+        if phase == "PENDING" {
+            return Ok(None);
+        }
+        if !matches!(phase.as_str(), "COMMITTED" | "SKIPPED") {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        Ok(Some((
+            phase,
+            serde_json::from_str(&raw.ok_or(StorageError::OutcomeUnknown)?)?,
+        )))
+    }
+
+    /// Safe status projection for an authenticated owner; no worker spawn.
+    pub fn native_export_confirmed_items(
+        &self,
+        owner: &str,
+        operation_id: &str,
+    ) -> StorageResult<Vec<Value>> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let mut stmt = conn.prepare("SELECT i.item_index,i.phase,i.result_json FROM durable_operation_items i JOIN durable_operations p ON p.scope_kind=i.scope_kind AND p.scope_id=i.scope_id AND p.request_id=i.request_id WHERE p.scope_kind='application' AND p.scope_id=?1 AND p.request_id=?2 AND p.owner_application_id=?1 AND p.kind='native-export' ORDER BY i.item_index")?;
+        let items = stmt
+            .query_map(params![owner, operation_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        items.into_iter().map(|(index,phase,raw)| {
+            Ok(json!({"index":index,"phase":phase,"result":raw.as_deref().map(serde_json::from_str::<Value>).transpose()?}))
+        }).collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn native_export<F, P, A>(
         &self,
@@ -2558,6 +7983,202 @@ impl StorageEngine {
         prune: ExportPrunePolicy,
         tracking_key: Option<&str>,
         directory_layout: DirectoryExportLayout,
+        is_cancelled: F,
+        progress: P,
+        ask: A,
+    ) -> StorageResult<NativeExportReport>
+    where
+        F: Fn() -> bool,
+        P: FnMut(u64, Option<u64>, u64, Option<u64>),
+        A: FnMut(&str) -> StorageResult<bool>,
+    {
+        self.native_export_bound(
+            application_id,
+            space_id,
+            source_paths,
+            destination_root,
+            destination_label,
+            mode,
+            conflict,
+            archive_name,
+            bookkeeping,
+            prune,
+            tracking_key,
+            directory_layout,
+            None,
+            is_cancelled,
+            progress,
+            ask,
+        )
+    }
+
+    /// For saved grants, bind the *same opened root handle* used for export to
+    /// the inode recorded at grant issuance. An unbound legacy grant fails closed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_export_bound<F, P, A>(
+        &self,
+        application_id: &str,
+        space_id: &str,
+        source_paths: &[String],
+        destination_root: &Path,
+        destination_label: &str,
+        mode: NativeExportMode,
+        conflict: ExportConflictPolicy,
+        archive_name: Option<&str>,
+        bookkeeping: ExportBookkeepingPolicy,
+        prune: ExportPrunePolicy,
+        tracking_key: Option<&str>,
+        directory_layout: DirectoryExportLayout,
+        destination_grant_id: Option<&str>,
+        is_cancelled: F,
+        progress: P,
+        ask: A,
+    ) -> StorageResult<NativeExportReport>
+    where
+        F: Fn() -> bool,
+        P: FnMut(u64, Option<u64>, u64, Option<u64>),
+        A: FnMut(&str) -> StorageResult<bool>,
+    {
+        self.native_export_bound_impl(
+            application_id,
+            space_id,
+            source_paths,
+            destination_root,
+            destination_label,
+            mode,
+            conflict,
+            archive_name,
+            bookkeeping,
+            prune,
+            tracking_key,
+            directory_layout,
+            destination_grant_id,
+            None,
+            false,
+            is_cancelled,
+            progress,
+            ask,
+        )
+    }
+
+    /// Runtime's durable operation identity is attached without changing
+    /// the existing Core public native_export_bound API.
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_export_bound_with_operation<F, P, A>(
+        &self,
+        application_id: &str,
+        space_id: &str,
+        source_paths: &[String],
+        destination_root: &Path,
+        destination_label: &str,
+        mode: NativeExportMode,
+        conflict: ExportConflictPolicy,
+        archive_name: Option<&str>,
+        bookkeeping: ExportBookkeepingPolicy,
+        prune: ExportPrunePolicy,
+        tracking_key: Option<&str>,
+        directory_layout: DirectoryExportLayout,
+        destination_grant_id: Option<&str>,
+        operation_id: &str,
+        is_cancelled: F,
+        progress: P,
+        ask: A,
+    ) -> StorageResult<NativeExportReport>
+    where
+        F: Fn() -> bool,
+        P: FnMut(u64, Option<u64>, u64, Option<u64>),
+        A: FnMut(&str) -> StorageResult<bool>,
+    {
+        self.native_export_bound_impl(
+            application_id,
+            space_id,
+            source_paths,
+            destination_root,
+            destination_label,
+            mode,
+            conflict,
+            archive_name,
+            bookkeeping,
+            prune,
+            tracking_key,
+            directory_layout,
+            destination_grant_id,
+            Some(operation_id),
+            false,
+            is_cancelled,
+            progress,
+            ask,
+        )
+    }
+
+    /// Only used after authenticated durable re-admission; the destination
+    /// identity and unchanged immutable item plan are checked again by Core.
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_export_bound_resume<F, P, A>(
+        &self,
+        application_id: &str,
+        space_id: &str,
+        source_paths: &[String],
+        destination_root: &Path,
+        destination_label: &str,
+        mode: NativeExportMode,
+        conflict: ExportConflictPolicy,
+        archive_name: Option<&str>,
+        bookkeeping: ExportBookkeepingPolicy,
+        prune: ExportPrunePolicy,
+        tracking_key: Option<&str>,
+        directory_layout: DirectoryExportLayout,
+        destination_grant_id: &str,
+        operation_id: &str,
+        is_cancelled: F,
+        progress: P,
+        ask: A,
+    ) -> StorageResult<NativeExportReport>
+    where
+        F: Fn() -> bool,
+        P: FnMut(u64, Option<u64>, u64, Option<u64>),
+        A: FnMut(&str) -> StorageResult<bool>,
+    {
+        self.native_export_bound_impl(
+            application_id,
+            space_id,
+            source_paths,
+            destination_root,
+            destination_label,
+            mode,
+            conflict,
+            archive_name,
+            bookkeeping,
+            prune,
+            tracking_key,
+            directory_layout,
+            Some(destination_grant_id),
+            Some(operation_id),
+            true,
+            is_cancelled,
+            progress,
+            ask,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn native_export_bound_impl<F, P, A>(
+        &self,
+        application_id: &str,
+        space_id: &str,
+        source_paths: &[String],
+        destination_root: &Path,
+        destination_label: &str,
+        mode: NativeExportMode,
+        conflict: ExportConflictPolicy,
+        archive_name: Option<&str>,
+        bookkeeping: ExportBookkeepingPolicy,
+        prune: ExportPrunePolicy,
+        tracking_key: Option<&str>,
+        directory_layout: DirectoryExportLayout,
+        destination_grant_id: Option<&str>,
+        operation_id: Option<&str>,
+        allow_resume: bool,
         is_cancelled: F,
         mut progress: P,
         mut ask: A,
@@ -2591,16 +8212,19 @@ impl StorageEngine {
         }
 
         let data_root = self.space_data_root(space_id)?;
-        let scan = scan_file_index(&data_root, &is_cancelled, |_| {})?;
-        if !scan.unsafe_items.is_empty() {
-            return Err(StorageError::StorageUnavailable(
-                "space contains unsafe/unexportable filesystem entries".into(),
-            ));
-        }
+        // Enumerate exactly the requested registry paths. The previous whole-space
+        // filesystem scan hashed unrelated files before even checking selection.
         let logical_sources = source_paths
             .iter()
             .map(|value| LogicalPath::parse(value))
             .collect::<StorageResult<Vec<_>>>()?;
+        // Capture every selected source under one atomic set of scoped claims.
+        // No SQLite mutex or space-wide exclusive lease is held while copying.
+        let mut source_claims = vec![Claim::global_shared(), Claim::space_shared(space_id)];
+        for source in &logical_sources {
+            source_claims.push(Claim::path(space_id, source.as_str()));
+        }
+        let source_lease = self.admit(source_claims)?;
         if matches!(directory_layout, DirectoryExportLayout::Contents) {
             let source_root = data_root.join(logical_sources[0].relative());
             ensure_no_symlink_escape(&data_root, &source_root)?;
@@ -2610,23 +8234,32 @@ impl StorageEngine {
                 ));
             }
         }
-        let mut selected = Vec::new();
-        for item in &scan.files {
-            let matched = logical_sources.iter().any(|source| {
-                let base = source.as_str();
-                item.path == base
-                    || (matches!(
-                        mode,
-                        NativeExportMode::Directory | NativeExportMode::Archive
-                    ) && (base == "/"
-                        || item
-                            .path
-                            .starts_with(&format!("{}/", base.trim_end_matches('/')))))
-            });
-            if matched {
-                selected.push(item);
+        let mut selected_by_path = BTreeMap::<String, ScannedFile>::new();
+        for source in &logical_sources {
+            if is_cancelled() {
+                return Err(StorageError::OperationCancelled);
+            }
+            for record in self.file_records_under(space_id, source.as_str())? {
+                if !matches!(
+                    mode,
+                    NativeExportMode::Directory | NativeExportMode::Archive
+                ) && record.path != source.as_str()
+                {
+                    continue;
+                }
+                let normalized = LogicalPath::parse(&record.path)?;
+                selected_by_path
+                    .entry(record.path.clone())
+                    .or_insert(ScannedFile {
+                        path: record.path,
+                        collision_key: normalized.collision_key().to_owned(),
+                        size: record.size,
+                        etag: record.etag,
+                        updated_at_ms: record.updated_at_ms,
+                    });
             }
         }
+        let selected = selected_by_path.into_values().collect::<Vec<_>>();
         if selected.is_empty() {
             return Err(StorageError::NotFound("export source".into()));
         }
@@ -2645,7 +8278,44 @@ impl StorageEngine {
             ));
         }
 
-        let destination_root = fs::canonicalize(destination_root)?;
+        let destination_meta = fs::symlink_metadata(destination_root)?;
+        if is_link_like(&destination_meta) || !destination_meta.is_dir() {
+            return Err(StorageError::PathInvalid(
+                "native export root is link-like or not a directory".into(),
+            ));
+        }
+        // Never canonicalize after checking for links: canonicalize() follows
+        // a component swapped to a symlink before the OS-relative open.
+        // Directory grants already store an absolute canonical path at issue.
+        let destination_root = destination_root.to_path_buf();
+        // Hold the directory descriptor for the ENTIRE export. Subsequent
+        // writes/reads/pruning must never return to path-based traversal.
+        let native_root = NativeDirectory::open(&destination_root)?;
+        native_root.ensure_root_identity(&destination_meta)?;
+        if let Some(grant_id) = destination_grant_id {
+            let expected: Option<(String,)> = {
+                let conn = self
+                    .connection
+                    .lock()
+                    .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+                conn.query_row("SELECT b.root_identity FROM directory_grant_root_bindings b                         JOIN directory_grants g ON g.id=b.grant_id                         WHERE g.id=?1 AND g.application_id=?2 AND g.revoked_at_ms IS NULL                         AND g.physical_path=?3 AND g.capability IN ('write','read-write')",
+                    params![grant_id,application_id,destination_root.to_string_lossy().as_ref()],
+                    |row| Ok((row.get(0)?,))).optional()?
+            };
+            let expected = expected
+                .ok_or_else(|| {
+                    StorageError::RequestInvalid(
+                        "saved directory grant is unbound or revoked; choose the folder again"
+                            .into(),
+                    )
+                })?
+                .0;
+            if native_root.identity()? != expected {
+                return Err(StorageError::RequestInvalid(
+                    "saved directory grant root changed; choose the folder again".into(),
+                ));
+            }
+        }
         if !destination_root.is_dir() {
             return Err(StorageError::RequestInvalid(
                 "export destination is not a directory".into(),
@@ -2674,29 +8344,102 @@ impl StorageEngine {
             }
         };
 
-        let mut previous_manifest = load_native_export_tracking_manifest(
-            &manifest_path,
-            application_id,
-            &destination_identity,
-            tracking_key,
-            matches!(bookkeeping, ExportBookkeepingPolicy::Destination) && tracking_key.is_empty(),
-        );
-        if previous_manifest.is_none() && matches!(bookkeeping, ExportBookkeepingPolicy::Internal) {
-            let legacy_path = destination_root.join(".vontaqfs-export-manifest.json");
-            previous_manifest = load_native_export_tracking_manifest(
-                &legacy_path,
+        let mut previous_manifest = if matches!(bookkeeping, ExportBookkeepingPolicy::Destination) {
+            let bytes = read_native_small(
+                &native_root,
+                Path::new(".vontaqfs-export-manifest.json"),
+                16 * 1024 * 1024,
+            )?;
+            bytes.and_then(|bytes| {
+                parse_native_export_tracking_manifest(
+                    &bytes,
+                    application_id,
+                    &destination_identity,
+                    tracking_key,
+                    tracking_key.is_empty(),
+                )
+            })
+        } else {
+            load_native_export_tracking_manifest(
+                &manifest_path,
                 application_id,
                 &destination_identity,
                 tracking_key,
-                true,
-            );
+                false,
+            )
+        };
+        if previous_manifest.is_none() && matches!(bookkeeping, ExportBookkeepingPolicy::Internal) {
+            previous_manifest = read_native_small(
+                &native_root,
+                Path::new(".vontaqfs-export-manifest.json"),
+                16 * 1024 * 1024,
+            )?
+            .and_then(|bytes| {
+                parse_native_export_tracking_manifest(
+                    &bytes,
+                    application_id,
+                    &destination_identity,
+                    tracking_key,
+                    true,
+                )
+            });
             legacy_sidecar_seeded = previous_manifest.is_some();
+        }
+        if matches!(bookkeeping, ExportBookkeepingPolicy::Destination) {
+            native_root.exists(Path::new(".vontaqfs-export-manifest.json"))?;
+            native_root.exists(Path::new(".vontaqfs-export-journal.json"))?;
+        }
+        // Only inspect prior tracked files if the previous export left an
+        // unfinished journal. A normal completed export must not incur one
+        // extra directory lookup per manifest entry on every subsequent run.
+        let interrupted_prune = if matches!(prune, ExportPrunePolicy::Tracked) {
+            if matches!(bookkeeping, ExportBookkeepingPolicy::Destination) {
+                read_native_small(
+                    &native_root,
+                    Path::new(".vontaqfs-export-journal.json"),
+                    4 * 1024 * 1024,
+                )?
+                .is_some()
+            } else {
+                journal_path.exists()
+            }
+        } else {
+            false
+        };
+        if interrupted_prune {
+            if let Some(previous) = previous_manifest.as_ref() {
+                for entry in &previous.files {
+                    let relative = parse_portable_relative_path(&entry.relative_destination)
+                        .ok_or_else(|| {
+                            StorageError::PathInvalid("invalid previous export destination".into())
+                        })?;
+                    native_root.recover_prune_for(&relative)?;
+                }
+            }
         }
         let previous_checksums = previous_manifest
             .as_ref()
             .map(manifest_checksums_by_destination)
             .unwrap_or_default();
 
+        // One coherent generation: the selected registry plan and every source
+        // byte are captured under their path claims. Unrelated spaces/paths
+        // continue to mutate. Release the claims *before* native I/O/ZIP work.
+        let captured_sources =
+            NativeExportCapture::create(self, &data_root, &selected, &is_cancelled)?;
+        drop(source_lease);
+        if let Some(id) = operation_id {
+            self.prepare_native_export_items(
+                application_id,
+                id,
+                &selected,
+                mode,
+                conflict,
+                prune,
+                allow_resume,
+            )?;
+        }
+        let data_root = captured_sources.root.as_path();
         let total_bytes = selected.iter().map(|item| item.size).sum::<u64>();
         let total_items = selected.len() as u64;
         let journal_context = NativeExportJournalContext {
@@ -2707,14 +8450,38 @@ impl StorageEngine {
             mode: export_mode_db(mode),
             source_paths,
         };
-        prepare_native_export_journal_at(&journal_path, &journal_context)?;
+        if matches!(bookkeeping, ExportBookkeepingPolicy::Destination) {
+            prepare_native_export_journal_secure(&native_root, &journal_context)?;
+        } else {
+            prepare_native_export_journal_at(&journal_path, &journal_context)?;
+        }
 
         let result = (|| -> StorageResult<NativeExportReport> {
             progress(0, Some(total_items), 0, Some(total_bytes));
             if matches!(mode, NativeExportMode::Archive) {
+                if allow_resume {
+                    if let Some(id) = operation_id {
+                        for index in 0..selected.len() {
+                            // A published ZIP and an unfinished ZIP are not
+                            // distinguishable by per-source child receipts.
+                            if self
+                                .prior_native_export_item(application_id, id, index)?
+                                .is_some()
+                            {
+                                return Err(StorageError::OutcomeUnknown);
+                            }
+                        }
+                    }
+                }
                 let name = safe_archive_name(archive_name.unwrap_or("vontaqfs-export.zip"))?;
-                let target =
-                    resolve_export_target(&destination_root.join(name), conflict, None, &mut ask)?;
+                let archive_had_target = native_root.exists(Path::new(&name))?;
+                let target = resolve_export_target_secure(
+                    &native_root,
+                    &destination_root,
+                    Path::new(&name),
+                    conflict,
+                    &mut ask,
+                )?;
                 let Some(target) = target else {
                     return Ok(NativeExportReport {
                         space_id: space_id.into(),
@@ -2730,12 +8497,11 @@ impl StorageEngine {
                         manifest_written: false,
                     });
                 };
-                let temp = target.with_extension("zip.vontaqfs-tmp");
-                if temp.exists() {
-                    let _ = fs::remove_file(&temp);
-                }
-                let file = File::create(&temp)?;
-                let mut zip = SimpleZipWriter::new(BufWriter::new(file));
+                let relative = target.strip_prefix(&destination_root).map_err(|_| {
+                    StorageError::PathInvalid("native archive target escaped root".into())
+                })?;
+                let temporary = native_root.temporary(relative, false)?;
+                let mut zip = SimpleZipWriter::new(BufWriter::new(temporary.writer()?));
                 let mut bytes_done = 0_u64;
                 let mut items_done = 0_u64;
                 let manifest = json!({
@@ -2746,36 +8512,53 @@ impl StorageEngine {
                     "vontaqfs-export.json",
                     &serde_json::to_vec_pretty(&manifest)?,
                 )?;
-                for item in selected {
+                for (item_index, item) in selected.iter().enumerate() {
+                    if let Some(id) = operation_id {
+                        self.start_native_export_item(application_id, id, item_index)?;
+                    }
                     if is_cancelled() {
-                        let _ = fs::remove_file(&temp);
                         return Err(StorageError::OperationCancelled);
                     }
                     let logical = LogicalPath::parse(&item.path)?;
                     let source = data_root.join(logical.relative());
-                    ensure_no_symlink_escape(&data_root, &source)?;
+                    ensure_no_symlink_escape(data_root, &source)?;
                     let entry_name = logical.relative().to_string_lossy().replace('\\', "/");
-                    if let Err(error) = zip.add_file_verified_cancellable(
+                    zip.add_file_verified_cancellable(
                         &entry_name,
                         &source,
                         &item.etag,
                         &is_cancelled,
-                    ) {
-                        let _ = fs::remove_file(&temp);
-                        return Err(error);
-                    }
+                    )?;
                     items_done += 1;
                     bytes_done = bytes_done.saturating_add(item.size);
                     progress(items_done, Some(total_items), bytes_done, Some(total_bytes));
                 }
                 zip.finish()?;
-                sync_file_for_durability(&temp)?;
+                temporary.sync()?;
                 if is_cancelled() {
-                    let _ = fs::remove_file(&temp);
                     return Err(StorageError::OperationCancelled);
                 }
-                atomic_replace(&temp, &target)?;
-                sync_parent(target.parent());
+                if matches!(
+                    conflict,
+                    ExportConflictPolicy::Skip | ExportConflictPolicy::Rename
+                ) || (matches!(conflict, ExportConflictPolicy::Ask) && !archive_had_target)
+                {
+                    temporary.publish_new()?;
+                } else {
+                    temporary.publish()?;
+                }
+                if let Some(id) = operation_id {
+                    for (index, item) in selected.iter().enumerate() {
+                        self.finish_native_export_item(
+                            application_id,
+                            id,
+                            index,
+                            "COMMITTED",
+                            &json!({"source":item.path,"size":item.size,"checksum":item.etag,
+                                "archive":name}),
+                        )?;
+                    }
+                }
                 return Ok(NativeExportReport {
                     space_id: space_id.into(),
                     destination_label: destination_label.into(),
@@ -2801,31 +8584,93 @@ impl StorageEngine {
             let mut items_done = 0_u64;
             let mut manifest_files = Vec::new();
             let mut current_export_paths = HashSet::new();
-            for item in selected {
+            for (item_index, item) in selected.into_iter().enumerate() {
+                let prior = if allow_resume {
+                    Some(self.prior_native_export_item(
+                        application_id,
+                        operation_id.ok_or(StorageError::OutcomeUnknown)?,
+                        item_index,
+                    )?)
+                } else {
+                    None
+                };
                 if is_cancelled() {
                     return Err(StorageError::OperationCancelled);
                 }
                 let logical = LogicalPath::parse(&item.path)?;
                 let source = data_root.join(logical.relative());
-                ensure_no_symlink_escape(&data_root, &source)?;
+                ensure_no_symlink_escape(data_root, &source)?;
                 let relative = export_relative_destination(
                     &logical,
                     mode,
                     directory_layout,
                     logical_sources.first(),
                 )?;
-                let target0 = destination_root.join(&relative);
-                if let Some(parent) = target0.parent() {
-                    fs::create_dir_all(parent)?;
-                }
                 let relative_key = portable_relative_text(&relative).ok_or_else(|| {
                     StorageError::PathInvalid("export destination path is not portable".into())
                 })?;
                 current_export_paths.insert(relative_key.clone());
-                let existing_hash = if matches!(conflict, ExportConflictPolicy::UpdateChanged)
-                    && target0.is_file()
-                {
-                    sha256_file(&target0).ok()
+                if let Some(Some((phase, evidence))) = prior {
+                    if evidence.get("path").and_then(Value::as_str) != Some(item.path.as_str())
+                        || evidence.get("checksum").and_then(Value::as_str)
+                            != Some(item.etag.as_str())
+                    {
+                        return Err(StorageError::RequestIdConflict);
+                    }
+                    if phase == "COMMITTED"
+                        || evidence.get("unchanged").and_then(Value::as_bool) == Some(true)
+                    {
+                        let target = evidence
+                            .get("destination")
+                            .and_then(Value::as_str)
+                            .map(Path::new)
+                            .unwrap_or(relative.as_path());
+                        if secure_native_sha256(&native_root, target)?.as_deref()
+                            != Some(item.etag.as_str())
+                        {
+                            return Err(StorageError::ExportSourceChanged);
+                        }
+                        if phase == "COMMITTED" {
+                            if evidence.get("hadTarget").and_then(Value::as_bool) == Some(true) {
+                                changed += 1;
+                            } else if evidence.get("hadTarget").and_then(Value::as_bool)
+                                == Some(false)
+                            {
+                                added += 1;
+                            } else {
+                                return Err(StorageError::OutcomeUnknown);
+                            }
+                        } else {
+                            unchanged += 1;
+                        }
+                        bytes_done = bytes_done.saturating_add(item.size);
+                        manifest_files.push(NativeExportTrackingEntry {
+                            path: item.path.clone(),
+                            size: item.size,
+                            checksum: item.etag.clone(),
+                            relative_destination: portable_relative_text(target).ok_or_else(
+                                || {
+                                    StorageError::PathInvalid(
+                                        "invalid confirmed export target".into(),
+                                    )
+                                },
+                            )?,
+                        });
+                    } else if phase == "SKIPPED" {
+                        skipped += 1;
+                        if evidence.get("conflict").and_then(Value::as_bool) == Some(true) {
+                            conflicts += 1;
+                        }
+                    }
+                    items_done += 1;
+                    progress(items_done, Some(total_items), bytes_done, Some(total_bytes));
+                    continue;
+                }
+                if let Some(id) = operation_id {
+                    self.start_native_export_item(application_id, id, item_index)?;
+                }
+                let existing_hash = if matches!(conflict, ExportConflictPolicy::UpdateChanged) {
+                    secure_native_sha256(&native_root, &relative)?
                 } else {
                     None
                 };
@@ -2835,6 +8680,15 @@ impl StorageEngine {
                     && existing_hash.as_deref() == Some(item.etag.as_str())
                 {
                     verify_selected_export_source(&source, &item.etag, &is_cancelled)?;
+                    if let Some(id) = operation_id {
+                        self.finish_native_export_item(
+                            application_id,
+                            id,
+                            item_index,
+                            "SKIPPED",
+                            &json!({"path":item.path,"checksum":item.etag,"unchanged":true}),
+                        )?;
+                    }
                     unchanged += 1;
                     items_done += 1;
                     bytes_done = bytes_done.saturating_add(item.size);
@@ -2852,6 +8706,15 @@ impl StorageEngine {
                     && existing_hash.as_deref() == Some(item.etag.as_str())
                 {
                     verify_selected_export_source(&source, &item.etag, &is_cancelled)?;
+                    if let Some(id) = operation_id {
+                        self.finish_native_export_item(
+                            application_id,
+                            id,
+                            item_index,
+                            "SKIPPED",
+                            &json!({"path":item.path,"checksum":item.etag,"unchanged":true}),
+                        )?;
+                    }
                     unchanged += 1;
                     items_done += 1;
                     bytes_done = bytes_done.saturating_add(item.size);
@@ -2864,10 +8727,24 @@ impl StorageEngine {
                     });
                     continue;
                 }
-                let had_target = target0.exists();
-                let resolved =
-                    resolve_export_target(&target0, conflict, existing_hash.as_deref(), &mut ask)?;
+                let had_target = native_root.exists(&relative)?;
+                let resolved = resolve_export_target_secure(
+                    &native_root,
+                    &destination_root,
+                    &relative,
+                    conflict,
+                    &mut ask,
+                )?;
                 let Some(target) = resolved else {
+                    if let Some(id) = operation_id {
+                        self.finish_native_export_item(
+                            application_id,
+                            id,
+                            item_index,
+                            "SKIPPED",
+                            &json!({"path":item.path,"checksum":item.etag,"conflict":had_target}),
+                        )?;
+                    }
                     skipped += 1;
                     if had_target {
                         conflicts += 1;
@@ -2876,20 +8753,19 @@ impl StorageEngine {
                     progress(items_done, Some(total_items), bytes_done, Some(total_bytes));
                     continue;
                 };
-                let temp = target.with_extension(format!(
-                    "{}vontaqfs-tmp",
-                    target
-                        .extension()
-                        .and_then(|v| v.to_str())
-                        .map(|v| format!("{v}."))
-                        .unwrap_or_default()
-                ));
+                let actual_target = target.strip_prefix(&destination_root).map_err(|_| {
+                    StorageError::PathInvalid("native export target escaped root".into())
+                })?;
                 let mut copied_for_file = 0_u64;
-                copy_file_atomic_stage(
+                copy_file_secure_stage(
                     &source,
-                    &temp,
-                    &target,
+                    &native_root,
+                    actual_target,
                     &item.etag,
+                    matches!(
+                        conflict,
+                        ExportConflictPolicy::Skip | ExportConflictPolicy::Rename
+                    ) || (matches!(conflict, ExportConflictPolicy::Ask) && !had_target),
                     &is_cancelled,
                     |delta| {
                         copied_for_file = copied_for_file.saturating_add(delta);
@@ -2901,6 +8777,17 @@ impl StorageEngine {
                         );
                     },
                 )?;
+                if let Some(id) = operation_id {
+                    self.finish_native_export_item(
+                        application_id,
+                        id,
+                        item_index,
+                        "COMMITTED",
+                        &json!({"path":item.path,"checksum":item.etag,
+                            "bytes":copied_for_file,"destination":actual_target.to_string_lossy(),
+                            "hadTarget":had_target}),
+                    )?;
+                }
                 if had_target {
                     changed += 1;
                 } else {
@@ -2946,22 +8833,15 @@ impl StorageEngine {
                         else {
                             continue;
                         };
-                        let target = destination_root.join(relative);
-                        let Ok(metadata) = fs::symlink_metadata(&target) else {
-                            continue;
-                        };
-                        if is_link_like(&metadata) || !metadata.is_file() {
-                            continue;
-                        }
-                        if ensure_no_symlink_escape(&destination_root, &target).is_err() {
-                            continue;
-                        }
-                        let Ok(current_hash) = sha256_file(&target) else {
-                            continue;
-                        };
-                        if current_hash == previous_entry.checksum {
-                            fs::remove_file(&target)?;
-                            deleted += 1;
+                        // A tracked file is quarantined before a second checksum
+                        // verification; never unlink the old pathname after a
+                        // check that could now refer to another user's file.
+                        // Unsafe entries are not candidates for automatic prune.
+                        match native_root.prune_tracked(&relative, &previous_entry.checksum) {
+                            Ok(true) => deleted += 1,
+                            Ok(false) => {}
+                            Err(StorageError::PathInvalid(_)) => {}
+                            Err(error) => return Err(error),
                         }
                     }
                 }
@@ -2980,13 +8860,19 @@ impl StorageEngine {
                 created_at_ms: now_ms(),
                 files: manifest_files,
             };
-            write_native_export_tracking_manifest(&manifest_path, &manifest)?;
+            if matches!(bookkeeping, ExportBookkeepingPolicy::Destination) {
+                native_root.write_atomic(
+                    Path::new(".vontaqfs-export-manifest.json"),
+                    &serde_json::to_vec_pretty(&manifest)?,
+                )?;
+            } else {
+                write_native_export_tracking_manifest(&manifest_path, &manifest)?;
+            }
             if legacy_sidecar_seeded && matches!(bookkeeping, ExportBookkeepingPolicy::Internal) {
-                let legacy_path = destination_root.join(".vontaqfs-export-manifest.json");
-                if legacy_path.exists() {
-                    let _ = fs::remove_file(&legacy_path);
-                    sync_parent(Some(&destination_root));
-                }
+                // Legacy sidecar is not touched unless the new internal manifest
+                // was durably written. Directory-handle based unlink avoids any
+                // race through a swapped destination parent.
+                native_root.unlink(Path::new(".vontaqfs-export-manifest.json"))?;
             }
             Ok(NativeExportReport {
                 space_id: space_id.into(),
@@ -3005,16 +8891,27 @@ impl StorageEngine {
 
         match result {
             Ok(report) => {
-                clear_native_export_journal_at(&journal_path);
+                if matches!(bookkeeping, ExportBookkeepingPolicy::Destination) {
+                    native_root.unlink(Path::new(".vontaqfs-export-journal.json"))?;
+                } else {
+                    clear_native_export_journal_at(&journal_path);
+                }
                 Ok(report)
             }
             Err(StorageError::OperationCancelled) => {
-                let _ =
-                    write_native_export_journal_at(&journal_path, "cancelled", &journal_context);
+                let _ = if matches!(bookkeeping, ExportBookkeepingPolicy::Destination) {
+                    write_native_export_journal_secure(&native_root, "cancelled", &journal_context)
+                } else {
+                    write_native_export_journal_at(&journal_path, "cancelled", &journal_context)
+                };
                 Err(StorageError::OperationCancelled)
             }
             Err(error) => {
-                let _ = write_native_export_journal_at(&journal_path, "failed", &journal_context);
+                let _ = if matches!(bookkeeping, ExportBookkeepingPolicy::Destination) {
+                    write_native_export_journal_secure(&native_root, "failed", &journal_context)
+                } else {
+                    write_native_export_journal_at(&journal_path, "failed", &journal_context)
+                };
                 Err(error)
             }
         }
@@ -3098,6 +8995,278 @@ impl StorageEngine {
         Ok(resolved)
     }
 
+    /// Attach a generic long-job's request and scope, without weakening its
+    /// existing owner/fingerprint binding. This permits restart reconciliation
+    /// of the space-level native-import item plan after the Runtime disappears.
+    pub fn bind_application_native_import(
+        &self,
+        owner: &str,
+        operation_id: &str,
+        space_id: &str,
+        request_id: &str,
+    ) -> StorageResult<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let real_owner: String = conn.query_row(
+            "SELECT owner_application_id FROM spaces WHERE id=?1",
+            params![space_id],
+            |r| r.get(0),
+        )?;
+        if real_owner != owner {
+            return Err(StorageError::RequestInvalid(
+                "native import owner mismatch".into(),
+            ));
+        }
+        let source = json!({"spaceId":space_id,"requestId":request_id});
+        let changed = conn.execute("UPDATE durable_operations SET result_json=?1,updated_at_ms=?2 WHERE scope_kind='application' AND scope_id=?3 AND request_id=?4 AND owner_application_id=?3 AND kind='native-import' AND phase IN ('ADMITTED','RUNNING')",
+            params![serde_json::to_string(&source)?,now_ms(),owner,operation_id])?;
+        if changed != 1 {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        Ok(())
+    }
+    /// Historical native import evidence is accessible only after verifying
+    /// both the application owner and space ownership in SQL.
+    pub fn native_import_status_evidence(
+        &self,
+        owner: &str,
+        space_id: &str,
+        request_id: &str,
+    ) -> StorageResult<(Option<Value>, Vec<Value>)> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let result: Option<(String,Option<String>)> = conn.query_row(
+            "SELECT phase,result_json FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 AND owner_application_id=?3 AND kind='NATIVE_IMPORT'",
+            params![space_id,request_id,owner],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let terminal = result
+            .and_then(|(phase, json)| if phase == "COMMITTED" { json } else { None })
+            .map(|raw| serde_json::from_str::<Value>(&raw))
+            .transpose()?;
+        let mut stmt = conn.prepare("SELECT item_index,phase,result_json FROM durable_operation_items WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 ORDER BY item_index")?;
+        let items = stmt
+            .query_map(params![space_id, request_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut observed = Vec::with_capacity(items.len());
+        for (index, mut phase, raw) in items {
+            let mut value = raw
+                .as_deref()
+                .map(serde_json::from_str::<Value>)
+                .transpose()?;
+            if phase == "RUNNING" {
+                if let Some(ref context) = value {
+                    if let (Some(child), Some(target)) = (
+                        context.get("childRequestId").and_then(Value::as_str),
+                        context.get("target").and_then(Value::as_str),
+                    ) {
+                        // Status reconciliation does not mutate or start a worker.
+                        // Only a committed child receipt for this exact path can
+                        // promote the projected result to COMMITTED.
+                        let proof: Option<(String,String)> = conn.query_row(
+                            "SELECT r.operation,r.result_json FROM mutation_receipts r JOIN durable_operations p ON p.scope_kind='space' AND p.scope_id=r.space_id AND p.request_id=?3 AND p.kind='NATIVE_IMPORT' WHERE r.space_id=?1 AND r.request_id=?2 AND r.created_at_ms >= p.request_started_at_ms",
+                            params![space_id,child,request_id],|row|Ok((row.get(0)?,row.get(1)?)),
+                        ).optional()?;
+                        if let Some((operation, payload)) = proof {
+                            if operation != file_write_operation(target) {
+                                return Err(StorageError::RecoveryRequired);
+                            }
+                            let record: FileRecord = serde_json::from_str(&payload)?;
+                            if record.path != target {
+                                return Err(StorageError::RecoveryRequired);
+                            }
+                            phase = "COMMITTED".into();
+                            value = Some(serde_json::to_value(record)?);
+                        }
+                    }
+                }
+            }
+            observed.push(json!({"index":index,"phase":phase,"result":value}));
+        }
+        Ok((terminal, observed))
+    }
+
+    /// A complete immutable import plan is committed before the first user
+    /// file is changed. Child Core file-write receipts are the authority for
+    /// interrupted RUNNING items; the parent is not permission to repeat them.
+    fn prepare_native_import_items(
+        &self,
+        space_id: &str,
+        request_id: &str,
+        fingerprint: &str,
+        item_fingerprints: &[String],
+        allow_resume: bool,
+    ) -> StorageResult<()> {
+        // Recover a child committed immediately before the parent item ACK.
+        self.reconcile_native_import_receipts()?;
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let owner: String = tx.query_row(
+            "SELECT owner_application_id FROM spaces WHERE id=?1",
+            params![space_id],
+            |r| r.get(0),
+        )?;
+        let existing: Option<(String, String, String)> = tx.query_row(
+            "SELECT request_fingerprint,phase,owner_application_id FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 AND kind='NATIVE_IMPORT'",
+            params![space_id,request_id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        if let Some((old, phase, prior_owner)) = existing {
+            if old != fingerprint || prior_owner != owner {
+                return Err(StorageError::RequestIdConflict);
+            }
+            if !allow_resume || phase != "RUNNING" {
+                return Err(StorageError::OutcomeUnknown);
+            }
+            let mut stmt = tx.prepare("SELECT item_index,item_fingerprint,phase FROM durable_operation_items WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 ORDER BY item_index")?;
+            let rows = stmt
+                .query_map(params![space_id, request_id], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+            if rows.len() != item_fingerprints.len() {
+                return Err(StorageError::RequestIdConflict);
+            }
+            for (index, (stored_index, stored_fp, stored_phase)) in rows.into_iter().enumerate() {
+                if stored_index != index as i64 || stored_fp != item_fingerprints[index] {
+                    return Err(StorageError::RequestIdConflict);
+                }
+                // A RUNNING child without a confirmed Core receipt is ambiguous;
+                // it cannot be safely re-executed just because the worker vanished.
+                if !matches!(stored_phase.as_str(), "PENDING" | "COMMITTED" | "SKIPPED") {
+                    return Err(StorageError::OutcomeUnknown);
+                }
+            }
+            tx.commit()?;
+            return Ok(());
+        }
+        let now = now_ms();
+        let version = if request_id.starts_with("operation-v3-") {
+            validate_new_v3_operation_id(request_id, now)?;
+            3
+        } else {
+            1
+        };
+        let child_slots = i64::try_from(item_fingerprints.len()).map_err(|_| {
+            StorageError::StorageUnavailable("import plan exceeds receipt capacity".into())
+        })?;
+        ensure_v3_result_capacity_slots(&tx, now, child_slots.saturating_add(1))?;
+        tx.execute("INSERT INTO durable_operations(scope_kind,scope_id,request_id,kind,owner_application_id,identity_version,request_fingerprint,phase,request_started_at_ms,created_at_ms,updated_at_ms) VALUES('space',?1,?2,'NATIVE_IMPORT',?3,?4,?5,'RUNNING',?6,?6,?6)",
+            params![space_id,request_id,owner,version,fingerprint,now])?;
+        for (index, fp) in item_fingerprints.iter().enumerate() {
+            tx.execute("INSERT INTO durable_operation_items(scope_kind,scope_id,request_id,item_index,item_fingerprint,phase,updated_at_ms) VALUES('space',?1,?2,?3,?4,'PENDING',?5)",
+                params![space_id,request_id,index as i64,fp,now])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// A repeated import is an explicit, owner-authorized continuation of the
+    /// immutable source plan. Only PENDING may execute. COMMITTED/SKIPPED are
+    /// reported from the durable journal without re-evaluating conflict policy.
+    fn prior_native_import_item(
+        &self,
+        space_id: &str,
+        request_id: &str,
+        index: usize,
+    ) -> StorageResult<Option<Option<FileRecord>>> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let (phase,stored): (String,Option<String>) = conn.query_row(
+            "SELECT phase,result_json FROM durable_operation_items WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 AND item_index=?3",
+            params![space_id,request_id,index as i64], |r| Ok((r.get(0)?,r.get(1)?)))?;
+        match phase.as_str() {
+            "PENDING" => Ok(None),
+            "SKIPPED" => Ok(Some(None)),
+            "COMMITTED" => {
+                let payload = stored.ok_or(StorageError::RecoveryRequired)?;
+                let record: FileRecord = serde_json::from_str(&payload)?;
+                Ok(Some(Some(record)))
+            }
+            _ => Err(StorageError::OutcomeUnknown),
+        }
+    }
+
+    fn begin_native_import_item(
+        &self,
+        space_id: &str,
+        request_id: &str,
+        index: usize,
+        target: Option<&str>,
+        child_request_id: Option<&str>,
+    ) -> StorageResult<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let now = now_ms();
+        let changed = conn.execute("UPDATE durable_operation_items SET phase='RUNNING',result_json=?1,updated_at_ms=?2 WHERE scope_kind='space' AND scope_id=?3 AND request_id=?4 AND item_index=?5 AND phase='PENDING'",
+            params![serde_json::to_string(&json!({"target":target,"childRequestId":child_request_id}))?,now,space_id,request_id,index as i64])?;
+        if changed != 1 {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        Ok(())
+    }
+    fn finish_native_import_item(
+        &self,
+        space_id: &str,
+        request_id: &str,
+        index: usize,
+        result: Option<&FileRecord>,
+    ) -> StorageResult<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let changed = conn.execute("UPDATE durable_operation_items SET phase=?1,result_json=?2,updated_at_ms=?3 WHERE scope_kind='space' AND scope_id=?4 AND request_id=?5 AND item_index=?6 AND phase='RUNNING'",
+            params![if result.is_some(){"COMMITTED"}else{"SKIPPED"},serde_json::to_string(&result)?,now_ms(),space_id,request_id,index as i64])?;
+        if changed != 1 {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        Ok(())
+    }
+    fn finish_native_import_plan(
+        &self,
+        space_id: &str,
+        request_id: &str,
+        result: &NativeImportReport,
+    ) -> StorageResult<()> {
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let pending: i64 = tx.query_row("SELECT COUNT(*) FROM durable_operation_items WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 AND phase IN ('PENDING','RUNNING')",
+            params![space_id,request_id],|r|r.get(0))?;
+        if pending != 0 {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        let now = now_ms();
+        let changed = tx.execute("UPDATE durable_operations SET phase='COMMITTED',result_json=?1,terminal_at_ms=?2,expires_at_ms=?3,updated_at_ms=?2 WHERE scope_kind='space' AND scope_id=?4 AND request_id=?5 AND kind='NATIVE_IMPORT' AND phase='RUNNING'",
+            params![serde_json::to_string(result)?,now,now.saturating_add(DURABLE_SQL_RECEIPT_TTL_MS),space_id,request_id])?;
+        if changed != 1 {
+            return Err(StorageError::OutcomeUnknown);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Ordinary import never resumes a previously admitted request implicitly.
     #[allow(clippy::too_many_arguments)]
     pub fn native_import<F, P, A>(
         &self,
@@ -3108,6 +9277,43 @@ impl StorageEngine {
         target_root: &str,
         conflict: ImportConflictPolicy,
         request_id: &str,
+        is_cancelled: F,
+        progress: P,
+        ask: A,
+    ) -> StorageResult<NativeImportReport>
+    where
+        F: Fn() -> bool,
+        P: FnMut(u64, Option<u64>, u64, Option<u64>),
+        A: FnMut(&str) -> StorageResult<bool>,
+    {
+        self.native_import_with_resume(
+            space_id,
+            selected_sources,
+            source_label,
+            mode,
+            target_root,
+            conflict,
+            request_id,
+            false,
+            is_cancelled,
+            progress,
+            ask,
+        )
+    }
+
+    /// Explicitly authorized Runtime resume. Same plan, same receipt identity;
+    /// PENDING items only may start and uncertain RUNNING never re-executes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_import_with_resume<F, P, A>(
+        &self,
+        space_id: &str,
+        selected_sources: &[PathBuf],
+        source_label: &str,
+        mode: NativeImportMode,
+        target_root: &str,
+        conflict: ImportConflictPolicy,
+        request_id: &str,
+        allow_resume: bool,
         is_cancelled: F,
         mut progress: P,
         mut ask: A,
@@ -3129,15 +9335,6 @@ impl StorageEngine {
                 "import requires a selected source".into(),
             ));
         }
-        prepare_native_import_journal(
-            self,
-            space_id,
-            request_id,
-            mode,
-            source_label,
-            target_root.as_str(),
-        )?;
-
         let outcome = (|| {
             let mut imported = Vec::<FileRecord>::new();
             let mut imported_bytes = 0u64;
@@ -3197,6 +9394,42 @@ impl StorageEngine {
                     total_items = total_items.saturating_add(1);
                     total_bytes = total_bytes.saturating_add(entry.size());
                 }
+                // ZIP entry identity includes the source archive metadata and
+                // per-entry CRC/size/name. A replaced source cannot be assumed
+                // equivalent on an interrupted replay.
+                let source_meta = fs::metadata(archive_path)?;
+                let mut plan = Vec::new();
+                for index in 0..archive.len() {
+                    let entry = archive
+                        .by_index(index)
+                        .map_err(|e| StorageError::RequestInvalid(format!("archive entry: {e}")))?;
+                    if entry.is_dir() {
+                        continue;
+                    }
+                    plan.push(sha256_hex(&serde_json::to_vec(&json!({"index":index,"name":entry.name(),"size":entry.size(),"crc32":entry.crc32()}))?));
+                }
+                let source_sha256 = sha256_file(archive_path)?;
+                let request_fingerprint = sha256_hex(&serde_json::to_vec(
+                    &json!({"mode":mode,"conflict":conflict,
+                    "source":archive_path,"size":source_meta.len(),"sourceSha256":source_sha256,
+                    "targetRoot":target_root.as_str(),"items":plan,"label":source_label}),
+                )?);
+                self.prepare_native_import_items(
+                    space_id,
+                    request_id,
+                    &request_fingerprint,
+                    &plan,
+                    allow_resume,
+                )?;
+                prepare_native_import_journal(
+                    self,
+                    space_id,
+                    request_id,
+                    mode,
+                    source_label,
+                    target_root.as_str(),
+                    allow_resume,
+                )?;
                 progress(0, Some(total_items), 0, Some(total_bytes));
                 let file = File::open(archive_path)?;
                 let mut archive = zip::ZipArchive::new(file).map_err(|error| {
@@ -3225,10 +9458,45 @@ impl StorageEngine {
                     let relative = portable_relative_text(&enclosed).ok_or_else(|| {
                         StorageError::PathInvalid("archive entry has a non-portable path".into())
                     })?;
+                    if let Some(previous) =
+                        self.prior_native_import_item(space_id, request_id, done_items as usize)?
+                    {
+                        match previous {
+                            Some(record) => {
+                                imported_bytes = imported_bytes.saturating_add(record.size);
+                                imported.push(record);
+                            }
+                            None => {
+                                skipped = skipped.saturating_add(1);
+                                conflicts = conflicts.saturating_add(1);
+                            }
+                        }
+                        done_items += 1;
+                        progress(
+                            done_items,
+                            Some(total_items),
+                            imported_bytes,
+                            Some(total_bytes),
+                        );
+                        continue;
+                    }
                     let desired = join_import_logical(target_root.as_str(), &relative)?;
                     let Some(target) =
                         self.resolve_native_import_target(space_id, &desired, conflict, &mut ask)?
                     else {
+                        self.begin_native_import_item(
+                            space_id,
+                            request_id,
+                            done_items as usize,
+                            None,
+                            None,
+                        )?;
+                        self.finish_native_import_item(
+                            space_id,
+                            request_id,
+                            done_items as usize,
+                            None,
+                        )?;
                         skipped = skipped.saturating_add(1);
                         conflicts = conflicts.saturating_add(1);
                         done_items += 1;
@@ -3241,6 +9509,13 @@ impl StorageEngine {
                         continue;
                     };
                     let child_request = format!("{request_id}:import:{index}");
+                    self.begin_native_import_item(
+                        space_id,
+                        request_id,
+                        done_items as usize,
+                        Some(target.as_str()),
+                        Some(&child_request),
+                    )?;
                     self.ensure_write_capacity(space_id, entry.size())?;
                     let temp =
                         self.prepare_stream_temp(space_id, target.as_str(), &child_request)?;
@@ -3259,6 +9534,12 @@ impl StorageEngine {
                         size,
                         None,
                         &child_request,
+                    )?;
+                    self.finish_native_import_item(
+                        space_id,
+                        request_id,
+                        done_items as usize,
+                        Some(&result),
                     )?;
                     imported_bytes = imported_bytes.saturating_add(result.size);
                     imported.push(result);
@@ -3287,6 +9568,40 @@ impl StorageEngine {
                     "import source contains no regular files".into(),
                 ));
             }
+            let mut plan = Vec::with_capacity(items.len());
+            for item in &items {
+                let metadata = fs::metadata(&item.source)?;
+                let modified_ms = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|delta| delta.as_millis())
+                    .unwrap_or(0);
+                plan.push(sha256_hex(&serde_json::to_vec(
+                    &json!({"source":item.source,"relative":item.relative_path,
+                    "size":item.size,"modifiedMs":modified_ms,"sha256":item.sha256}),
+                )?));
+            }
+            let request_fingerprint = sha256_hex(&serde_json::to_vec(
+                &json!({"mode":mode,"conflict":conflict,
+                "targetRoot":target_root.as_str(),"sourceLabel":source_label,"items":plan}),
+            )?);
+            self.prepare_native_import_items(
+                space_id,
+                request_id,
+                &request_fingerprint,
+                &plan,
+                allow_resume,
+            )?;
+            prepare_native_import_journal(
+                self,
+                space_id,
+                request_id,
+                mode,
+                source_label,
+                target_root.as_str(),
+                allow_resume,
+            )?;
             let total_items = items.len() as u64;
             let total_bytes = items
                 .iter()
@@ -3296,10 +9611,33 @@ impl StorageEngine {
                 if is_cancelled() {
                     return Err(StorageError::OperationCancelled);
                 }
+                if let Some(previous) =
+                    self.prior_native_import_item(space_id, request_id, index)?
+                {
+                    match previous {
+                        Some(record) => {
+                            imported_bytes = imported_bytes.saturating_add(record.size);
+                            imported.push(record);
+                        }
+                        None => {
+                            skipped = skipped.saturating_add(1);
+                            conflicts = conflicts.saturating_add(1);
+                        }
+                    }
+                    progress(
+                        (index + 1) as u64,
+                        Some(total_items),
+                        imported_bytes,
+                        Some(total_bytes),
+                    );
+                    continue;
+                }
                 let desired = join_import_logical(target_root.as_str(), &item.relative_path)?;
                 let Some(target) =
                     self.resolve_native_import_target(space_id, &desired, conflict, &mut ask)?
                 else {
+                    self.begin_native_import_item(space_id, request_id, index, None, None)?;
+                    self.finish_native_import_item(space_id, request_id, index, None)?;
                     skipped = skipped.saturating_add(1);
                     conflicts = conflicts.saturating_add(1);
                     progress(
@@ -3311,9 +9649,16 @@ impl StorageEngine {
                     continue;
                 };
                 let child_request = format!("{request_id}:import:{index}");
+                self.begin_native_import_item(
+                    space_id,
+                    request_id,
+                    index,
+                    Some(target.as_str()),
+                    Some(&child_request),
+                )?;
                 self.ensure_write_capacity(space_id, item.size)?;
-                let temp = self.prepare_stream_temp(space_id, target.as_str(), &child_request)?;
                 let mut source = File::open(&item.source)?;
+                let temp = self.prepare_stream_temp(space_id, target.as_str(), &child_request)?;
                 let (size, etag) = match copy_reader_to_temp(&mut source, &temp, &is_cancelled) {
                     Ok(value) => value,
                     Err(error) => {
@@ -3321,6 +9666,10 @@ impl StorageEngine {
                         return Err(error);
                     }
                 };
+                if size != item.size || etag != item.sha256 {
+                    let _ = self.abort_stream_temp(space_id, &temp);
+                    return Err(StorageError::ExportSourceChanged);
+                }
                 let result = self.commit_stream_file(
                     space_id,
                     target.as_str(),
@@ -3330,6 +9679,7 @@ impl StorageEngine {
                     None,
                     &child_request,
                 )?;
+                self.finish_native_import_item(space_id, request_id, index, Some(&result))?;
                 imported_bytes = imported_bytes.saturating_add(result.size);
                 imported.push(result);
                 progress(
@@ -3350,8 +9700,9 @@ impl StorageEngine {
             })
         })();
         match &outcome {
-            Ok(_) => {
-                clear_native_import_journal(self, space_id);
+            Ok(report) => {
+                self.finish_native_import_plan(space_id, request_id, report)?;
+                clear_native_import_journal(self, space_id, request_id);
             }
             Err(StorageError::OperationCancelled) => {
                 let _ = write_native_import_journal(
@@ -3428,36 +9779,112 @@ impl StorageEngine {
         Ok(physical.exists())
     }
 
+    /// Resolve a process death between a Core file receipt and the parent
+    /// item journal. Missing receipt is NOT evidence that the file was not
+    /// committed; it stays RUNNING and blocks automatic replay.
+    fn reconcile_native_import_receipts(&self) -> StorageResult<()> {
+        let mut conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut stmt = tx.prepare("SELECT i.scope_id,i.request_id,i.item_index,i.result_json FROM durable_operation_items i JOIN durable_operations p ON p.scope_kind=i.scope_kind AND p.scope_id=i.scope_id AND p.request_id=i.request_id WHERE p.kind='NATIVE_IMPORT' AND i.phase='RUNNING'")?;
+        let mut rows = stmt.query([])?;
+        let mut observed = Vec::<(String, String, i64, String)>::new();
+        while let Some(row) = rows.next()? {
+            observed.push((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?));
+        }
+        drop(rows);
+        drop(stmt);
+        for (space_id, parent_id, item_index, data) in observed {
+            let context: Value = serde_json::from_str(&data)?;
+            let (Some(child_id), Some(target)) = (
+                context.get("childRequestId").and_then(Value::as_str),
+                context.get("target").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            let receipt: Option<(String,String,i64)> = tx.query_row(
+                "SELECT operation,result_json,created_at_ms FROM mutation_receipts WHERE space_id=?1 AND request_id=?2",
+                params![space_id,child_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+            let Some((operation, json, receipt_at)) = receipt else {
+                continue;
+            };
+            let parent_at: i64 = tx.query_row("SELECT request_started_at_ms FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2 AND kind='NATIVE_IMPORT'",
+                params![space_id,parent_id],|r|r.get(0))?;
+            if receipt_at < parent_at {
+                continue;
+            }
+            if operation != file_write_operation(target) {
+                return Err(StorageError::RecoveryRequired);
+            }
+            let stored: FileRecord = serde_json::from_str(&json)?;
+            if stored.path != target {
+                return Err(StorageError::RecoveryRequired);
+            }
+            let count = tx.execute("UPDATE durable_operation_items SET phase='COMMITTED',result_json=?1,updated_at_ms=?2 WHERE scope_kind='space' AND scope_id=?3 AND request_id=?4 AND item_index=?5 AND phase='RUNNING'",
+                params![json,now_ms(),space_id,parent_id,item_index])?;
+            if count != 1 {
+                return Err(StorageError::RecoveryRequired);
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn recover_native_import_journals(&self) -> StorageResult<()> {
         let spaces = self.root.join("spaces");
         if !spaces.exists() {
             return Ok(());
         }
-        for entry in fs::read_dir(spaces)?.filter_map(Result::ok) {
-            let journal = entry.path().join(".vontaqfs/native-import-journal.json");
-            if !journal.is_file() {
-                continue;
+        for space in fs::read_dir(spaces)? {
+            let space = space?;
+            if !space.file_type()?.is_dir() {
+                return Err(StorageError::RecoveryRequired);
             }
-            let status = fs::read(&journal)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                .and_then(|value| {
-                    value
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                });
-            if status.as_deref() != Some("running") {
-                continue;
-            }
-            let interrupted = entry.path().join(format!(
-                ".vontaqfs/native-import-interrupted-{}.json",
-                now_ms()
-            ));
-            match fs::rename(&journal, &interrupted) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            let internal = space.path().join(".vontaqfs");
+            let metadata = match fs::symlink_metadata(&internal) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
+            };
+            if is_link_like(&metadata) || !metadata.is_dir() {
+                return Err(StorageError::RecoveryRequired);
+            }
+            for entry in fs::read_dir(&internal)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                // Keep compatibility with the v1 single-journal layout. New
+                // imports have one private journal per request, so independent
+                // imports can never erase one another's recovery evidence.
+                if name != "native-import-journal.json"
+                    && !(name.starts_with("native-import-")
+                        && name.ends_with(".json")
+                        && !name.starts_with("native-import-interrupted-"))
+                {
+                    continue;
+                }
+                let journal = entry.path();
+                let metadata = fs::symlink_metadata(&journal)?;
+                if is_link_like(&metadata) || !metadata.is_file() {
+                    return Err(StorageError::RecoveryRequired);
+                }
+                let body = fs::read(&journal)?;
+                let value: Value =
+                    serde_json::from_slice(&body).map_err(|_| StorageError::RecoveryRequired)?;
+                if value.get("format").and_then(Value::as_str)
+                    != Some("vontaqfs-native-import-journal")
+                {
+                    return Err(StorageError::RecoveryRequired);
+                }
+                if value.get("status").and_then(Value::as_str) != Some("running") {
+                    continue;
+                }
+                // A crash can have committed a prefix of files. Retain the
+                // request-keyed journal in place to fence admission of that
+                // same requestId after restart. Do not mark it aborted.
+                // Legacy journals are also preserved for manual reconciliation.
             }
         }
         Ok(())
@@ -3484,6 +9911,37 @@ impl StorageEngine {
             })?;
         let files = self.file_records_under(space_id, "/")?;
         let kv = self.list_kv_entries(space_id)?;
+        // Back up a coherent selected generation, not a sequence of live file
+        // reads during ZIP encoding. Scoped claims are held only while copying
+        // to a private immutable capture. Other spaces and unrelated paths
+        // remain writable, and no space-exclusive lease spans external I/O.
+        let claims = std::iter::once(Claim::global_shared())
+            .chain(std::iter::once(Claim::space_shared(space_id)))
+            .chain(
+                files
+                    .iter()
+                    .map(|record| Claim::path(space_id, &record.path)),
+            )
+            .collect::<Vec<_>>();
+        let capture_lease = self.admit(claims)?;
+        if self.file_records_under(space_id, "/")? != files || self.list_kv_entries(space_id)? != kv
+        {
+            return Err(StorageError::ExportSourceChanged);
+        }
+        let capture_plan = files
+            .iter()
+            .map(|record| ScannedFile {
+                path: record.path.clone(),
+                collision_key: String::new(),
+                etag: record.etag.clone(),
+                size: record.size,
+                updated_at_ms: record.updated_at_ms,
+            })
+            .collect::<Vec<_>>();
+        let live_data_root = self.space_data_root(space_id)?;
+        let captured_sources =
+            NativeExportCapture::create(self, &live_data_root, &capture_plan, &is_cancelled)?;
+        drop(capture_lease);
         let total_bytes = files
             .iter()
             .fold(0u64, |sum, file| sum.saturating_add(file.size));
@@ -3513,27 +9971,32 @@ impl StorageEngine {
                 "backup metadata exceeds the portable backup manifest limit".into(),
             ));
         }
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
-            ensure_disk_reserve(
-                parent,
-                total_bytes.saturating_add(manifest_bytes.len() as u64),
-            )?;
+        let parent = destination.parent().ok_or_else(|| {
+            StorageError::PathInvalid("portable backup target has no parent".into())
+        })?;
+        let parent_meta = fs::symlink_metadata(parent)?;
+        if is_link_like(&parent_meta) || !parent_meta.is_dir() {
+            return Err(StorageError::PathInvalid(
+                "portable backup parent is unsafe".into(),
+            ));
         }
-        let temp = destination.with_extension(format!(
-            "{}.tmp",
-            destination
-                .extension()
-                .and_then(|value| value.to_str())
-                .unwrap_or("vontaqfs-backup")
-        ));
-        if temp.exists() {
-            fs::remove_file(&temp)?;
-        }
+        // Opening the original parent via a descriptor rejects a swapped
+        // symlink; canonicalize() here would reintroduce that race.
+        let native_parent = NativeDirectory::open(parent)?;
+        native_parent.ensure_root_identity(&parent_meta)?;
+        let backup_name = Path::new(destination.file_name().ok_or_else(|| {
+            StorageError::PathInvalid("backup destination has no filename".into())
+        })?);
+        ensure_disk_reserve(
+            parent,
+            total_bytes.saturating_add(manifest_bytes.len() as u64),
+        )?;
+        let backup_temp = native_parent.temporary(backup_name, false)?;
+        let file = backup_temp.writer()?;
         progress(0, Some(total_items), 0, Some(total_bytes));
-        let data_root = self.space_data_root(space_id)?;
+        // The held capture owns the source generation until ZIP is finished.
+        let data_root = captured_sources.root.as_path();
         let result = (|| -> StorageResult<()> {
-            let file = File::create(&temp)?;
             let mut zip = SimpleZipWriter::new(BufWriter::new(file));
             zip.add_bytes("vontaqfs-backup.json", &manifest_bytes)?;
             progress(1, Some(total_items), 0, Some(total_bytes));
@@ -3545,7 +10008,7 @@ impl StorageEngine {
                 validate_file_metadata(Some(&record.metadata()))?;
                 let logical = LogicalPath::parse(&record.path)?;
                 let source = data_root.join(logical.relative());
-                ensure_no_symlink_escape(&data_root, &source)?;
+                ensure_no_symlink_escape(data_root, &source)?;
                 let metadata = fs::symlink_metadata(&source)?;
                 if is_link_like(&metadata) || !metadata.is_file() || metadata.len() != record.size {
                     return Err(StorageError::StorageCorrupt(format!(
@@ -3553,13 +10016,10 @@ impl StorageEngine {
                         record.path
                     )));
                 }
-                let actual = sha256_file_cancellable(&source, &is_cancelled)?;
-                if actual != record.etag {
-                    return Err(StorageError::StorageCorrupt(format!(
-                        "backup checksum mismatch: {}",
-                        record.path
-                    )));
-                }
+                // ZIP writer validates the registry SHA while streaming the
+                // source into the archive. An earlier separate hash pass can
+                // certify different bytes if the file changes before ZIP IO;
+                // it also doubles disk reads for every backed-up object.
                 let archive_name = format!(
                     "files/{}",
                     logical.relative().to_string_lossy().replace('\\', "/")
@@ -3579,16 +10039,22 @@ impl StorageEngine {
                 );
             }
             zip.finish()?;
-            sync_file_for_durability(&temp)?;
+            backup_temp.sync()?;
             Ok(())
         })();
-        if let Err(error) = result {
-            let _ = fs::remove_file(&temp);
-            return Err(error);
+        result?;
+        backup_temp.publish()?;
+        let mut published = native_parent.read(backup_name)?;
+        let mut hasher = Sha256::new();
+        let mut block = [0u8; 256 * 1024];
+        loop {
+            let n = published.read(&mut block)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&block[..n]);
         }
-        atomic_replace(&temp, destination)?;
-        sync_parent(destination.parent());
-        let archive_sha256 = sha256_file(destination)?;
+        let archive_sha256 = digest_hex(hasher.finalize());
         Ok(PortableBackupReport {
             space_id: space_id.to_owned(),
             destination: destination.to_string_lossy().to_string(),
@@ -3771,6 +10237,7 @@ impl StorageEngine {
             &manifest.files,
             &manifest.kv,
             Some(manifest.space.storage_category),
+            None,
         );
         if let Err(error) = commit {
             if created_space {
@@ -3825,6 +10292,11 @@ impl StorageEngine {
                 ));
             }
         }
+        let _lease = self.admit(vec![
+            Claim::global_shared(),
+            Claim::space_exclusive(space_id),
+        ])?;
+        self.ensure_space_mutable(space_id)?;
         self.get_space(space_id)?
             .ok_or_else(|| StorageError::NotFound("space".into()))?;
         let files = self.file_records_under(space_id, "/")?;
@@ -3909,8 +10381,9 @@ impl StorageEngine {
             return Err(StorageError::OperationCancelled);
         }
         let final_dir = snapshot_root.join(&snapshot.id);
-        fs::rename(&stage, &final_dir)?;
-        sync_parent(Some(&snapshot_root));
+        // Publish SQLite snapshot identity before filesystem rename. This row
+        // becomes the durable completion marker: startup can finish a verified
+        // .staging-ID directory if interrupted before final publication.
         let persist = (|| -> StorageResult<()> {
             let mut conn = self
                 .connection
@@ -3923,9 +10396,20 @@ impl StorageEngine {
             Ok(())
         })();
         if let Err(error) = persist {
-            let _ = fs::remove_dir_all(&final_dir);
+            let _ = fs::remove_dir_all(&stage);
             return Err(error);
         }
+        if fs::rename(&stage, &final_dir).is_err() {
+            // Metadata is now committed. Do not silently roll it back or claim
+            // failure is safe to retry with a different snapshot identity.
+            let conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            conn.execute("UPDATE spaces SET state='snapshot_publication_pending' WHERE id=?1 AND state='healthy'",params![space_id])?;
+            return Err(StorageError::RecoveryRequired);
+        }
+        sync_parent(Some(&snapshot_root));
         Ok(snapshot)
     }
 
@@ -3955,21 +10439,70 @@ impl StorageEngine {
         Ok(conn.query_row("SELECT id,space_id,created_at_ms,label,logical_bytes,file_count,source_generation FROM snapshots WHERE id=?1 AND space_id=?2", params![snapshot_id,space_id], row_snapshot).optional()?)
     }
 
+    /// Existing internal callers retain the old API. Public requests use
+    /// `delete_snapshot_with_request` so the user-supplied identity is durable.
     pub fn delete_snapshot(&self, space_id: &str, snapshot_id: &str) -> StorageResult<bool> {
+        let request_id = format!("internal-snapshot-delete-{}", Uuid::new_v4().simple());
+        self.delete_snapshot_with_request(space_id, snapshot_id, &request_id)
+    }
+
+    pub fn delete_snapshot_with_request(
+        &self,
+        space_id: &str,
+        snapshot_id: &str,
+        request_id: &str,
+    ) -> StorageResult<bool> {
         validate_snapshot_id(snapshot_id)?;
+        validate_request_id(request_id)?;
+        // The universal v3 handshake is not enabled: don't silently admit a
+        // v3 identity into a partially migrated mutation class.
+        if request_id.starts_with("request-v3-") {
+            return Err(StorageError::RequestIdMigrationRequired);
+        }
+        let _lease = self.admit_space(space_id, vec![Claim::snapshot(space_id, snapshot_id)])?;
+        let payload = json!({"snapshotId":snapshot_id});
+        let fingerprint = semantic_fingerprint("SNAPSHOT_DELETE", &payload)?;
+        {
+            let conn = self
+                .connection
+                .lock()
+                .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            if let Some(done) = fs_operation_replay::<bool>(
+                &conn,
+                space_id,
+                request_id,
+                "SNAPSHOT_DELETE",
+                &fingerprint,
+            )? {
+                return Ok(done);
+            }
+        }
         let Some(_) = self.get_snapshot(space_id, snapshot_id)? else {
             return Ok(false);
         };
         let snapshots_root = self.space_internal_root(space_id)?.join("snapshots");
         let snapshot_dir = snapshots_root.join(snapshot_id);
-        let quarantine = snapshots_root.join(format!(
-            ".delete-{}-{}",
-            snapshot_id,
-            Uuid::new_v4().simple()
-        ));
-        if snapshot_dir.exists() {
-            fs::rename(&snapshot_dir, &quarantine)?;
+        let intent_id = Uuid::new_v4().to_string();
+        let quarantine = snapshots_root.join(format!(".delete-{intent_id}"));
+        let source_rel = format!("spaces/{space_id}/.vontaqfs/snapshots/{snapshot_id}");
+        let quarantine_rel = format!("spaces/{space_id}/.vontaqfs/snapshots/.delete-{intent_id}");
+        let op = "snapshot-delete";
+        self.prepare_fs_intent(
+            &intent_id,
+            space_id,
+            request_id,
+            "SNAPSHOT_DELETE",
+            Some(&source_rel),
+            None,
+            Some(&quarantine_rel),
+            &payload,
+        )?;
+        if let Err(error) = fs::rename(&snapshot_dir, &quarantine) {
+            self.mark_fs_intent_aborted(&intent_id, space_id, request_id)?;
+            return Err(error.into());
         }
+        sync_parent(snapshot_dir.parent());
+        let _ = self.transition_fs_intent(&intent_id, "FS_APPLIED");
         let result = (|| -> StorageResult<()> {
             let mut conn = self
                 .connection
@@ -3988,17 +10521,17 @@ impl StorageEngine {
                 "DELETE FROM snapshots WHERE id=?1 AND space_id=?2",
                 params![snapshot_id, space_id],
             )?;
+            self.complete_fs_intent(&tx, &intent_id, space_id, request_id, op, &true)?;
             tx.commit()?;
             Ok(())
         })();
         if let Err(error) = result {
-            if quarantine.exists() {
-                let _ = fs::rename(&quarantine, &snapshot_dir);
-            }
+            fs::rename(&quarantine, &snapshot_dir)?;
+            self.mark_fs_intent_aborted(&intent_id, space_id, request_id)?;
             return Err(error);
         }
-        if quarantine.exists() {
-            fs::remove_dir_all(&quarantine)?;
+        if fs::remove_dir_all(&quarantine).is_ok() {
+            let _ = self.finish_fs_cleanup(&intent_id);
         }
         Ok(true)
     }
@@ -4014,6 +10547,12 @@ impl StorageEngine {
         F: Fn() -> bool,
         P: FnMut(&str, u64, Option<u64>, u64, Option<u64>, bool),
     {
+        let _lease = self.admit(vec![
+            Claim::global_shared(),
+            Claim::space_exclusive(space_id),
+            Claim::snapshot(space_id, snapshot_id),
+        ])?;
+        self.ensure_space_mutable(space_id)?;
         let snapshot = self
             .get_snapshot(space_id, snapshot_id)?
             .ok_or_else(|| StorageError::NotFound("snapshot".into()))?;
@@ -4086,7 +10625,8 @@ impl StorageEngine {
             Some(snapshot.logical_bytes),
             false,
         );
-        let result = commit_staged_space_replace(self, space_id, &staging_data, &files, &kv, None);
+        let result =
+            commit_staged_space_replace(self, space_id, &staging_data, &files, &kv, None, None);
         let _ = fs::remove_dir_all(&staging_root);
         result?;
         Ok(SnapshotRestoreReport {
@@ -4328,6 +10868,23 @@ impl StorageEngine {
         request_id: &str,
         fault: AtomicWriteFault,
     ) -> StorageResult<FileRecord> {
+        self.write_file_fault_with_metadata_using_lease(
+            space_id, raw_path, bytes, if_match, metadata, request_id, fault, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_file_fault_with_metadata_using_lease(
+        &self,
+        space_id: &str,
+        raw_path: &str,
+        bytes: &[u8],
+        if_match: Option<&str>,
+        metadata: Option<&FileMetadata>,
+        request_id: &str,
+        fault: AtomicWriteFault,
+        existing_lease: Option<&AdmissionLease>,
+    ) -> StorageResult<FileRecord> {
         validate_file_metadata(metadata)?;
         validate_request_id(request_id)?;
         let logical = LogicalPath::parse(raw_path)?;
@@ -4336,6 +10893,17 @@ impl StorageEngine {
                 "cannot write the space root as a file".into(),
             ));
         }
+        let _owned_lease = if let Some(lease) = existing_lease {
+            if !lease.covers(&Claim::space_exclusive(space_id)) {
+                return Err(StorageError::RequestInvalid(
+                    "invalid file mutation context".into(),
+                ));
+            }
+            self.ensure_space_mutable(space_id)?;
+            None
+        } else {
+            Some(self.admit_space(space_id, vec![Claim::path(space_id, logical.as_str())])?)
+        };
         let data_root = self.space_data_root(space_id)?;
         let internal_root = self.space_internal_root(space_id)?;
         let target = data_root.join(logical.relative());
@@ -4351,9 +10919,21 @@ impl StorageEngine {
             .connection
             .lock()
             .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-        let tx = conn.transaction()?;
-        let receipt_operation = file_write_operation(logical.as_str());
-        if let Some(result) = receipt::<FileRecord>(&tx, space_id, request_id, &receipt_operation)?
+        let tx = if active_capacity_credit().is_some() {
+            conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?
+        } else {
+            conn.transaction()?
+        };
+        let etag = sha256_hex(bytes);
+        let fingerprint = file_write_fingerprint(
+            logical.as_str(),
+            &etag,
+            bytes.len() as u64,
+            if_match,
+            metadata,
+        )?;
+        if let Some(result) =
+            sql_atomic_receipt::<FileRecord>(&tx, false, space_id, request_id, &fingerprint)?
         {
             return Ok(result);
         }
@@ -4391,7 +10971,6 @@ impl StorageEngine {
             )));
         }
         let version = existing.as_ref().map_or(1, |entry| entry.version + 1);
-        let etag = sha256_hex(bytes);
         let now = now_ms();
         ensure_disk_reserve(&data_root, bytes.len() as u64)?;
         let temp_name = format!("{}.tmp", sha256_hex(request_id.as_bytes()));
@@ -4410,9 +10989,15 @@ impl StorageEngine {
             .map_err(|_| StorageError::Internal("temp path escaped root".into()))?
             .to_string_lossy()
             .replace('\\', "/");
+        if active_capacity_credit().is_some()
+            && !prepaid_child_proof(&tx, space_id, request_id)?
+            && !spend_scoped_proof(&tx, space_id, request_id, "RECEIPT", &fingerprint, 1)?
+        {
+            return Err(StorageError::RecoveryRequired);
+        }
         tx.execute(
-            "INSERT INTO pending_mutations(id,space_id,operation,logical_path,collision_key,temp_rel_path,etag,size,next_version,created_at_ms,content_type,format_id,opaque) VALUES(?1,?2,'file-write',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-            params![request_id, space_id, logical.as_str(), logical.collision_key(), relative_temp, etag, bytes.len() as i64, version as i64, now, metadata.and_then(|value| value.content_type.as_deref()), metadata.and_then(|value| value.format_id.as_deref()), metadata.and_then(|value| value.opaque).map(bool_to_db)],
+            "INSERT INTO pending_mutations(id,space_id,operation,logical_path,collision_key,temp_rel_path,etag,size,next_version,created_at_ms,content_type,format_id,opaque,request_fingerprint) VALUES(?1,?2,'file-write',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![request_id, space_id, logical.as_str(), logical.collision_key(), relative_temp, etag, bytes.len() as i64, version as i64, now, metadata.and_then(|value| value.content_type.as_deref()), metadata.and_then(|value| value.format_id.as_deref()), metadata.and_then(|value| value.opaque).map(bool_to_db), fingerprint],
         )?;
         tx.commit()?;
         drop(conn);
@@ -4431,7 +11016,11 @@ impl StorageEngine {
             .connection
             .lock()
             .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
-        let tx = conn.transaction()?;
+        let tx = if active_capacity_credit().is_some() {
+            conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?
+        } else {
+            conn.transaction()?
+        };
         let result = finalize_file_write(
             &tx,
             space_id,
@@ -4556,9 +11145,12 @@ impl StorageEngine {
                 .connection
                 .lock()
                 .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+            // Neither committed target nor staged bytes can prove an outcome.
+            // Deleting the pending intent here would make a crash look like a
+            // never-started mutation. Fence the space, retain the SQL intent.
             conn.execute(
-                "DELETE FROM pending_mutations WHERE id=?1 AND space_id=?2",
-                params![mutation.id, mutation.space_id],
+                "UPDATE spaces SET state='recovery_required' WHERE id=?1 AND state='healthy'",
+                params![mutation.space_id],
             )?;
             return Ok(());
         } else if temp.exists() {
@@ -4632,28 +11224,191 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn prune_mutation_receipts(&self) -> StorageResult<()> {
-        let cutoff = now_ms().saturating_sub(MUTATION_RECEIPT_TTL_MS);
+    /// After ALL startup recovery and scope fencing, the Runtime maintenance
+    /// worker may collect at most a small batch of expired terminal evidence.
+    /// It never runs from auth, request admission, or chunk PUT.
+    pub fn run_bounded_receipt_gc(&self) -> StorageResult<()> {
+        self.prune_mutation_receipts()?;
+        self.prune_stream_operations()?;
+        self.prune_expired_v3_results()?;
+        Ok(())
+    }
+
+    fn fence_unresolved_recovery_scopes(&self) -> StorageResult<()> {
         let conn = self
             .connection
             .lock()
             .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        // A NEEDS_REPAIR parent/intent can be carried from an older registry
+        // without its space health flag. Never advertise such a space as healthy.
         conn.execute(
-            "DELETE FROM mutation_receipts WHERE created_at_ms < ?1",
-            params![cutoff],
+            "UPDATE spaces SET state='recovery_required' WHERE state='healthy' AND (
+            EXISTS(SELECT 1 FROM filesystem_intents i WHERE i.scope_kind='space'
+                AND i.scope_id=spaces.id AND i.state='NEEDS_REPAIR')
+            OR EXISTS(SELECT 1 FROM durable_operations p WHERE p.scope_kind='space'
+                AND p.scope_id=spaces.id AND p.phase='NEEDS_REPAIR')
+            OR EXISTS(SELECT 1 FROM durable_operations p WHERE p.scope_kind='application'
+                AND p.scope_id=spaces.owner_application_id AND p.phase='NEEDS_REPAIR')
+            OR EXISTS(SELECT 1 FROM filesystem_intents i WHERE i.scope_kind='application'
+                AND i.scope_id=spaces.owner_application_id AND i.state='NEEDS_REPAIR')
+        )",
+            [],
         )?;
+        Ok(())
+    }
+
+    fn prune_mutation_receipts(&self) -> StorageResult<()> {
+        // Legacy identities are not v3-negotiated, but a stored receipt may
+        // still be the only evidence of a partial filesystem operation. No
+        // global row-count eviction. Use the same >=7 day minimum as v3.
+        let cutoff = now_ms().saturating_sub(DURABLE_SQL_RECEIPT_TTL_MS);
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        conn.execute("DELETE FROM mutation_receipts WHERE rowid IN (
+            SELECT r.rowid FROM mutation_receipts r WHERE r.identity_version=0
+              AND r.created_at_ms<?1
+              AND NOT EXISTS(SELECT 1 FROM pending_mutations m WHERE m.space_id=r.space_id AND m.id=r.request_id)
+              AND NOT EXISTS(SELECT 1 FROM durable_operations p WHERE p.scope_kind='space'
+                  AND p.scope_id=r.space_id AND p.request_id=r.request_id
+                  AND p.phase NOT IN ('COMMITTED','ABORTED','PARTIALLY_APPLIED'))
+              AND NOT EXISTS(SELECT 1 FROM filesystem_intents i WHERE i.scope_kind='space'
+                  AND i.scope_id=r.space_id AND i.request_id=r.request_id AND i.state<>'CLEANED')
+              AND NOT EXISTS(SELECT 1 FROM durable_capacity_spends c WHERE c.scope_kind='space'
+                  AND c.scope_id=r.space_id AND c.child_request_id=r.request_id
+                  AND EXISTS(SELECT 1 FROM durable_capacity_escrows e WHERE e.scope_kind=c.scope_kind
+                    AND e.scope_id=c.scope_id AND e.root_request_id=c.root_request_id AND e.state<>'TERMINAL'))
+              ORDER BY r.created_at_ms,r.rowid LIMIT ?2)",params![cutoff,V3_GC_BATCH_ROWS])?;
+        conn.execute("DELETE FROM application_mutation_receipts WHERE rowid IN (
+            SELECT r.rowid FROM application_mutation_receipts r WHERE r.identity_version=0
+              AND r.created_at_ms<?1
+              AND NOT EXISTS(SELECT 1 FROM durable_operations p WHERE p.scope_kind='application'
+                  AND p.scope_id=r.application_id AND p.request_id=r.request_id
+                  AND p.phase NOT IN ('COMMITTED','ABORTED','PARTIALLY_APPLIED'))
+              AND NOT EXISTS(SELECT 1 FROM filesystem_intents i WHERE i.scope_kind='application'
+                  AND i.scope_id=r.application_id AND i.request_id=r.request_id AND i.state<>'CLEANED')
+              ORDER BY r.created_at_ms,r.rowid LIMIT ?2)",params![cutoff,V3_GC_BATCH_ROWS])?;
+        Ok(())
+    }
+
+    /// Bounded v3 GC: keep unresolved child plans, escrow and filesystem
+    /// intents even when their original timestamps are long expired.
+    fn prune_expired_v3_results(&self) -> StorageResult<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| StorageError::Internal("registry lock poisoned".into()))?;
+        let now = now_ms();
+        let terminal_cutoff = now.saturating_sub(DURABLE_SQL_RECEIPT_TTL_MS);
+        // Exclude unresolved outcomes in the selection, not just in DELETE
+        // triggers: one poisoned row must not starve all eligible receipts.
+        for table in ["mutation_receipts", "application_mutation_receipts"] {
+            let exclusion = if table == "mutation_receipts" {
+                "AND NOT EXISTS(SELECT 1 FROM pending_mutations m WHERE m.space_id=r.space_id AND m.id=r.request_id)
+                 AND NOT EXISTS(SELECT 1 FROM durable_operations p WHERE p.scope_kind='space' AND p.scope_id=r.space_id
+                   AND p.request_id=r.request_id AND p.phase NOT IN ('COMMITTED','ABORTED','PARTIALLY_APPLIED'))
+                 AND NOT EXISTS(SELECT 1 FROM filesystem_intents i WHERE i.scope_kind='space' AND i.scope_id=r.space_id
+                   AND i.request_id=r.request_id AND i.state<>'CLEANED')
+                 AND NOT EXISTS(SELECT 1 FROM durable_capacity_spends c WHERE c.scope_kind='space'
+                   AND c.scope_id=r.space_id AND c.child_request_id=r.request_id
+                   AND EXISTS(SELECT 1 FROM durable_capacity_escrows e WHERE e.scope_kind=c.scope_kind
+                     AND e.scope_id=c.scope_id AND e.root_request_id=c.root_request_id AND e.state<>'TERMINAL'))
+                 AND NOT EXISTS(SELECT 1 FROM durable_operation_items i JOIN durable_operations p
+                   ON p.scope_kind=i.scope_kind AND p.scope_id=i.scope_id AND p.request_id=i.request_id
+                   WHERE i.scope_kind='space' AND i.scope_id=r.space_id AND i.phase IN ('PENDING','RUNNING')
+                     AND CASE WHEN json_valid(i.result_json) THEN json_extract(i.result_json,'$.childRequestId') ELSE NULL END=r.request_id)"
+            } else {
+                "AND NOT EXISTS(SELECT 1 FROM durable_operations p WHERE p.scope_kind='application'
+                   AND p.scope_id=r.application_id AND p.request_id=r.request_id
+                   AND p.phase NOT IN ('COMMITTED','ABORTED','PARTIALLY_APPLIED'))
+                 AND NOT EXISTS(SELECT 1 FROM filesystem_intents i WHERE i.scope_kind='application'
+                   AND i.scope_id=r.application_id AND i.request_id=r.request_id AND i.state<>'CLEANED')"
+            };
+            let sql = format!(
+                "DELETE FROM {table} WHERE rowid IN (SELECT r.rowid FROM {table} r
+                WHERE r.identity_version>=3 AND r.expires_at_ms IS NOT NULL
+                AND r.expires_at_ms<=?1 AND r.terminal_at_ms IS NOT NULL
+                AND r.terminal_at_ms<=?3 {exclusion} ORDER BY r.expires_at_ms,r.rowid LIMIT ?2)"
+            );
+            conn.execute(&sql, params![now, V3_GC_BATCH_ROWS, terminal_cutoff])?;
+        }
+        for table in [
+            "retained_space_outcomes",
+            "retained_application_outcomes",
+            "retained_stream_outcomes",
+        ] {
+            let exclusion = if table == "retained_space_outcomes" {
+                "AND NOT EXISTS(SELECT 1 FROM durable_operations p WHERE p.scope_kind='space'
+                    AND p.scope_id=r.space_id AND p.request_id=r.request_id
+                    AND p.phase NOT IN ('COMMITTED','ABORTED','PARTIALLY_APPLIED'))
+                 AND NOT EXISTS(SELECT 1 FROM filesystem_intents i WHERE i.scope_kind='space'
+                    AND i.scope_id=r.space_id AND i.request_id=r.request_id AND i.state<>'CLEANED')"
+            } else if table == "retained_application_outcomes" {
+                "AND NOT EXISTS(SELECT 1 FROM durable_operations p WHERE p.scope_kind='application'
+                    AND p.scope_id=r.owner_application_id AND p.request_id=r.request_id
+                    AND p.phase NOT IN ('COMMITTED','ABORTED','PARTIALLY_APPLIED'))
+                 AND NOT EXISTS(SELECT 1 FROM filesystem_intents i WHERE i.scope_kind='application'
+                    AND i.scope_id=r.owner_application_id AND i.request_id=r.request_id AND i.state<>'CLEANED')"
+            } else {
+                ""
+            };
+            let terminal_column = if table == "retained_stream_outcomes" {
+                "updated_at_ms"
+            } else {
+                "terminal_at_ms"
+            };
+            let sql = format!(
+                "DELETE FROM {table} WHERE rowid IN (SELECT r.rowid FROM {table} r
+                WHERE r.expires_at_ms IS NOT NULL AND r.expires_at_ms<=?1
+                  AND r.{terminal_column} IS NOT NULL AND r.{terminal_column}<=?3 {exclusion}
+                ORDER BY r.expires_at_ms,r.rowid LIMIT ?2)"
+            );
+            conn.execute(&sql, params![now, V3_GC_BATCH_ROWS, terminal_cutoff])?;
+        }
         conn.execute(
-            "DELETE FROM application_mutation_receipts WHERE created_at_ms < ?1",
-            params![cutoff],
+            "DELETE FROM retained_pairing_owners WHERE rowid IN (
+            SELECT rowid FROM retained_pairing_owners WHERE expires_at_ms<=?1 AND deleted_at_ms<=?3
+            ORDER BY expires_at_ms,rowid LIMIT ?2)",
+            params![now, V3_GC_BATCH_ROWS, terminal_cutoff],
         )?;
-        conn.execute(
-            "DELETE FROM mutation_receipts WHERE rowid IN (SELECT rowid FROM mutation_receipts ORDER BY created_at_ms DESC, rowid DESC LIMIT -1 OFFSET ?1)",
-            params![MUTATION_RECEIPT_MAX_ROWS],
-        )?;
-        conn.execute(
-            "DELETE FROM application_mutation_receipts WHERE rowid IN (SELECT rowid FROM application_mutation_receipts ORDER BY created_at_ms DESC, rowid DESC LIMIT -1 OFFSET ?1)",
-            params![MUTATION_RECEIPT_MAX_ROWS],
-        )?;
+        // Spend rows are immutable; remove them before their terminal escrow.
+        // Unresolved roots, unfinished items and non-CLEANED intents retain ALL
+        // their proof and reserved credits. The SQL triggers are a final guard.
+        let eligible = "e.state='TERMINAL' AND e.remaining_slots=0
+            AND p.phase IN ('COMMITTED','ABORTED','PARTIALLY_APPLIED')
+            AND p.expires_at_ms IS NOT NULL AND p.expires_at_ms<=?1
+            AND p.terminal_at_ms IS NOT NULL AND p.terminal_at_ms<=?3
+            AND p.cleanup_pending=0
+            AND NOT EXISTS(SELECT 1 FROM durable_operation_items i WHERE i.scope_kind=e.scope_kind
+                AND i.scope_id=e.scope_id AND i.request_id=e.root_request_id AND i.phase IN ('PENDING','RUNNING'))
+            AND NOT EXISTS(SELECT 1 FROM filesystem_intents i WHERE i.scope_kind=e.scope_kind
+                AND i.scope_id=e.scope_id AND i.request_id=e.root_request_id AND i.state<>'CLEANED')";
+        let spends = format!("DELETE FROM durable_capacity_spends WHERE (scope_kind,scope_id,root_request_id) IN (
+            SELECT e.scope_kind,e.scope_id,e.root_request_id FROM durable_capacity_escrows e
+            JOIN durable_operations p ON p.scope_kind=e.scope_kind AND p.scope_id=e.scope_id AND p.request_id=e.root_request_id
+            WHERE {eligible} ORDER BY p.expires_at_ms,p.rowid LIMIT ?2)");
+        conn.execute(&spends, params![now, V3_GC_BATCH_ROWS, terminal_cutoff])?;
+        let escrow = format!("DELETE FROM durable_capacity_escrows WHERE rowid IN (
+            SELECT e.rowid FROM durable_capacity_escrows e JOIN durable_operations p
+            ON p.scope_kind=e.scope_kind AND p.scope_id=e.scope_id AND p.request_id=e.root_request_id
+            WHERE {eligible} AND NOT EXISTS(SELECT 1 FROM durable_capacity_spends c WHERE
+                c.scope_kind=e.scope_kind AND c.scope_id=e.scope_id AND c.root_request_id=e.root_request_id)
+            ORDER BY p.expires_at_ms,p.rowid LIMIT ?2)");
+        conn.execute(&escrow, params![now, V3_GC_BATCH_ROWS, terminal_cutoff])?;
+        conn.execute("DELETE FROM durable_operations WHERE rowid IN (
+            SELECT p.rowid FROM durable_operations p
+            WHERE p.phase IN ('COMMITTED','ABORTED','PARTIALLY_APPLIED')
+              AND p.expires_at_ms IS NOT NULL AND p.expires_at_ms<=?1
+              AND p.terminal_at_ms IS NOT NULL AND p.terminal_at_ms<=?3
+              AND p.cleanup_pending=0
+              AND NOT EXISTS(SELECT 1 FROM filesystem_intents i WHERE i.scope_kind=p.scope_kind
+                AND i.scope_id=p.scope_id AND i.request_id=p.request_id AND i.state<>'CLEANED')
+              AND NOT EXISTS(SELECT 1 FROM durable_operation_items i WHERE i.scope_kind=p.scope_kind
+                AND i.scope_id=p.scope_id AND i.request_id=p.request_id AND i.phase IN ('PENDING','RUNNING'))
+              AND NOT EXISTS(SELECT 1 FROM durable_capacity_escrows e WHERE e.scope_kind=p.scope_kind
+                AND e.scope_id=p.scope_id AND e.root_request_id=p.request_id)
+            ORDER BY p.expires_at_ms,p.rowid LIMIT ?2)",params![now,V3_GC_BATCH_ROWS,terminal_cutoff])?;
         Ok(())
     }
 
@@ -4930,6 +11685,7 @@ fn commit_staged_space_replace(
     files: &[FileRecord],
     kv: &[KvRecord],
     storage_category: Option<StorageCategory>,
+    public_clear: Option<(&str, &str, &SpaceClearReport)>,
 ) -> StorageResult<()> {
     let stage_meta = fs::symlink_metadata(staging_data)?;
     if is_link_like(&stage_meta) || !stage_meta.is_dir() {
@@ -4953,12 +11709,46 @@ fn commit_staged_space_replace(
         fs::create_dir_all(&data_root)?;
     }
     let internal_root = engine.space_internal_root(space_id)?;
-    let old_data = internal_root.join(format!("restore-old-{}", Uuid::new_v4().simple()));
-    fs::rename(&data_root, &old_data)?;
-    if let Err(error) = fs::rename(staging_data, &data_root) {
-        let _ = fs::rename(&old_data, &data_root);
+    let intent_id = Uuid::new_v4().to_string();
+    let request_id = format!("space-replace-{intent_id}");
+    let old_data = internal_root.join(format!("restore-old-{intent_id}"));
+    let source_rel = data_root
+        .strip_prefix(&engine.root)
+        .map_err(|_| StorageError::RecoveryRequired)?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let old_rel = old_data
+        .strip_prefix(&engine.root)
+        .map_err(|_| StorageError::RecoveryRequired)?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let stage_rel = staging_data
+        .strip_prefix(&engine.root)
+        .map_err(|_| StorageError::RecoveryRequired)?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let payload =
+        json!({"files":files.len(),"kv":kv.len(),"category":storage_category,"stage":stage_rel});
+    engine.prepare_fs_intent(
+        &intent_id,
+        space_id,
+        &request_id,
+        "SPACE_REPLACE",
+        Some(&source_rel),
+        Some(&stage_rel),
+        Some(&old_rel),
+        &payload,
+    )?;
+    if let Err(error) = fs::rename(&data_root, &old_data) {
+        engine.mark_fs_intent_aborted(&intent_id, space_id, &request_id)?;
         return Err(error.into());
     }
+    if let Err(error) = fs::rename(staging_data, &data_root) {
+        fs::rename(&old_data, &data_root)?;
+        engine.mark_fs_intent_aborted(&intent_id, space_id, &request_id)?;
+        return Err(error.into());
+    }
+    let _ = engine.transition_fs_intent(&intent_id, "FS_APPLIED");
     sync_parent(data_root.parent());
 
     let logical_bytes = files
@@ -4972,10 +11762,6 @@ fn commit_staged_space_replace(
         let tx = conn.transaction()?;
         tx.execute(
             "DELETE FROM pending_mutations WHERE space_id=?1",
-            params![space_id],
-        )?;
-        tx.execute(
-            "DELETE FROM mutation_receipts WHERE space_id=?1",
             params![space_id],
         )?;
         tx.execute(
@@ -5013,13 +11799,42 @@ fn commit_staged_space_replace(
                 params![logical_bytes as i64,files.len() as i64,now_ms(),space_id],
             )?;
         }
+        engine.complete_fs_intent(
+            &tx,
+            &intent_id,
+            space_id,
+            &request_id,
+            "space-replace",
+            &true,
+        )?;
+        if let Some((public_request, public_fingerprint, report)) = public_clear {
+            let now = now_ms();
+            let changed = tx.execute(
+                "UPDATE durable_operations SET phase='COMMITTED',result_json=?1,terminal_at_ms=?2,expires_at_ms=?3,updated_at_ms=?2 \
+                 WHERE scope_kind='space' AND scope_id=?4 AND request_id=?5 AND kind='SPACE_CLEAR' AND request_fingerprint=?6 AND phase='ADMITTED'",
+                params![serde_json::to_string(report)?,now,now.saturating_add(DURABLE_SQL_RECEIPT_TTL_MS),space_id,public_request,public_fingerprint],
+            )?;
+            if changed != 1 {
+                return Err(StorageError::RecoveryRequired);
+            }
+            sql_atomic_store(
+                &tx,
+                false,
+                space_id,
+                public_request,
+                "space-clear",
+                public_fingerprint,
+                report,
+            )?;
+        }
         tx.commit()?;
         Ok(())
     })();
     if let Err(error) = db_result {
         let failed_data = internal_root.join(format!("restore-failed-{}", Uuid::new_v4().simple()));
-        let _ = fs::rename(&data_root, &failed_data);
-        let _ = fs::rename(&old_data, &data_root);
+        fs::rename(&data_root, &failed_data)?;
+        fs::rename(&old_data, &data_root)?;
+        engine.mark_fs_intent_aborted(&intent_id, space_id, &request_id)?;
         let _ = fs::remove_dir_all(&failed_data);
         if category_changed {
             if let Err(manifest_error) =
@@ -5030,8 +11845,8 @@ fn commit_staged_space_replace(
         }
         return Err(error);
     }
-    if old_data.exists() {
-        let _ = fs::remove_dir_all(&old_data);
+    if !old_data.exists() || fs::remove_dir_all(&old_data).is_ok() {
+        let _ = engine.finish_fs_cleanup(&intent_id);
     }
     Ok(())
 }
@@ -5164,10 +11979,26 @@ fn load_native_export_tracking_manifest(
     allow_legacy_scope: bool,
 ) -> Option<NativeExportTrackingManifest> {
     let bytes = fs::read(path).ok()?;
+    parse_native_export_tracking_manifest(
+        &bytes,
+        application_id,
+        destination_identity,
+        tracking_key,
+        allow_legacy_scope,
+    )
+}
+
+fn parse_native_export_tracking_manifest(
+    bytes: &[u8],
+    application_id: &str,
+    destination_identity: &str,
+    tracking_key: &str,
+    allow_legacy_scope: bool,
+) -> Option<NativeExportTrackingManifest> {
     if bytes.len() > 16 * 1024 * 1024 {
         return None;
     }
-    let manifest = serde_json::from_slice::<NativeExportTrackingManifest>(&bytes).ok()?;
+    let manifest = serde_json::from_slice::<NativeExportTrackingManifest>(bytes).ok()?;
     if manifest.format != "vontaqfs-native-export"
         || manifest.format_version != 1
         || manifest.space_id.trim().is_empty()
@@ -5210,6 +12041,235 @@ fn manifest_checksums_by_destination(
         .collect()
 }
 
+fn secure_native_sha256(root: &NativeDirectory, relative: &Path) -> StorageResult<Option<String>> {
+    let Some(mut reader) = root.read_if_exists(relative)? else {
+        return Ok(None);
+    };
+    let mut hasher = Sha256::new();
+    let mut bytes = [0u8; 256 * 1024];
+    loop {
+        let n = reader.read(&mut bytes)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&bytes[..n]);
+    }
+    Ok(Some(digest_hex(hasher.finalize())))
+}
+
+fn resolve_export_target_secure<A: FnMut(&str) -> StorageResult<bool>>(
+    root: &NativeDirectory,
+    base: &Path,
+    relative: &Path,
+    policy: ExportConflictPolicy,
+    ask: &mut A,
+) -> StorageResult<Option<PathBuf>> {
+    if !root.exists(relative)? {
+        return Ok(Some(base.join(relative)));
+    }
+    match policy {
+        ExportConflictPolicy::Replace | ExportConflictPolicy::UpdateChanged => {
+            Ok(Some(base.join(relative)))
+        }
+        ExportConflictPolicy::Skip => Ok(None),
+        ExportConflictPolicy::Ask => {
+            let label = relative
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("existing item");
+            Ok(if ask(label)? {
+                Some(base.join(relative))
+            } else {
+                None
+            })
+        }
+        ExportConflictPolicy::Rename => {
+            for index in 1..=9999 {
+                let stem = relative
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("export");
+                let name = match relative.extension().and_then(|s| s.to_str()) {
+                    Some(ext) => format!("{stem} ({index}).{ext}"),
+                    None => format!("{stem} ({index})"),
+                };
+                let candidate = relative.with_file_name(name);
+                if !root.exists(&candidate)? {
+                    return Ok(Some(base.join(candidate)));
+                }
+            }
+            Err(StorageError::StorageUnavailable(
+                "could not choose an unused export name".into(),
+            ))
+        }
+    }
+}
+
+fn prepare_native_export_journal_secure(
+    root: &NativeDirectory,
+    context: &NativeExportJournalContext<'_>,
+) -> StorageResult<()> {
+    let journal = Path::new(".vontaqfs-export-journal.json");
+    if root.exists(journal)? {
+        let previous = format!(
+            ".vontaqfs-export-interrupted-{}-{}.json",
+            now_ms(),
+            Uuid::new_v4()
+        );
+        root.rename(journal, Path::new(&previous))?;
+    }
+    write_native_export_journal_secure(root, "running", context)
+}
+
+fn write_native_export_journal_secure(
+    root: &NativeDirectory,
+    status: &str,
+    context: &NativeExportJournalContext<'_>,
+) -> StorageResult<()> {
+    let bytes = serde_json::to_vec_pretty(&json!({
+        "format":"vontaqfs-native-export-journal", "formatVersion":1, "status":status,
+        "applicationId":context.application_id, "destinationIdentity":context.destination_identity,
+        "trackingKey":context.tracking_key, "spaceId":context.space_id, "mode":context.mode,
+        "sourcePaths":context.source_paths, "updatedAtMs":now_ms()
+    }))?;
+    root.write_atomic(Path::new(".vontaqfs-export-journal.json"), &bytes)
+}
+
+fn copy_file_secure_stage<F: Fn() -> bool, P: FnMut(u64)>(
+    source: &Path,
+    native_root: &NativeDirectory,
+    destination: &Path,
+    expected_sha256: &str,
+    must_be_new: bool,
+    is_cancelled: &F,
+    mut on_bytes: P,
+) -> StorageResult<()> {
+    if is_cancelled() {
+        return Err(StorageError::OperationCancelled);
+    }
+    let mut input = File::open(source).map_err(|_| StorageError::ExportSourceChanged)?;
+    let temporary = native_root.temporary(destination, true)?;
+    let mut output = temporary.writer()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 256 * 1024];
+    loop {
+        if is_cancelled() {
+            return Err(StorageError::OperationCancelled);
+        }
+        let read = input
+            .read(&mut buffer)
+            .map_err(|_| StorageError::ExportSourceChanged)?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+        on_bytes(read as u64);
+    }
+    output.sync_all()?;
+    if digest_hex(hasher.finalize()) != expected_sha256 {
+        return Err(StorageError::ExportSourceChanged);
+    }
+    if is_cancelled() {
+        return Err(StorageError::OperationCancelled);
+    }
+    if must_be_new {
+        temporary.publish_new()
+    } else {
+        temporary.publish()
+    }
+}
+
+// Native destination files belong to the user, not to VFS storage. Never
+// traverse a link-like parent or overwrite a link-like leaf. This preflight is
+// intentionally distinct from Core's owned storage root path validation.
+// NOTE: a path preflight alone is not a handle-relative race-proof primitive.
+// Retained legacy helper; not part of the active mutation path.
+#[allow(dead_code)]
+fn ensure_safe_native_target(
+    root: &Path,
+    target: &Path,
+    create_parents: bool,
+) -> StorageResult<()> {
+    let relative = target.strip_prefix(root).map_err(|_| {
+        StorageError::PathInvalid("native output escaped the chosen directory".into())
+    })?;
+    let base = fs::symlink_metadata(root)?;
+    if is_link_like(&base) || !base.is_dir() {
+        return Err(StorageError::PathInvalid(
+            "unsafe native destination root".into(),
+        ));
+    }
+    let mut current = root.to_path_buf();
+    let components = relative.components().collect::<Vec<_>>();
+    for (index, part) in components.iter().enumerate() {
+        let Component::Normal(name) = part else {
+            return Err(StorageError::PathInvalid(
+                "unsafe native destination component".into(),
+            ));
+        };
+        current.push(name);
+        let last = index + 1 == components.len();
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if is_link_like(&meta) => {
+                return Err(StorageError::PathInvalid(
+                    "native destination contains a symlink or reparse point".into(),
+                ))
+            }
+            Ok(meta) if last && !meta.is_file() => {
+                return Err(StorageError::PathInvalid(
+                    "native target is not a regular file".into(),
+                ))
+            }
+            Ok(meta) if !last && !meta.is_dir() => {
+                return Err(StorageError::PathInvalid(
+                    "native parent is not a directory".into(),
+                ))
+            }
+            Ok(_) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && !last && create_parents =>
+            {
+                match fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+                let meta = fs::symlink_metadata(&current)?;
+                if is_link_like(&meta) || !meta.is_dir() {
+                    return Err(StorageError::PathInvalid(
+                        "native destination parent changed to unsafe entry".into(),
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn create_unique_native_temp(target: &Path) -> StorageResult<(PathBuf, File)> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| StorageError::PathInvalid("native target has no parent".into()))?;
+    for _ in 0..16 {
+        let path = parent.join(format!(
+            ".vontaqfs-{}-{}.tmp",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(StorageError::StorageUnavailable(
+        "could not allocate a unique native temporary file".into(),
+    ))
+}
+
 fn write_native_export_tracking_manifest(
     path: &Path,
     manifest: &NativeExportTrackingManifest,
@@ -5217,9 +12277,10 @@ fn write_native_export_tracking_manifest(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let temp = path.with_extension("json.tmp");
-    fs::write(&temp, serde_json::to_vec_pretty(manifest)?)?;
-    sync_file_for_durability(&temp)?;
+    let (temp, mut file) = create_unique_native_temp(path)?;
+    file.write_all(&serde_json::to_vec_pretty(manifest)?)?;
+    file.sync_all()?;
+    drop(file);
     atomic_replace(&temp, path)?;
     sync_parent(path.parent());
     Ok(())
@@ -5265,15 +12326,16 @@ fn write_native_export_journal_at(
     if let Some(parent) = journal.parent() {
         fs::create_dir_all(parent)?;
     }
-    let temp = journal.with_extension("json.tmp");
+    let (temp, mut file) = create_unique_native_temp(journal)?;
     let bytes = serde_json::to_vec_pretty(&json!({
         "format":"vontaqfs-native-export-journal", "formatVersion":1, "status":status,
         "applicationId":context.application_id, "destinationIdentity":context.destination_identity,
         "trackingKey":context.tracking_key, "spaceId":context.space_id, "mode":context.mode,
         "sourcePaths":context.source_paths, "updatedAtMs":now_ms()
     }))?;
-    fs::write(&temp, bytes)?;
-    sync_file_for_durability(&temp)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
     atomic_replace(&temp, journal)?;
     sync_parent(journal.parent());
     Ok(())
@@ -5340,6 +12402,8 @@ fn safe_archive_name(value: &str) -> StorageResult<String> {
         format!("{value}.zip")
     })
 }
+// Retained legacy helper; not part of the active mutation path.
+#[allow(dead_code)]
 fn resolve_export_target<A: FnMut(&str) -> StorageResult<bool>>(
     target: &Path,
     policy: ExportConflictPolicy,
@@ -5400,9 +12464,10 @@ fn verify_selected_export_source<F: Fn() -> bool>(
     }
 }
 
+// Retained legacy helper; not part of the active mutation path.
+#[allow(dead_code)]
 fn copy_file_atomic_stage<F: Fn() -> bool, P: FnMut(u64)>(
     source: &Path,
-    temp: &Path,
     target: &Path,
     expected_sha256: &str,
     is_cancelled: &F,
@@ -5411,24 +12476,21 @@ fn copy_file_atomic_stage<F: Fn() -> bool, P: FnMut(u64)>(
     if is_cancelled() {
         return Err(StorageError::OperationCancelled);
     }
-    if let Some(parent) = temp.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let mut input = File::open(source).map_err(|_| StorageError::ExportSourceChanged)?;
-    let mut output = File::create(temp)?;
+    let (temp, mut output) = create_unique_native_temp(target)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 256 * 1024];
     loop {
         if is_cancelled() {
             drop(output);
-            let _ = fs::remove_file(temp);
+            let _ = fs::remove_file(&temp);
             return Err(StorageError::OperationCancelled);
         }
         let read = match input.read(&mut buffer) {
             Ok(read) => read,
             Err(_) => {
                 drop(output);
-                let _ = fs::remove_file(temp);
+                let _ = fs::remove_file(&temp);
                 return Err(StorageError::ExportSourceChanged);
             }
         };
@@ -5443,15 +12505,15 @@ fn copy_file_atomic_stage<F: Fn() -> bool, P: FnMut(u64)>(
     let observed = digest_hex(hasher.finalize());
     if observed != expected_sha256 {
         drop(output);
-        let _ = fs::remove_file(temp);
+        let _ = fs::remove_file(&temp);
         return Err(StorageError::ExportSourceChanged);
     }
     if is_cancelled() {
         drop(output);
-        let _ = fs::remove_file(temp);
+        let _ = fs::remove_file(&temp);
         return Err(StorageError::OperationCancelled);
     }
-    atomic_replace(temp, target)?;
+    atomic_replace(&temp, target)?;
     sync_parent(target.parent());
     Ok(())
 }
@@ -5482,11 +12544,21 @@ fn open_or_recover_registry(root: &Path, db: &Path) -> StorageResult<Connection>
             fs::copy(backup, db)?;
             let conn = open_registry(db)?;
             verify_registry_connection(&conn)?;
+            // A backup may predate disk/KV mutations. Do not advertise complete recovery.
+            conn.execute(
+                "UPDATE spaces SET state='recovery_required' WHERE state='healthy'",
+                [],
+            )?;
             return Ok(conn);
         }
         let conn = open_registry(db)?;
         rebuild_registry_from_manifests(root, &conn)?;
         verify_registry_connection(&conn)?;
+        // Manifests cannot reconstruct the complete KV/snapshot generation.
+        conn.execute(
+            "UPDATE spaces SET state='recovery_required' WHERE state='healthy'",
+            [],
+        )?;
         return Ok(conn);
     }
 
@@ -5510,11 +12582,19 @@ fn open_or_recover_registry(root: &Path, db: &Path) -> StorageResult<Connection>
                 fs::copy(backup, db)?;
                 let conn = open_registry(db)?;
                 verify_registry_connection(&conn)?;
+                conn.execute(
+                    "UPDATE spaces SET state='recovery_required' WHERE state='healthy'",
+                    [],
+                )?;
                 return Ok(conn);
             }
             let conn = open_registry(db)?;
             rebuild_registry_from_manifests(root, &conn)?;
             verify_registry_connection(&conn)?;
+            conn.execute(
+                "UPDATE spaces SET state='recovery_required' WHERE state='healthy'",
+                [],
+            )?;
             Ok(conn)
         }
         Err(error) => Err(error),
@@ -5532,60 +12612,246 @@ fn registry_error_is_recoverable(error: &StorageError) -> bool {
     }
 }
 
-fn open_registry(path: &Path) -> StorageResult<Connection> {
-    let conn = Connection::open(path)?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;",
-    )?;
-    // Keep a verified v1 snapshot before upgrading the registry. SQLite VACUUM
-    // INTO takes a consistent snapshot even if the source uses WAL pages.
-    let has_schema: i64 = conn.query_row(
+fn registry_schema_version(conn: &Connection) -> StorageResult<Option<i64>> {
+    let exists: i64 = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta')",
         [],
         |row| row.get(0),
     )?;
-    if has_schema != 0 {
-        let old_version: i64 =
-            conn.query_row("SELECT version FROM schema_meta LIMIT 1", [], |row| {
+    if exists == 0 {
+        return Ok(None);
+    }
+    Ok(Some(conn.query_row(
+        "SELECT version FROM schema_meta LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?))
+}
+
+fn backup_before_v3(conn: &Connection, path: &Path) -> StorageResult<()> {
+    let backups = path
+        .parent()
+        .expect("registry has parent")
+        .join("registry-backups");
+    fs::create_dir_all(&backups)?;
+    let backup = backups.join(format!(
+        "registry-{}-pre-v3-{}.sqlite3",
+        now_ms(),
+        Uuid::new_v4()
+    ));
+    let result = (|| -> StorageResult<()> {
+        // VACUUM INTO includes committed WAL pages and gives a consistent SQLite file.
+        conn.execute(
+            "VACUUM INTO ?1",
+            params![backup.to_string_lossy().to_string()],
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&backup, fs::Permissions::from_mode(0o600))?;
+        }
+        verify_registry_file(&backup)?;
+        let old: i64 = Connection::open(&backup)?.query_row(
+            "SELECT version FROM schema_meta LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if old != 2 {
+            return Err(StorageError::SchemaUnsupported(old));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&backup);
+    }
+    result?;
+    rotate_registry_backups(path.parent().and_then(Path::parent).expect("runtime root"))?;
+    Ok(())
+}
+
+fn migrate_v3(conn: &Connection) -> StorageResult<()> {
+    if registry_schema_version(conn)? == Some(3) {
+        return Ok(());
+    }
+    if registry_schema_version(conn)? != Some(2) {
+        return Err(StorageError::SchemaUnsupported(
+            registry_schema_version(conn)?.unwrap_or(-1),
+        ));
+    }
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| -> StorageResult<()> {
+        conn.execute_batch(include_str!("registry_v3.sql"))?;
+        if conn.execute("UPDATE schema_meta SET version=3 WHERE version=2", [])? != 1 {
+            return Err(StorageError::StorageCorrupt(
+                "schema v3 migration lost version precondition".into(),
+            ));
+        }
+        let violations: i64 =
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
                 row.get(0)
             })?;
-        if old_version == 1 {
-            let backups = path
-                .parent()
-                .expect("registry path has parent")
-                .join("registry-backups");
-            fs::create_dir_all(&backups)?;
-            let backup = backups.join(format!(
-                "registry-{}-pre-v2-{}.sqlite3",
-                now_ms(),
-                Uuid::new_v4()
+        if violations != 0 {
+            return Err(StorageError::StorageCorrupt(
+                "registry v3 foreign-key validation failed".into(),
             ));
-            if let Err(error) = conn.execute(
-                "VACUUM INTO ?1",
-                params![backup.to_string_lossy().to_string()],
-            ) {
-                let _ = fs::remove_file(&backup);
-                return Err(error.into());
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&backup, fs::Permissions::from_mode(0o600))?;
-            }
-            verify_registry_file(&backup)?;
-            rotate_registry_backups(
-                path.parent()
-                    .and_then(Path::parent)
-                    .expect("runtime root has parent"),
-            )?;
+        }
+        conn.execute_batch("COMMIT;")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    result
+}
+
+fn open_registry(path: &Path) -> StorageResult<Connection> {
+    let conn = Connection::open(path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    // Preflight the schema BEFORE journal-mode changes or mutating DDL.
+    if let Some(version) = registry_schema_version(&conn)? {
+        if !(1..=SCHEMA_VERSION).contains(&version) {
+            return Err(StorageError::SchemaUnsupported(version));
         }
     }
+    conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
+    if registry_schema_version(&conn)? == Some(3) {
+        ensure_native_grant_root_bindings(&conn)?;
+        ensure_retained_outcomes(&conn)?;
+        ensure_capacity_escrow_extension(&conn)?;
+        return Ok(conn);
+    }
+    // Retain legacy v1 -> v2 bootstrapping, but migrate v3 from a consistent
+    // v2 snapshot only. Never use the v3 DDL as an independent script.
     migrate(&conn)?;
+    if registry_schema_version(&conn)? == Some(2) {
+        backup_before_v3(&conn, path)?;
+        migrate_v3(&conn)?;
+    }
+    ensure_native_grant_root_bindings(&conn)?;
+    ensure_retained_outcomes(&conn)?;
+    ensure_capacity_escrow_extension(&conn)?;
     Ok(conn)
 }
 
+// Additive v3 extension for nested result credits; no new public format/version.
+// BEGIN IMMEDIATE makes reopening older development registries idempotent.
+fn ensure_capacity_escrow_extension(conn: &Connection) -> StorageResult<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| -> StorageResult<()> {
+        conn.execute_batch(include_str!("capacity_escrow.sql"))?;
+        conn.execute_batch(include_str!("cp17_retention_guards.sql"))?;
+        let violated: i64 =
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })?;
+        if violated != 0 {
+            return Err(StorageError::StorageCorrupt(
+                "capacity escrow foreign-key validation failed".into(),
+            ));
+        }
+        conn.execute_batch("COMMIT;")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    result
+}
+
+// A transactional, additive registry-v3 evidence archive. The original receipt
+// triggers still prohibit premature erasure unless the exact outcome is already
+// durably retained with immutable owner binding and expiry. No FK to deleted owners.
+fn ensure_retained_outcomes(conn: &Connection) -> StorageResult<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let outcome = (|| -> StorageResult<()> {
+        conn.execute_batch(include_str!("retained_outcomes.sql"))?;
+        // Previous CP14 checkpoints created retained_pairing_owners without
+        // proof columns. Never backfill them from an app name or new pairing.
+        ensure_column(
+            conn,
+            "retained_pairing_owners",
+            "client_instance_id",
+            "TEXT",
+        )?;
+        ensure_column(conn, "retained_pairing_owners", "credential_hash", "TEXT")?;
+        ensure_column(conn, "retained_pairing_owners", "application_kind", "TEXT")?;
+        ensure_column(
+            conn,
+            "retained_pairing_owners",
+            "application_external_id",
+            "TEXT",
+        )?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS retained_pairing_owners_proof
+            ON retained_pairing_owners(client_instance_id,credential_hash,expires_at_ms)",
+        )?;
+        let current_guard: Option<String> = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='mutation_receipts_gc_guard'",
+            [], |r| r.get(0),
+        ).optional()?;
+        if !current_guard
+            .unwrap_or_default()
+            .contains("retained_space_outcomes")
+        {
+            conn.execute_batch("DROP TRIGGER IF EXISTS mutation_receipts_gc_guard;
+                CREATE TRIGGER mutation_receipts_gc_guard BEFORE DELETE ON mutation_receipts
+                WHEN OLD.identity_version >= 3
+                AND (OLD.expires_at_ms IS NULL OR OLD.expires_at_ms > CAST(strftime('%s','now') AS INTEGER)*1000)
+                AND NOT EXISTS (SELECT 1 FROM retained_space_outcomes h
+                    WHERE h.space_id=OLD.space_id AND h.request_id=OLD.request_id
+                    AND h.operation=OLD.operation AND h.result_json=OLD.result_json
+                    AND h.created_at_ms=OLD.created_at_ms AND h.identity_version=OLD.identity_version
+                    AND h.request_fingerprint IS OLD.request_fingerprint
+                    AND h.terminal_at_ms IS OLD.terminal_at_ms
+                    AND h.expires_at_ms IS OLD.expires_at_ms)
+                BEGIN SELECT RAISE(ABORT,'MUTATION_RECEIPT_NOT_EXPIRED'); END;")?;
+        }
+        let app_guard: Option<String> = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='application_mutation_receipts_gc_guard'",
+            [], |r| r.get(0),
+        ).optional()?;
+        if !app_guard
+            .unwrap_or_default()
+            .contains("retained_application_outcomes")
+        {
+            conn.execute_batch("DROP TRIGGER IF EXISTS application_mutation_receipts_gc_guard;
+                CREATE TRIGGER application_mutation_receipts_gc_guard BEFORE DELETE ON application_mutation_receipts
+                WHEN OLD.identity_version >= 3
+                AND (OLD.expires_at_ms IS NULL OR OLD.expires_at_ms > CAST(strftime('%s','now') AS INTEGER)*1000)
+                AND NOT EXISTS (SELECT 1 FROM retained_application_outcomes h
+                    WHERE h.owner_application_id=OLD.application_id AND h.request_id=OLD.request_id
+                    AND h.operation=OLD.operation AND h.result_json=OLD.result_json
+                    AND h.created_at_ms=OLD.created_at_ms AND h.identity_version=OLD.identity_version
+                    AND h.request_fingerprint IS OLD.request_fingerprint
+                    AND h.terminal_at_ms IS OLD.terminal_at_ms
+                    AND h.expires_at_ms IS OLD.expires_at_ms)
+                BEGIN SELECT RAISE(ABORT,'APPLICATION_RECEIPT_NOT_EXPIRED'); END;")?;
+        }
+        conn.execute_batch("COMMIT;")?;
+        Ok(())
+    })();
+    if outcome.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    outcome
+}
+
+// Compatible additive v3 extension. Previously-issued path-only grants remain
+// intentionally unbound: re-selecting the folder is required before native IO.
+fn ensure_native_grant_root_bindings(conn: &Connection) -> StorageResult<()> {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS directory_grant_root_bindings (        grant_id TEXT PRIMARY KEY NOT NULL REFERENCES directory_grants(id) ON DELETE CASCADE,        root_identity TEXT NOT NULL CHECK(length(root_identity) > 0)    );")?;
+    Ok(())
+}
+
 fn migrate(conn: &Connection) -> StorageResult<()> {
+    if let Some(version) = registry_schema_version(conn)? {
+        if version == SCHEMA_VERSION {
+            return Ok(());
+        }
+        if version != 1 && version != 2 {
+            return Err(StorageError::SchemaUnsupported(version));
+        }
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_meta(version INTEGER NOT NULL);\
          INSERT INTO schema_meta(version) SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM schema_meta);\
@@ -5634,7 +12900,7 @@ fn migrate(conn: &Connection) -> StorageResult<()> {
     let version: i64 = conn.query_row("SELECT version FROM schema_meta LIMIT 1", [], |row| {
         row.get(0)
     })?;
-    if version != 1 && version != SCHEMA_VERSION {
+    if version != 1 && version != 2 {
         return Err(StorageError::SchemaUnsupported(version));
     }
     // Registry schema v2 prevents old runtimes from silently ignoring transport
@@ -5933,6 +13199,14 @@ fn finalize_file_write(
         "UPDATE spaces SET logical_bytes=MAX(0,logical_bytes + ?1),file_count=MAX(0,file_count + ?2),last_used_at_ms=?3 WHERE id=?4",
         params![bytes_delta as i64, file_delta, updated_at_ms, space_id],
     )?;
+    let pending_fingerprint: Option<String> = tx
+        .query_row(
+            "SELECT request_fingerprint FROM pending_mutations WHERE id=?1 AND space_id=?2",
+            params![request_id, space_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
     tx.execute(
         "DELETE FROM pending_mutations WHERE id=?1 AND space_id=?2",
         params![request_id, space_id],
@@ -5947,13 +13221,27 @@ fn finalize_file_write(
         format_id,
         opaque,
     };
-    store_receipt(
-        tx,
-        space_id,
-        request_id,
-        &file_write_operation(logical_path),
-        &result,
-    )?;
+    if let Some(fingerprint) = pending_fingerprint.as_deref() {
+        sql_atomic_store(
+            tx,
+            false,
+            space_id,
+            request_id,
+            &file_write_operation(logical_path),
+            fingerprint,
+            &result,
+        )?;
+    } else {
+        // An interrupted write from an older binary has no semantic identity.
+        // Preserve its legacy receipt, never invent a fingerprint on recovery.
+        store_receipt(
+            tx,
+            space_id,
+            request_id,
+            &file_write_operation(logical_path),
+            &result,
+        )?;
+    }
     Ok(result)
 }
 
@@ -5980,12 +13268,771 @@ fn kv_row(conn: &Connection, space_id: &str, key: &str) -> StorageResult<Option<
     ).optional().map_err(Into::into)
 }
 
+const DURABLE_SQL_RECEIPT_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+const V3_MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1000;
+
+/// Only enforce this on first admission; a valid historical lookup must never
+/// be refused merely because the clock advanced. Legacy opaque IDs remain
+/// governed by the pre-negotiation contract until durableReplay is advertised.
+fn validate_new_v3_operation_id(value: &str, now: i64) -> StorageResult<()> {
+    validate_new_v3_id(value, "operation-v3-", now)
+}
+
+fn validate_new_v3_request_id(value: &str, now: i64) -> StorageResult<()> {
+    validate_new_v3_id(value, "request-v3-", now)
+}
+
+fn validate_new_v3_id(value: &str, prefix: &str, now: i64) -> StorageResult<()> {
+    let encoded = value
+        .strip_prefix(prefix)
+        .ok_or(StorageError::RequestClockSkew)?;
+    let (timestamp, entropy) = encoded
+        .split_once('-')
+        .ok_or(StorageError::RequestClockSkew)?;
+    if timestamp.len() != 13
+        || !timestamp.bytes().all(|digit| digit.is_ascii_digit())
+        || entropy.len() != 32
+        || !entropy.bytes().all(|digit| digit.is_ascii_hexdigit())
+    {
+        return Err(StorageError::RequestClockSkew);
+    }
+    let started_ms = timestamp
+        .parse::<i64>()
+        .map_err(|_| StorageError::RequestClockSkew)?;
+    if started_ms > now.saturating_add(V3_MAX_FUTURE_SKEW_MS) {
+        return Err(StorageError::RequestClockSkew);
+    }
+    if started_ms < now.saturating_sub(DURABLE_SQL_RECEIPT_TTL_MS) {
+        return Err(StorageError::ResultExpired);
+    }
+    Ok(())
+}
+
+fn destination_request_fingerprint(
+    application_id: &str,
+    label: Option<&str>,
+    capability: DirectoryGrantCapability,
+    initial_id: Option<&str>,
+    reuse: bool,
+) -> StorageResult<String> {
+    semantic_fingerprint(
+        "DESTINATION_CREATE",
+        &json!({"applicationId":application_id,"label":label,
+        "capability":capability,"initialDestinationId":initial_id,"reuseInitialIfSame":reuse}),
+    )
+}
+
+fn semantic_fingerprint<T: serde::Serialize>(kind: &str, payload: &T) -> StorageResult<String> {
+    let bytes = serde_json::to_vec(&json!({"kind": kind, "payload": payload}))?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Preflight inside the same IMMEDIATE SQL transaction as admission/commit.
+/// Internal G7 primitive. Caller MUST own a BEGIN IMMEDIATE transaction and
+/// persist the immutable root parent/plan before creating its escrow. Parent
+/// occupancy is already included in the protected-actual count.
+#[allow(clippy::too_many_arguments)]
+fn reserve_capacity_escrow(
+    tx: &Transaction<'_>,
+    scope_kind: &str,
+    scope_id: &str,
+    root_request_id: &str,
+    owner: &str,
+    root_fingerprint: &str,
+    slots: i64,
+    fresh_parent_in_same_transaction: bool,
+) -> StorageResult<()> {
+    if !(0..=V3_PROTECTED_RECEIPT_CAPACITY).contains(&slots) {
+        return Err(StorageError::StorageUnavailable(
+            "durable replay result capacity reached; no mutation admitted".into(),
+        ));
+    }
+    let parent: Option<(String,String,String,String)> = tx.query_row(
+        "SELECT owner_application_id,request_fingerprint,kind,phase FROM durable_operations WHERE scope_kind=?1 AND scope_id=?2 AND request_id=?3",
+        params![scope_kind,scope_id,root_request_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+    ).optional()?;
+    if parent
+        .as_ref()
+        .map(|(o, f, k, _)| (o.as_str(), f.as_str(), k.as_str()))
+        .is_none_or(|(o, f, k)| {
+            o != owner || f != root_fingerprint || !matches!(k, "BATCH" | "MOVE_COMPOSITE")
+        })
+    {
+        return Err(StorageError::RecoveryRequired);
+    }
+    let prior: Option<(String,String,i64)> = tx.query_row(
+        "SELECT owner_application_id,root_fingerprint,total_slots FROM durable_capacity_escrows WHERE scope_kind=?1 AND scope_id=?2 AND root_request_id=?3",
+        params![scope_kind,scope_id,root_request_id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    ).optional()?;
+    if let Some((saved_owner, saved_fingerprint, saved_slots)) = prior {
+        return if saved_owner == owner
+            && saved_fingerprint == root_fingerprint
+            && saved_slots == slots
+        {
+            Ok(()) // replay never tops up the original reserve
+        } else {
+            Err(StorageError::RequestIdConflict)
+        };
+    }
+    // A legacy unfinished root WITHOUT an escrow cannot be "re-admitted".
+    // Only a freshly inserted RUNNING parent in this same transaction may
+    // receive its first reserve; older parents require explicit proof-based
+    // recovery, never blind capacity top-up.
+    if !fresh_parent_in_same_transaction
+        || parent
+            .as_ref()
+            .is_none_or(|(_, _, _, phase)| phase != "RUNNING")
+    {
+        return Err(StorageError::RecoveryRequired);
+    }
+    ensure_v3_result_capacity_slots(tx, now_ms(), slots)?;
+    let now = now_ms();
+    tx.execute("INSERT INTO durable_capacity_escrows(scope_kind,scope_id,root_request_id,owner_application_id,root_fingerprint,total_slots,remaining_slots,state,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?6,'HELD',?7,?7)",
+        params![scope_kind,scope_id,root_request_id,owner,root_fingerprint,slots,now])?;
+    Ok(())
+}
+
+/// Validate both the immutable BATCH item identity and the currently RUNNING
+/// child binding before using a credit. The owner and root are not inputs from
+/// the SDK: they originate from an admitted, held Core MutationContext.
+fn validate_batch_receipt_credit(
+    tx: &Transaction<'_>,
+    proof: &BatchReceiptCredit<'_>,
+    space_id: &str,
+    child_request_id: &str,
+    child_kind: &str,
+) -> StorageResult<()> {
+    let saved: Option<(String,String,Option<String>,String,String)> = tx.query_row(
+        "SELECT i.item_fingerprint,i.phase,i.result_json,p.owner_application_id,e.state \
+         FROM durable_operation_items i \
+         JOIN durable_operations p ON p.scope_kind=i.scope_kind AND p.scope_id=i.scope_id AND p.request_id=i.request_id \
+         JOIN durable_capacity_escrows e ON e.scope_kind=p.scope_kind AND e.scope_id=p.scope_id AND e.root_request_id=p.request_id \
+         WHERE i.scope_kind='space' AND i.scope_id=?1 AND i.request_id=?2 AND i.item_index=?3 AND p.kind='BATCH' AND p.phase='RUNNING'",
+        params![space_id,proof.context.root_request_id,proof.item_index as i64],
+        |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+    ).optional()?;
+    let Some((fingerprint, phase, payload, owner, state)) = saved else {
+        return Err(StorageError::RecoveryRequired);
+    };
+    let binding: Value =
+        serde_json::from_str(payload.as_deref().ok_or(StorageError::RecoveryRequired)?)?;
+    if fingerprint != proof.item_fingerprint
+        || phase != "RUNNING"
+        || owner != proof.context.owner_application_id
+        || state != "HELD"
+        || binding.get("childRequestId").and_then(Value::as_str) != Some(child_request_id)
+        || binding.get("kind").and_then(Value::as_str) != Some(child_kind)
+    {
+        return Err(StorageError::RequestIdConflict);
+    }
+    Ok(())
+}
+
+/// A replayed child receipt must already have an exact credit debit. A
+/// matching result from another context is not transferable proof.
+#[allow(clippy::too_many_arguments)]
+fn verify_capacity_escrow_spend(
+    tx: &Transaction<'_>,
+    scope_kind: &str,
+    scope_id: &str,
+    root_request_id: &str,
+    item_index: i64,
+    child_request_id: &str,
+    proof_kind: &str,
+    fingerprint: &str,
+    slots: i64,
+) -> StorageResult<()> {
+    let saved: Option<(i64,String,i64)> = tx.query_row(
+        "SELECT item_index,child_fingerprint,slots FROM durable_capacity_spends WHERE scope_kind=?1 AND scope_id=?2 AND root_request_id=?3 AND child_request_id=?4 AND proof_kind=?5",
+        params![scope_kind,scope_id,root_request_id,child_request_id,proof_kind],
+        |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    ).optional()?;
+    match saved {
+        None => Err(StorageError::RecoveryRequired),
+        Some((index, prior_fp, prior_slots))
+            if index == item_index && prior_fp == fingerprint && prior_slots == slots =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(StorageError::RequestIdConflict),
+    }
+}
+
+/// A spend and the matching durable parent/item/receipt MUST be written using
+/// this same transaction. Calling this in a separate committed transaction is
+/// forbidden: a freed credit without its result proof could be stolen.
+/// Returns true for new spend, false for exact same-id replay.
+#[allow(clippy::too_many_arguments)]
+fn spend_capacity_escrow(
+    tx: &Connection,
+    scope_kind: &str,
+    scope_id: &str,
+    root_request_id: &str,
+    owner: &str,
+    item_index: i64,
+    child_request_id: &str,
+    proof_kind: &str,
+    child_fingerprint: &str,
+    slots: i64,
+) -> StorageResult<bool> {
+    if slots <= 0
+        || item_index < 0
+        || child_request_id.is_empty()
+        || child_fingerprint.is_empty()
+        || !matches!(proof_kind, "PARENT" | "RECEIPT")
+    {
+        return Err(StorageError::RequestInvalid(
+            "invalid capacity escrow spend identity".into(),
+        ));
+    }
+    let prior: Option<(i64,String,i64)> = tx.query_row(
+        "SELECT item_index,child_fingerprint,slots FROM durable_capacity_spends WHERE scope_kind=?1 AND scope_id=?2 AND root_request_id=?3 AND child_request_id=?4 AND proof_kind=?5",
+        params![scope_kind,scope_id,root_request_id,child_request_id,proof_kind],
+        |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    ).optional()?;
+    if let Some((prior_index, prior_fp, prior_slots)) = prior {
+        return if prior_index == item_index && prior_fp == child_fingerprint && prior_slots == slots
+        {
+            Ok(false)
+        } else {
+            Err(StorageError::RequestIdConflict)
+        };
+    }
+    let changed = tx.execute("UPDATE durable_capacity_escrows SET remaining_slots=remaining_slots-?1,updated_at_ms=?2 WHERE scope_kind=?3 AND scope_id=?4 AND root_request_id=?5 AND owner_application_id=?6 AND state='HELD' AND remaining_slots>=?1",
+        params![slots,now_ms(),scope_kind,scope_id,root_request_id,owner])?;
+    if changed != 1 {
+        return Err(StorageError::StorageUnavailable(
+            "durable replay reserved result capacity exhausted".into(),
+        ));
+    }
+    tx.execute("INSERT INTO durable_capacity_spends(scope_kind,scope_id,root_request_id,item_index,child_request_id,proof_kind,child_fingerprint,slots,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![scope_kind,scope_id,root_request_id,item_index,child_request_id,proof_kind,child_fingerprint,slots,now_ms()])?;
+    Ok(true)
+}
+
+/// Release only provably unused credits in the SAME transaction which records
+/// the root's terminal outcome. A RUNNING/RECONCILING root retains its escrow.
+fn close_capacity_escrow(
+    tx: &Transaction<'_>,
+    scope_kind: &str,
+    scope_id: &str,
+    root_request_id: &str,
+) -> StorageResult<()> {
+    let root: Option<String> = tx.query_row(
+        "SELECT phase FROM durable_operations WHERE scope_kind=?1 AND scope_id=?2 AND request_id=?3",
+        params![scope_kind,scope_id,root_request_id], |r|r.get(0),
+    ).optional()?;
+    if !matches!(
+        root.as_deref(),
+        Some("COMMITTED" | "ABORTED" | "PARTIALLY_APPLIED")
+    ) {
+        return Err(StorageError::RecoveryRequired);
+    }
+    let unfinished: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM durable_operation_items WHERE scope_kind=?1 AND scope_id=?2 AND request_id=?3 AND phase IN ('PENDING','RUNNING')",
+        params![scope_kind,scope_id,root_request_id], |r|r.get(0),
+    )?;
+    let unproven: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM durable_capacity_spends s WHERE s.scope_kind=?1 AND s.scope_id=?2 AND s.root_request_id=?3 AND NOT EXISTS (
+            SELECT 1 FROM durable_operations p WHERE p.scope_kind=s.scope_kind AND p.scope_id=s.scope_id AND p.request_id=s.child_request_id AND p.phase='COMMITTED'
+          ) AND NOT EXISTS (
+            SELECT 1 FROM mutation_receipts r WHERE s.proof_kind='RECEIPT' AND s.scope_kind='space' AND r.space_id=s.scope_id AND r.request_id=s.child_request_id
+          ) AND NOT EXISTS (
+            SELECT 1 FROM durable_operation_items i JOIN durable_operations p
+                ON p.scope_kind=i.scope_kind AND p.scope_id=i.scope_id AND p.request_id=i.request_id
+            WHERE s.proof_kind='PARENT' AND p.kind='COPY' AND p.phase='COMMITTED'
+              AND i.scope_kind=s.scope_kind AND i.scope_id=s.scope_id
+              AND (i.request_id || ':copy:' || i.item_index)=s.child_request_id
+              AND i.phase='COMMITTED'
+          )",
+        params![scope_kind,scope_id,root_request_id], |r|r.get(0),
+    )?;
+    if unfinished != 0 || unproven != 0 {
+        return Err(StorageError::RecoveryRequired);
+    }
+    let changed = tx.execute("UPDATE durable_capacity_escrows SET remaining_slots=0,state='TERMINAL',updated_at_ms=?1 WHERE scope_kind=?2 AND scope_id=?3 AND root_request_id=?4 AND state IN ('HELD','TERMINAL')",
+        params![now_ms(),scope_kind,scope_id,root_request_id])?;
+    if changed != 1 {
+        return Err(StorageError::RecoveryRequired);
+    }
+    Ok(())
+}
+
+/// Does not reclaim an unexpired receipt or uncertain operation for capacity.
+fn ensure_v3_result_capacity(conn: &Connection, now: i64) -> StorageResult<()> {
+    ensure_v3_result_capacity_slots(conn, now, 1)
+}
+
+/// Compound admissions which persist both a parent and a receipt must reserve
+/// both rows before any filesystem side effect, not merely one quota slot.
+fn ensure_v3_result_capacity_slots(conn: &Connection, now: i64, slots: i64) -> StorageResult<()> {
+    let protected: i64 = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM mutation_receipts WHERE identity_version>=3 AND (expires_at_ms IS NULL OR expires_at_ms>?1))
+               + (SELECT COUNT(*) FROM application_mutation_receipts WHERE identity_version>=3 AND (expires_at_ms IS NULL OR expires_at_ms>?1))
+               + (SELECT COUNT(*) FROM retained_space_outcomes WHERE identity_version>=3 AND (expires_at_ms IS NULL OR expires_at_ms>?1))
+               + (SELECT COUNT(*) FROM retained_application_outcomes WHERE identity_version>=3 AND (expires_at_ms IS NULL OR expires_at_ms>?1))
+               + (SELECT COUNT(*) FROM retained_stream_outcomes WHERE expires_at_ms>?1)
+               + (SELECT COALESCE(SUM(CASE
+                    WHEN p.kind='DESTINATION_CREATE' AND p.phase IN ('ADMITTED','RECONCILING','NEEDS_REPAIR') THEN 2
+                    WHEN p.kind='COPY' AND NOT EXISTS (
+                       SELECT 1 FROM mutation_receipts r WHERE r.space_id=p.scope_id AND r.request_id=p.request_id
+                         AND r.identity_version>=3) THEN 2
+                    ELSE 1 END),0) FROM durable_operations p
+                  WHERE p.phase IN ('ADMITTED','RUNNING','CANCEL_REQUESTED','RECONCILING','NEEDS_REPAIR')
+                    OR p.expires_at_ms IS NULL OR p.expires_at_ms>?1
+                    OR EXISTS (SELECT 1 FROM filesystem_intents i
+                       WHERE i.scope_kind=p.scope_kind AND i.scope_id=p.scope_id
+                         AND i.request_id=p.request_id AND i.state<>'CLEANED')
+                    OR EXISTS (SELECT 1 FROM durable_operation_items i
+                       WHERE i.scope_kind=p.scope_kind AND i.scope_id=p.scope_id
+                         AND i.request_id=p.request_id AND i.phase IN ('PENDING','RUNNING')))
+               + (SELECT COUNT(*) FROM durable_operation_items i
+                    JOIN durable_operations p ON p.scope_kind=i.scope_kind AND p.scope_id=i.scope_id AND p.request_id=i.request_id
+                    WHERE p.kind IN ('COPY','NATIVE_IMPORT') AND i.phase IN ('PENDING','RUNNING')
+                      AND NOT EXISTS (SELECT 1 FROM mutation_receipts r
+                        WHERE r.space_id=i.scope_id AND r.request_id=json_extract(i.result_json,'$.childRequestId')
+                          AND r.identity_version>=3))
+               + (SELECT COUNT(*) FROM pending_mutations m
+                    JOIN durable_capacity_spends c ON c.scope_kind='space' AND c.scope_id=m.space_id
+                      AND c.child_request_id=m.id AND c.proof_kind='RECEIPT'
+                    WHERE NOT EXISTS (SELECT 1 FROM mutation_receipts r WHERE r.space_id=m.space_id AND r.request_id=m.id))
+               + (SELECT COALESCE(SUM(remaining_slots),0) FROM durable_capacity_escrows)",
+        params![now], |row| row.get(0),
+    )?;
+    if slots < 0
+        || protected > V3_PROTECTED_RECEIPT_CAPACITY.saturating_sub(scoped_capacity_slots(slots))
+    {
+        return Err(StorageError::StorageUnavailable(
+            "durable replay result capacity reached; no mutation admitted".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The checksum identifies the committed payload; preconditions and explicit
+/// metadata are part of the intent even when the resulting bytes are equal.
+/// This identity is recorded before the filesystem swap and survives restart.
+fn file_write_fingerprint(
+    logical_path: &str,
+    etag: &str,
+    size: u64,
+    if_match: Option<&str>,
+    metadata: Option<&FileMetadata>,
+) -> StorageResult<String> {
+    semantic_fingerprint(
+        "file-write",
+        &json!({
+            "path": logical_path,
+            "sha256": etag,
+            "size": size,
+            "ifMatch": if_match,
+            "metadata": {
+                "contentType": metadata.and_then(|m| m.content_type.as_deref()),
+                "formatId": metadata.and_then(|m| m.format_id.as_deref()),
+                "opaque": metadata.and_then(|m| m.opaque),
+            }
+        }),
+    )
+}
+
+/// Shared v3 receipt status validation for live and retained owners. Status
+/// never changes the underlying result or admits a new mutation.
+type SqlReceiptStatusRow = (
+    String,
+    String,
+    i64,
+    Option<String>,
+    i64,
+    Option<i64>,
+    Option<i64>,
+);
+fn sql_receipt_status_outcome(
+    scope_kind: &str,
+    scope_id: &str,
+    request_id: &str,
+    row: Option<SqlReceiptStatusRow>,
+) -> StorageResult<Option<serde_json::Value>> {
+    let Some((operation, raw, version, fingerprint, created, terminal, expires)) = row else {
+        return Ok(None);
+    };
+    if expires.is_some_and(|until| until <= now_ms()) {
+        return Err(StorageError::ResultExpired);
+    }
+    // Preserve the historical v3 receipt validation contract: missing
+    // fingerprint or expiry is uncertain, while older terminal metadata is
+    // reported as stored instead of being silently reinterpreted.
+    if version >= 3 && (expires.is_none() || fingerprint.is_none()) {
+        return Err(StorageError::RecoveryRequired);
+    }
+    Ok(Some(serde_json::json!({
+        "scopeKind": scope_kind, "scopeId": scope_id, "requestId": request_id,
+        "operation": operation, "result": serde_json::from_str::<serde_json::Value>(&raw)?,
+        "identityVersion": version, "requestFingerprint": fingerprint,
+        "createdAtMs": created, "terminalAtMs": terminal, "expiresAtMs": expires,
+    })))
+}
+
+/// Only these two table names are possible; never interpolate untrusted SQL.
+fn sql_identity_table(application_scope: bool) -> &'static str {
+    if application_scope {
+        "application_mutation_receipts"
+    } else {
+        "mutation_receipts"
+    }
+}
+fn sql_identity_column(application_scope: bool) -> &'static str {
+    if application_scope {
+        "application_id"
+    } else {
+        "space_id"
+    }
+}
+fn sql_atomic_receipt<T: serde::de::DeserializeOwned>(
+    conn: &Connection,
+    application_scope: bool,
+    owner: &str,
+    request_id: &str,
+    fingerprint: &str,
+) -> StorageResult<Option<T>> {
+    sql_atomic_receipt_with_reserved(
+        conn,
+        application_scope,
+        owner,
+        request_id,
+        fingerprint,
+        false,
+    )
+}
+
+// `reserved_credit` is only passed after the private Core context verifies
+// a RUNNING BATCH child with its immutable saved item fingerprint. Never use
+// it for public standalone admissions or unrelated COPY/import reservations.
+fn sql_atomic_receipt_with_reserved<T: serde::de::DeserializeOwned>(
+    conn: &Connection,
+    application_scope: bool,
+    owner: &str,
+    request_id: &str,
+    fingerprint: &str,
+    reserved_credit: bool,
+) -> StorageResult<Option<T>> {
+    let query = format!("SELECT identity_version,request_fingerprint,result_json,expires_at_ms FROM {} WHERE {}=?1 AND request_id=?2",
+        sql_identity_table(application_scope), sql_identity_column(application_scope));
+    let stored: Option<(i64, Option<String>, String, Option<i64>)> = conn
+        .query_row(&query, params![owner, request_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .optional()?;
+    match stored {
+        None => {
+            let now = now_ms();
+            if request_id.starts_with("request-v3-") {
+                validate_new_v3_request_id(request_id, now)?;
+            }
+            // A COPY or NATIVE_IMPORT parent may have reserved this exact
+            // child's receipt durably before its first filesystem effect.
+            // Substitution of the reserved slot must not require a *second*
+            // vacant slot when other requests have filled the remaining quota.
+            // Ambiguous ownership (duplicate reservations) fails closed.
+            let reservations: i64 = if application_scope {
+                0
+            } else {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM durable_operation_items i
+                     JOIN durable_operations p ON p.scope_kind=i.scope_kind AND p.scope_id=i.scope_id AND p.request_id=i.request_id
+                     WHERE i.scope_kind='space' AND i.scope_id=?1 AND p.kind IN ('COPY','NATIVE_IMPORT')
+                       AND p.phase IN ('RUNNING','RECONCILING') AND i.phase IN ('PENDING','RUNNING')
+                       AND json_extract(i.result_json,'$.childRequestId')=?2",
+                    params![owner, request_id], |row| row.get(0),
+                )?
+            };
+            if reservations > 1 || (reserved_credit && reservations != 0) {
+                return Err(StorageError::RecoveryRequired);
+            }
+            if reservations == 1 || reserved_credit {
+                ensure_v3_result_capacity_slots(conn, now, 0)?;
+            } else {
+                ensure_v3_result_capacity(conn, now)?;
+            }
+            Ok(None)
+        }
+        Some((version, stored_fingerprint, json, expires_at))
+            if version >= 3 && stored_fingerprint.as_deref() == Some(fingerprint) =>
+        {
+            if expires_at.is_some_and(|expiry| expiry <= now_ms()) {
+                return Err(StorageError::ResultExpired);
+            }
+            Ok(Some(serde_json::from_str(&json)?))
+        }
+        Some((version, fingerprint, _, _)) if version < 3 || fingerprint.is_none() => {
+            Err(StorageError::OutcomeUnknown)
+        }
+        Some(_) => Err(StorageError::RequestIdConflict),
+    }
+}
+fn sql_atomic_store<T: serde::Serialize>(
+    conn: &Connection,
+    application_scope: bool,
+    owner: &str,
+    request_id: &str,
+    operation: &str,
+    fingerprint: &str,
+    result: &T,
+) -> StorageResult<()> {
+    let now = now_ms();
+    if !application_scope && active_capacity_credit().is_some() {
+        // Already-funded COPY file item or WRITE journal: no second debit.
+        // COPY root's two-slot parent proof also includes its final receipt.
+        let prepaid = prepaid_child_proof(conn, owner, request_id)?;
+        if !prepaid {
+            let _ = spend_scoped_proof(conn, owner, request_id, "RECEIPT", fingerprint, 1)?;
+        }
+    }
+    let statement = format!("INSERT INTO {} ({},request_id,operation,result_json,created_at_ms,identity_version,request_fingerprint,terminal_at_ms,expires_at_ms) VALUES(?1,?2,?3,?4,?5,3,?6,?5,?7)",
+        sql_identity_table(application_scope), sql_identity_column(application_scope));
+    conn.execute(
+        &statement,
+        params![
+            owner,
+            request_id,
+            operation,
+            serde_json::to_string(result)?,
+            now,
+            fingerprint,
+            now.saturating_add(DURABLE_SQL_RECEIPT_TTL_MS)
+        ],
+    )?;
+    Ok(())
+}
+
+/// Semantic identity must remain computable after deleting the registry owner.
+fn owner_deletion_fingerprint(kind: &str, scope_id: &str) -> StorageResult<String> {
+    semantic_fingerprint(kind, &json!({"targetId":scope_id}))
+}
+
+/// Consult a durable owner-deletion parent before accessing a removed owner row.
+/// An unfinished operation is uncertain even if the target directory is absent.
+fn owner_deletion_replay<T: serde::de::DeserializeOwned>(
+    conn: &Connection,
+    scope_kind: &str,
+    scope_id: &str,
+    request_id: &str,
+    kind: &str,
+    target_id: &str,
+) -> StorageResult<Option<T>> {
+    let expected = owner_deletion_fingerprint(kind, target_id)?;
+    let prior: Option<DurableOperationDbRow> = conn.query_row(
+        "SELECT kind,request_fingerprint,phase,result_json,expires_at_ms FROM durable_operations \
+         WHERE scope_kind=?1 AND scope_id=?2 AND request_id=?3",
+        params![scope_kind,scope_id,request_id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+    ).optional()?;
+    let Some((saved_kind, saved_fingerprint, phase, result, expiry)) = prior else {
+        return Ok(None);
+    };
+    if saved_kind != kind || saved_fingerprint != expected {
+        return Err(StorageError::RequestIdConflict);
+    }
+    if phase != "COMMITTED" {
+        return Err(StorageError::RecoveryRequired);
+    }
+    if expiry.is_none_or(|at| at <= now_ms()) {
+        return Err(StorageError::ResultExpired);
+    }
+    let result = result.ok_or(StorageError::RecoveryRequired)?;
+    Ok(Some(serde_json::from_str(&result)?))
+}
+
+/// The filesystem operation parent is authoritative if its SQL receipt is not
+/// yet available. Compare the immutable intent before reading the old result;
+/// neither a legacy receipt nor an unfinished intent proves a safe replay.
+fn fs_operation_replay<T: serde::de::DeserializeOwned>(
+    conn: &Connection,
+    space_id: &str,
+    request_id: &str,
+    kind: &str,
+    fingerprint: &str,
+) -> StorageResult<Option<T>> {
+    let existing: Option<DurableOperationDbRow> = conn.query_row(
+        "SELECT kind,request_fingerprint,phase,result_json,expires_at_ms FROM durable_operations \
+         WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2",
+        params![space_id, request_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    ).optional()?;
+    if let Some((stored_kind, stored_fp, phase, result, expires_at)) = existing {
+        if stored_kind != kind || stored_fp != fingerprint {
+            return Err(StorageError::RequestIdConflict);
+        }
+        if phase != "COMMITTED" {
+            return Err(StorageError::RecoveryRequired);
+        }
+        if expires_at.is_none_or(|expiry| expiry <= now_ms()) {
+            return Err(StorageError::ResultExpired);
+        }
+        let result = result.ok_or(StorageError::RecoveryRequired)?;
+        return Ok(Some(serde_json::from_str(&result)?));
+    }
+    sql_atomic_receipt(conn, false, space_id, request_id, fingerprint)
+}
+
+/// Recover terminal COPY from its original immutable operation arguments,
+/// parent fingerprint and matching committed SQL receipt. Re-reading a live
+/// source manifest here would reject a legitimate replay after later writes.
+/// An uncertain parent is never turned into permission to execute new work.
+fn committed_copy_replay_before_source(
+    conn: &Connection,
+    space_id: &str,
+    request_id: &str,
+    operation: &str,
+) -> StorageResult<Option<u64>> {
+    let parent: Option<DurableOperationDbRow> = conn.query_row(
+        "SELECT kind,request_fingerprint,phase,result_json,expires_at_ms FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2",
+        params![space_id,request_id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+    ).optional()?;
+    let Some((kind, fingerprint, phase, result, expires)) = parent else {
+        return Ok(None);
+    };
+    if kind != "COPY" {
+        return Err(StorageError::RequestIdConflict);
+    }
+    if phase != "COMMITTED" {
+        if phase == "RUNNING" {
+            // New parents have durable immutable arguments. Older RUNNING
+            // parents may lack this field, so never infer success from them.
+            let intent = result
+                .as_deref()
+                .and_then(|v| serde_json::from_str::<Value>(v).ok())
+                .and_then(|v| {
+                    v.get("copyIntent")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                });
+            if intent.as_deref().is_some_and(|prior| prior != operation) {
+                return Err(StorageError::RequestIdConflict);
+            }
+            return Ok(None);
+        }
+        return Err(StorageError::RecoveryRequired);
+    }
+    if expires.is_none_or(|at| at <= now_ms()) {
+        return Err(StorageError::ResultExpired);
+    }
+    let receipt: Option<(String, String, String, Option<i64>, i64)> = conn.query_row(
+        "SELECT operation,request_fingerprint,result_json,expires_at_ms,identity_version FROM mutation_receipts WHERE space_id=?1 AND request_id=?2",
+        params![space_id,request_id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+    ).optional()?;
+    let (stored_operation, stored_fingerprint, receipt_result, receipt_expiry, version) =
+        receipt.ok_or(StorageError::RecoveryRequired)?;
+    if stored_operation != operation {
+        return Err(StorageError::RequestIdConflict);
+    }
+    if stored_fingerprint != fingerprint
+        || version < 3
+        || receipt_expiry.is_none_or(|at| at <= now_ms())
+    {
+        return Err(StorageError::RecoveryRequired);
+    }
+    let original: u64 = serde_json::from_str(&result.ok_or(StorageError::RecoveryRequired)?)?;
+    let committed: u64 = serde_json::from_str(&receipt_result)?;
+    if original != committed {
+        return Err(StorageError::RecoveryRequired);
+    }
+    Ok(Some(committed))
+}
+
+/// Composite COPY intentionally allows an already-admitted RUNNING parent
+/// to resume only through its existing per-item journal and child receipts.
+/// A completed parent is replayed without executing any child a second time.
+fn composite_copy_replay<T: serde::de::DeserializeOwned>(
+    conn: &Connection,
+    space_id: &str,
+    request_id: &str,
+    fingerprint: &str,
+) -> StorageResult<Option<T>> {
+    let existing: Option<DurableOperationDbRow> = conn.query_row(
+        "SELECT kind,request_fingerprint,phase,result_json,expires_at_ms FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2",
+        params![space_id,request_id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+    ).optional()?;
+    if let Some((kind, recorded, phase, result, expires)) = existing {
+        if kind != "COPY" {
+            return Err(StorageError::RequestIdConflict);
+        }
+        // For a RUNNING parent, a different current source manifest is not
+        // evidence of a changed caller request; refuse to resume instead.
+        if recorded != fingerprint {
+            return Err(if phase == "RUNNING" {
+                StorageError::RecoveryRequired
+            } else {
+                StorageError::RequestIdConflict
+            });
+        }
+        if phase == "RUNNING" {
+            return Ok(None);
+        }
+        if phase != "COMMITTED" {
+            return Err(StorageError::RecoveryRequired);
+        }
+        if expires.is_none_or(|at| at <= now_ms()) {
+            return Err(StorageError::ResultExpired);
+        }
+        let result = result.ok_or(StorageError::RecoveryRequired)?;
+        return Ok(Some(serde_json::from_str(&result)?));
+    }
+    sql_atomic_receipt(conn, false, space_id, request_id, fingerprint)
+}
+
+/// Stream status is read-only. For v3, the historical file receipt must be
+/// fingerprinted and still retained; the legacy receipt helper deliberately
+/// rejects versioned IDs and is NOT sufficient for recovered stream status.
+/// Original pairing authorization is enforced in resolve_stream_operation.
+fn confirmed_stream_file_receipt(
+    conn: &Connection,
+    space_id: &str,
+    request_id: &str,
+    path: &str,
+) -> StorageResult<Option<FileRecord>> {
+    let operation = file_write_operation(path);
+    if !request_id.starts_with("request-v3-") {
+        return receipt::<FileRecord>(conn, space_id, request_id, &operation);
+    }
+    let evidence: Option<StreamReceiptDbRow> = conn.query_row(
+        "SELECT operation,identity_version,request_fingerprint,expires_at_ms,result_json FROM mutation_receipts WHERE space_id=?1 AND request_id=?2",
+        params![space_id, request_id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+    ).optional()?;
+    let Some((stored_op, version, fingerprint, expiry, result)) = evidence else {
+        return Ok(None);
+    };
+    if stored_op != operation {
+        return Err(StorageError::RequestIdConflict);
+    }
+    if version < 3
+        || fingerprint.as_deref().is_none_or(|value| {
+            value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    {
+        return Err(StorageError::RecoveryRequired);
+    }
+    let expiry = expiry.ok_or(StorageError::RecoveryRequired)?;
+    if expiry <= now_ms() {
+        return Err(StorageError::ResultExpired);
+    }
+    Ok(Some(serde_json::from_str(&result)?))
+}
+
 fn receipt<T: serde::de::DeserializeOwned>(
     conn: &Connection,
     space_id: &str,
     request_id: &str,
     operation: &str,
 ) -> StorageResult<Option<T>> {
+    // This legacy receipt helper has no semantic payload fingerprint and is
+    // subject to legacy retention. It MUST NOT consume new versioned IDs.
+    if request_id.starts_with("request-v3-") {
+        return Err(StorageError::RequestIdMigrationRequired);
+    }
     if let Some((stored_operation, json)) = conn.query_row(
         "SELECT operation,result_json FROM mutation_receipts WHERE space_id=?1 AND request_id=?2",
         params![space_id, request_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
@@ -6004,18 +14051,24 @@ fn store_receipt<T: serde::Serialize>(
     result: &T,
 ) -> StorageResult<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO mutation_receipts(space_id,request_id,operation,result_json,created_at_ms) VALUES(?1,?2,?3,?4,?5)",
+        "INSERT INTO mutation_receipts(space_id,request_id,operation,result_json,created_at_ms) VALUES(?1,?2,?3,?4,?5)",
         params![space_id, request_id, operation, serde_json::to_string(result)?, now_ms()],
     )?;
     Ok(())
 }
 
+// Retained legacy helper; not part of the active mutation path.
+#[allow(dead_code)]
 fn application_receipt<T: serde::de::DeserializeOwned>(
     conn: &Connection,
     application_id: &str,
     request_id: &str,
     operation: &str,
 ) -> StorageResult<Option<T>> {
+    // Legacy application receipts are not evidence of v3 semantic replay.
+    if request_id.starts_with("request-v3-") {
+        return Err(StorageError::RequestIdMigrationRequired);
+    }
     if let Some((stored_operation, json)) = conn.query_row(
         "SELECT operation,result_json FROM application_mutation_receipts WHERE application_id=?1 AND request_id=?2",
         params![application_id, request_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
@@ -6026,6 +14079,8 @@ fn application_receipt<T: serde::de::DeserializeOwned>(
     Ok(None)
 }
 
+// Retained legacy helper; not part of the active mutation path.
+#[allow(dead_code)]
 fn store_application_receipt<T: serde::Serialize>(
     conn: &Connection,
     application_id: &str,
@@ -6034,7 +14089,7 @@ fn store_application_receipt<T: serde::Serialize>(
     result: &T,
 ) -> StorageResult<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO application_mutation_receipts(application_id,request_id,operation,result_json,created_at_ms) VALUES(?1,?2,?3,?4,?5)",
+        "INSERT INTO application_mutation_receipts(application_id,request_id,operation,result_json,created_at_ms) VALUES(?1,?2,?3,?4,?5)",
         params![application_id, request_id, operation, serde_json::to_string(result)?, now_ms()],
     )?;
     Ok(())
@@ -6452,6 +14507,34 @@ where
     Ok(result)
 }
 
+/// Compare the physical scan to recorded durable index evidence. This check is
+/// intentionally read-only: unexpected external modifications require a
+/// separately authorized repair and cannot silently adjust usage counters.
+fn scan_matches_index(
+    conn: &Connection,
+    space_id: &str,
+    scan: &FileIndexScan,
+) -> StorageResult<bool> {
+    let mut stmt = conn.prepare(
+        "SELECT logical_path,etag,size FROM file_entries WHERE space_id=?1 ORDER BY logical_path",
+    )?;
+    let indexed = stmt
+        .query_map(params![space_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if indexed.len() != scan.files.len() {
+        return Ok(false);
+    }
+    Ok(indexed.iter().zip(scan.files.iter()).all(|(old, new)| {
+        old.0 == new.path && old.1 == new.etag && u64::try_from(old.2).ok() == Some(new.size)
+    }))
+}
+
 fn count_index_delta(previous: &HashMap<String, FileRecord>, current: &[ScannedFile]) -> u64 {
     let current_map = current
         .iter()
@@ -6470,6 +14553,8 @@ fn count_index_delta(previous: &HashMap<String, FileRecord>, current: &[ScannedF
     delta
 }
 
+// Retained legacy helper; not part of the active mutation path.
+#[allow(dead_code)]
 fn scan_usage_cancellable<F>(root: &Path, is_cancelled: &F) -> StorageResult<(u64, u64)>
 where
     F: Fn() -> bool,
@@ -6503,6 +14588,8 @@ where
     Ok((bytes, files))
 }
 
+// Retained legacy helper; not part of the active mutation path.
+#[allow(dead_code)]
 fn clear_directory_contents_preserving_root(root: &Path) -> StorageResult<()> {
     fn verify_tree(path: &Path) -> StorageResult<()> {
         for entry in fs::read_dir(path)?.filter_map(Result::ok) {
@@ -6574,6 +14661,10 @@ struct ExternalImportItem {
     source: PathBuf,
     relative_path: String,
     size: u64,
+    /// The semantic identity of source bytes at planning time. Comparing the
+    /// streamed temp against this digest blocks changed sources from being
+    /// published as the committed member of an immutable import plan.
+    sha256: String,
 }
 
 fn collect_external_import_items<F>(
@@ -6693,6 +14784,7 @@ fn external_import_file_item(
         source: path.to_path_buf(),
         relative_path,
         size: metadata.len(),
+        sha256: sha256_file(path)?,
     })
 }
 
@@ -6761,8 +14853,47 @@ fn prepare_native_import_journal(
     mode: NativeImportMode,
     source_label: &str,
     target_root: &str,
+    resume: bool,
 ) -> StorageResult<()> {
-    write_native_import_journal(
+    let internal = engine.space_internal_root(space_id)?;
+    let path = native_import_journal_path(&internal, request_id);
+    if resume {
+        match fs::symlink_metadata(&path) {
+            Ok(meta) => {
+                if is_link_like(&meta) || !meta.is_file() {
+                    return Err(StorageError::RecoveryRequired);
+                }
+                let previous: Value = serde_json::from_slice(&fs::read(&path)?)?;
+                if previous.get("format").and_then(Value::as_str)
+                    != Some("vontaqfs-native-import-journal")
+                    || previous.get("requestId").and_then(Value::as_str) != Some(request_id)
+                    || previous.get("mode") != Some(&serde_json::to_value(mode)?)
+                    || previous.get("sourceLabel").and_then(Value::as_str) != Some(source_label)
+                    || previous.get("targetRoot").and_then(Value::as_str) != Some(target_root)
+                {
+                    return Err(StorageError::RequestIdConflict);
+                }
+                // Immutable source/child plan lives in SQLite, not the journal.
+                return write_native_import_journal_with_mode(
+                    engine,
+                    space_id,
+                    request_id,
+                    "running",
+                    mode,
+                    source_label,
+                    target_root,
+                    false,
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Crash after the immutable all-PENDING SQL plan but before
+                // first journal publication. The plan gate proved no RUNNING
+                // child, so publishing a new marker is safe.
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    write_native_import_journal_with_mode(
         engine,
         space_id,
         request_id,
@@ -6770,7 +14901,16 @@ fn prepare_native_import_journal(
         mode,
         source_label,
         target_root,
+        true,
     )
+}
+fn native_import_journal_path(internal: &Path, request_id: &str) -> PathBuf {
+    // The request ID is untrusted. Derive an opaque filename rather than
+    // interpreting it as a path, and never share one mutable journal per space.
+    internal.join(format!(
+        "native-import-{}.json",
+        sha256_hex(request_id.as_bytes())
+    ))
 }
 fn write_native_import_journal(
     engine: &StorageEngine,
@@ -6781,23 +14921,140 @@ fn write_native_import_journal(
     source_label: &str,
     target_root: &str,
 ) -> StorageResult<()> {
+    write_native_import_journal_with_mode(
+        engine,
+        space_id,
+        request_id,
+        status,
+        mode,
+        source_label,
+        target_root,
+        false,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn write_native_import_journal_with_mode(
+    engine: &StorageEngine,
+    space_id: &str,
+    request_id: &str,
+    status: &str,
+    mode: NativeImportMode,
+    source_label: &str,
+    target_root: &str,
+    first_admission: bool,
+) -> StorageResult<()> {
     let internal = engine.space_internal_root(space_id)?;
-    fs::create_dir_all(&internal)?;
-    let path = internal.join("native-import-journal.json");
-    let temp = internal.join("native-import-journal.json.tmp");
-    let body = json!({"format":"vontaqfs-native-import-journal","formatVersion":1,"requestId":request_id,"status":status,"mode":mode,"sourceLabel":source_label,"targetRoot":target_root,"updatedAtMs":now_ms()});
+    let path = native_import_journal_path(&internal, request_id);
+    let temp = internal.join(format!(".native-import-{}.tmp", Uuid::new_v4()));
+    let body = json!({"format":"vontaqfs-native-import-journal","formatVersion":1,
+        "requestId":request_id,"status":status,"mode":mode,
+        "sourceLabel":source_label,"targetRoot":target_root,"updatedAtMs":now_ms()});
     {
-        let mut file = File::create(&temp)?;
-        file.write_all(&serde_json::to_vec_pretty(&body)?)?;
-        file.sync_all()?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        if let Err(error) = (|| -> StorageResult<()> {
+            file.write_all(&serde_json::to_vec_pretty(&body)?)?;
+            file.sync_all()?;
+            Ok(())
+        })() {
+            let _ = fs::remove_file(&temp);
+            return Err(error);
+        }
     }
-    atomic_replace(&temp, &path)?;
-    sync_parent(path.parent());
+    if first_admission {
+        // The link operation is an atomic no-replace publish. A second
+        // worker sharing a requestId cannot overwrite existing evidence.
+        if let Err(error) = fs::hard_link(&temp, &path) {
+            let _ = fs::remove_file(&temp);
+            return if error.kind() == std::io::ErrorKind::AlreadyExists {
+                Err(StorageError::OutcomeUnknown)
+            } else {
+                Err(error.into())
+            };
+        }
+        let _ = fs::remove_file(&temp);
+    } else if let Err(error) = atomic_replace(&temp, &path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    sync_parent(Some(&internal));
     Ok(())
 }
-fn clear_native_import_journal(engine: &StorageEngine, space_id: &str) {
+fn clear_native_import_journal(engine: &StorageEngine, space_id: &str, request_id: &str) {
     if let Ok(internal) = engine.space_internal_root(space_id) {
-        let _ = fs::remove_file(internal.join("native-import-journal.json"));
+        let path = native_import_journal_path(&internal, request_id);
+        if fs::remove_file(path).is_ok() {
+            sync_parent(Some(&internal));
+        }
+    }
+}
+
+/// Immutable private selected-generation staging for native export.
+/// Retains only the files selected by this job, not an entire space snapshot.
+/// Drop cleans the private staging directory on every normal exit.
+struct NativeExportCapture {
+    root: PathBuf,
+}
+impl NativeExportCapture {
+    fn create<F: Fn() -> bool>(
+        engine: &StorageEngine,
+        live_root: &Path,
+        selected: &[ScannedFile],
+        cancelled: &F,
+    ) -> StorageResult<Self> {
+        let parent = engine.root.join("runtime/native-export-capture");
+        fs::create_dir_all(&parent)?;
+        let root = parent.join(Uuid::new_v4().to_string());
+        fs::create_dir(&root)?;
+        let stage = Self { root };
+        let mut buffer = [0u8; 128 * 1024];
+        for entry in selected {
+            if cancelled() {
+                return Err(StorageError::OperationCancelled);
+            }
+            let logical = LogicalPath::parse(&entry.path)?;
+            let source = live_root.join(logical.relative());
+            ensure_no_symlink_escape(live_root, &source)?;
+            let mut reader = File::open(&source)?;
+            if !reader.metadata()?.is_file() {
+                return Err(StorageError::ExportSourceChanged);
+            }
+            let output = stage.root.join(logical.relative());
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut writer = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&output)?;
+            let mut size = 0u64;
+            let mut sha = Sha256::new();
+            loop {
+                if cancelled() {
+                    return Err(StorageError::OperationCancelled);
+                }
+                let n = reader.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+                writer.write_all(&buffer[..n])?;
+                sha.update(&buffer[..n]);
+                size = size.saturating_add(n as u64);
+            }
+            writer.sync_all()?;
+            if size != entry.size || digest_hex(sha.finalize()) != entry.etag {
+                return Err(StorageError::ExportSourceChanged);
+            }
+        }
+        sync_parent(Some(&stage.root));
+        Ok(stage)
+    }
+}
+impl Drop for NativeExportCapture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
@@ -6823,7 +15080,7 @@ impl<W: Write + Seek> SimpleZipWriter<W> {
             name,
             &mut &bytes[..],
             bytes.len() as u64,
-            crc32_bytes(bytes),
+            Some(crc32_bytes(bytes)),
             None,
             &|| false,
         )
@@ -6837,9 +15094,16 @@ impl<W: Write + Seek> SimpleZipWriter<W> {
     where
         F: Fn() -> bool,
     {
-        let (size, crc) = file_crc32_cancellable(path, is_cancelled)?;
+        // Open the source once; CRC and ZIP64 header are patched after copying.
+        // No preliminary CRC read or reopening a potentially replaced path.
         let mut file = File::open(path)?;
-        self.add_reader(name, &mut file, size, crc, None, is_cancelled)
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(StorageError::PathInvalid(
+                "ZIP source is not a regular file".into(),
+            ));
+        }
+        self.add_reader(name, &mut file, meta.len(), None, None, is_cancelled)
     }
     fn add_file_verified_cancellable<F>(
         &mut self,
@@ -6851,17 +15115,18 @@ impl<W: Write + Seek> SimpleZipWriter<W> {
     where
         F: Fn() -> bool,
     {
-        let (size, crc) = match file_crc32_cancellable(path, is_cancelled) {
-            Ok(value) => value,
-            Err(StorageError::OperationCancelled) => return Err(StorageError::OperationCancelled),
-            Err(_) => return Err(StorageError::ExportSourceChanged),
-        };
         let mut file = File::open(path).map_err(|_| StorageError::ExportSourceChanged)?;
+        let meta = file
+            .metadata()
+            .map_err(|_| StorageError::ExportSourceChanged)?;
+        if !meta.is_file() {
+            return Err(StorageError::ExportSourceChanged);
+        }
         self.add_reader(
             name,
             &mut file,
-            size,
-            crc,
+            meta.len(),
+            None,
             Some(expected_sha256),
             is_cancelled,
         )
@@ -6871,7 +15136,7 @@ impl<W: Write + Seek> SimpleZipWriter<W> {
         name: &str,
         reader: &mut R,
         size: u64,
-        crc32: u32,
+        expected_crc32: Option<u32>,
         expected_sha256: Option<&str>,
         is_cancelled: &F,
     ) -> StorageResult<()> {
@@ -6890,7 +15155,7 @@ impl<W: Write + Seek> SimpleZipWriter<W> {
         write_u16(&mut self.inner, 0)?;
         write_u16(&mut self.inner, 0)?;
         write_u16(&mut self.inner, 33)?;
-        write_u32(&mut self.inner, crc32)?;
+        write_u32(&mut self.inner, expected_crc32.unwrap_or(0))?;
         write_u32(&mut self.inner, u32::MAX)?;
         write_u32(&mut self.inner, u32::MAX)?;
         write_u16(&mut self.inner, name_bytes.len() as u16)?;
@@ -6928,7 +15193,7 @@ impl<W: Write + Seek> SimpleZipWriter<W> {
             written = written.saturating_add(read as u64);
         }
         let observed_crc = !observed_crc;
-        if written != size || observed_crc != crc32 {
+        if written != size || expected_crc32.is_some_and(|expected| observed_crc != expected) {
             return Err(if expected_sha256.is_some() {
                 StorageError::ExportSourceChanged
             } else {
@@ -6941,9 +15206,18 @@ impl<W: Write + Seek> SimpleZipWriter<W> {
                 return Err(StorageError::ExportSourceChanged);
             }
         }
+        // The local header was written with a zero CRC for streaming sources.
+        // Back-patch it only after the complete single pass has been validated.
+        // The central directory is subsequently written from the same bytes.
+        if expected_crc32.is_none() {
+            let end = self.inner.stream_position()?;
+            self.inner.seek(SeekFrom::Start(offset + 14))?;
+            write_u32(&mut self.inner, observed_crc)?;
+            self.inner.seek(SeekFrom::Start(end))?;
+        }
         self.entries.push(ZipCentralEntry {
             name: name_bytes.to_vec(),
-            crc32,
+            crc32: observed_crc,
             size,
             offset,
         });
@@ -7023,6 +15297,8 @@ fn crc32_bytes(bytes: &[u8]) -> u32 {
     }
     !crc
 }
+// Retained legacy helper; not part of the active mutation path.
+#[allow(dead_code)]
 fn file_crc32_cancellable<F: Fn() -> bool>(
     path: &Path,
     is_cancelled: &F,
@@ -7208,8 +15484,110 @@ fn atomic_replace(source: &Path, target: &Path) -> StorageResult<()> {
     Ok(())
 }
 
-/// Registry rows must be removed in FK order. In particular, durable stream
-/// receipts reference spaces and prevent deleting them until explicitly resolved.
+/// Registry rows must be removed in FK order. Terminal receipt/stream evidence
+/// is copied to FK-independent retained tables in the SAME deletion transaction;
+/// nonterminal stream journals and pending file writes still block deletion.
+fn retained_stream_for_pairing(
+    conn: &Connection,
+    pairing_id: &str,
+    space_id: &str,
+    request_id: &str,
+) -> StorageResult<Option<StreamOperationRecord>> {
+    type Row = (
+        String,
+        String,
+        Option<i64>,
+        Option<String>,
+        String,
+        i64,
+        i64,
+        i64,
+        Option<String>,
+        i64,
+        Option<String>,
+        String,
+    );
+    let saved: Option<Row> = conn.query_row(
+        "SELECT stream_id,chunk_method,declared_size,request_fingerprint,phase,state_revision,next_seq,confirmed_bytes,last_chunk_sha256,last_chunk_len,result_json,logical_path          FROM retained_stream_outcomes WHERE pairing_id=?1 AND space_id=?2 AND request_id=?3 AND expires_at_ms>?4",
+        params![pairing_id,space_id,request_id,now_ms()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?))
+    ).optional()?;
+    saved
+        .map(
+            |(
+                stream_id,
+                method,
+                declared_size,
+                request_fingerprint,
+                phase,
+                revision,
+                next_seq,
+                bytes,
+                sha,
+                chunk_len,
+                result_json,
+                path,
+            )| {
+                Ok(StreamOperationRecord {
+                    pairing_id: pairing_id.to_owned(),
+                    space_id: space_id.to_owned(),
+                    request_id: request_id.to_owned(),
+                    stream_id,
+                    method,
+                    path,
+                    declared_size: declared_size.map(|n| n as u64),
+                    request_fingerprint,
+                    phase,
+                    state_revision: revision,
+                    next_seq: next_seq as u64,
+                    confirmed_bytes: bytes as u64,
+                    last_chunk_sha256: sha,
+                    last_chunk_len: chunk_len as u64,
+                    result: result_json.map(|v| serde_json::from_str(&v)).transpose()?,
+                })
+            },
+        )
+        .transpose()
+}
+
+// Independent evidence rows are not an authorization grant. The owner binding
+// survives deletion; only the original authenticated owner/pairing may read them.
+fn archive_space_outcomes(
+    tx: &Transaction<'_>,
+    space_id: &str,
+    owner_id: &str,
+) -> StorageResult<()> {
+    tx.execute("INSERT INTO retained_space_outcomes(owner_application_id,space_id,request_id,operation,result_json,created_at_ms,identity_version,request_fingerprint,terminal_at_ms,expires_at_ms)
+        SELECT ?2,space_id,request_id,operation,result_json,created_at_ms,identity_version,request_fingerprint,terminal_at_ms,
+            CASE WHEN identity_version>=3 THEN expires_at_ms ELSE ?3 END
+        FROM mutation_receipts WHERE space_id=?1", params![space_id,owner_id,now_ms().saturating_add(DURABLE_SQL_RECEIPT_TTL_MS)])?;
+    tx.execute("INSERT INTO retained_stream_outcomes(owner_application_id,pairing_id,space_id,request_id,stream_id,chunk_method,logical_path,declared_size,request_fingerprint,phase,state_revision,next_seq,confirmed_bytes,last_chunk_sha256,last_chunk_len,result_json,updated_at_ms,expires_at_ms)
+        SELECT p.application_id,s.pairing_id,s.space_id,s.request_id,s.stream_id,s.chunk_method,s.logical_path,s.declared_size,s.request_fingerprint,s.phase,s.state_revision,s.next_seq,s.confirmed_bytes,s.last_chunk_sha256,s.last_chunk_len,s.result_json,s.updated_at_ms,
+            MAX(s.updated_at_ms,?3)+?4 FROM stream_operations s JOIN pairings p ON p.id=s.pairing_id WHERE s.space_id=?1
+            AND s.phase IN ('COMMITTED','ABORTED','EXPIRED_FENCED')",
+        params![space_id,owner_id,now_ms(),DURABLE_SQL_RECEIPT_TTL_MS])?;
+    Ok(())
+}
+
+fn archive_application_streams(tx: &Transaction<'_>, owner_id: &str) -> StorageResult<()> {
+    // A pairing may have written to another application's granted space; that
+    // terminal evidence also must survive deletion of the pairing row.
+    tx.execute("INSERT INTO retained_stream_outcomes(owner_application_id,pairing_id,space_id,request_id,stream_id,chunk_method,logical_path,declared_size,request_fingerprint,phase,state_revision,next_seq,confirmed_bytes,last_chunk_sha256,last_chunk_len,result_json,updated_at_ms,expires_at_ms)
+        SELECT ?1,s.pairing_id,s.space_id,s.request_id,s.stream_id,s.chunk_method,s.logical_path,s.declared_size,s.request_fingerprint,s.phase,s.state_revision,s.next_seq,s.confirmed_bytes,s.last_chunk_sha256,s.last_chunk_len,s.result_json,s.updated_at_ms,MAX(s.updated_at_ms,?2)+?3
+        FROM stream_operations s JOIN pairings p ON p.id=s.pairing_id
+        WHERE p.application_id=?1 AND s.phase IN ('COMMITTED','ABORTED','EXPIRED_FENCED')
+        AND NOT EXISTS (SELECT 1 FROM retained_stream_outcomes h WHERE h.stream_id=s.stream_id)",
+        params![owner_id,now_ms(),DURABLE_SQL_RECEIPT_TTL_MS])?;
+    Ok(())
+}
+
+fn archive_application_outcomes(tx: &Transaction<'_>, owner_id: &str) -> StorageResult<()> {
+    tx.execute("INSERT INTO retained_application_outcomes(owner_application_id,request_id,operation,result_json,created_at_ms,identity_version,request_fingerprint,terminal_at_ms,expires_at_ms)
+        SELECT application_id,request_id,operation,result_json,created_at_ms,identity_version,request_fingerprint,terminal_at_ms,
+            CASE WHEN identity_version>=3 THEN expires_at_ms ELSE ?2 END
+        FROM application_mutation_receipts WHERE application_id=?1",params![owner_id,now_ms().saturating_add(DURABLE_SQL_RECEIPT_TTL_MS)])?;
+    Ok(())
+}
+
 fn delete_space_registry_rows(tx: &Transaction<'_>, space_id: &str) -> StorageResult<()> {
     let pending: i64 = tx.query_row(
         "SELECT COUNT(*) FROM stream_operations WHERE space_id=?1 AND phase NOT IN ('COMMITTED','ABORTED','EXPIRED_FENCED')",
@@ -7219,6 +15597,16 @@ fn delete_space_registry_rows(tx: &Transaction<'_>, space_id: &str) -> StorageRe
             "storage has unresolved stream operations".into(),
         ));
     }
+    let pending_file_writes: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pending_mutations WHERE space_id=?1",
+        params![space_id],
+        |r| r.get(0),
+    )?;
+    if pending_file_writes != 0 {
+        return Err(StorageError::RecoveryRequired);
+    }
+    // Protected receipts may be removed only after archive_space_outcomes()
+    // wrote their exact owner-bound copies in this same SQL transaction.
     tx.execute(
         "DELETE FROM stream_operations WHERE space_id=?1",
         params![space_id],
@@ -7264,6 +15652,1089 @@ fn restore_quarantined_spaces(root: &Path, moved: &[(String, PathBuf)]) -> Stora
 
 #[cfg(test)]
 mod tests {
+    // CP17 native-only tests. Must be executed with cargo before any release.
+    #[test]
+    fn cp17_missing_pending_bytes_fence_space_and_keep_sql_proof_after_restart() {
+        let root = temp_root("cp17-pending-missing");
+        let (space_id, request_id) = {
+            let engine = StorageEngine::open(&root).unwrap();
+            let (_, space) = fixture(&engine);
+            let request_id = "cp17-lost-write".to_string();
+            let conn = engine.connection.lock().unwrap();
+            conn.execute("INSERT INTO pending_mutations(id,space_id,operation,logical_path,collision_key,temp_rel_path,etag,size,next_version,created_at_ms) VALUES(?1,?2,'FILE_WRITE','/lost.txt','/lost.txt','spaces/not-present.tmp',?3,4,1,?4)",
+                params![request_id,space.id,"f".repeat(64),now_ms()]).unwrap();
+            (space.id, request_id)
+        };
+        let engine = StorageEngine::open(&root).unwrap();
+        assert_eq!(
+            engine.get_space(&space_id).unwrap().unwrap().state,
+            "recovery_required"
+        );
+        let conn = engine.connection.lock().unwrap();
+        let remains: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_mutations WHERE space_id=?1 AND id=?2",
+                params![space_id, request_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remains, 1);
+        drop(conn);
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp17_bounded_gc_does_not_evict_recent_or_unresolved_evidence() {
+        let root = temp_root("cp17-bounded-gc");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (_, space) = fixture(&engine);
+        let now = now_ms();
+        let old = now - DURABLE_SQL_RECEIPT_TTL_MS - 10_000;
+        {
+            let conn = engine.connection.lock().unwrap();
+            for i in 0..130 {
+                conn.execute("INSERT INTO mutation_receipts(space_id,request_id,operation,result_json,created_at_ms) VALUES(?1,?2,'KV','{}',?3)",
+                    params![space.id,format!("cp17-old-{i}"),old]).unwrap();
+            }
+            conn.execute("INSERT INTO mutation_receipts(space_id,request_id,operation,result_json,created_at_ms) VALUES(?1,'cp17-recent','KV','{}',?2)",
+                params![space.id,now]).unwrap();
+            conn.execute("INSERT INTO durable_operations(scope_kind,scope_id,request_id,kind,owner_application_id,request_fingerprint,phase,request_started_at_ms,created_at_ms,updated_at_ms) SELECT 'space',?1,'cp17-unknown','KV',owner_application_id,'fp','RUNNING',?2,?2,?2 FROM spaces WHERE id=?1",
+                params![space.id,old]).unwrap();
+            conn.execute("INSERT INTO mutation_receipts(space_id,request_id,operation,result_json,created_at_ms,identity_version,request_fingerprint,terminal_at_ms,expires_at_ms) VALUES(?1,'cp17-unknown','KV','{}',?2,3,'fp',?2,?3)",
+                params![space.id,old,old+1]).unwrap();
+        }
+        engine.run_bounded_receipt_gc().unwrap();
+        let conn = engine.connection.lock().unwrap();
+        let leftovers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mutation_receipts WHERE request_id LIKE 'cp17-old-%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftovers, 2); // 128 maximum from this table per pass.
+        for id in ["cp17-recent", "cp17-unknown"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM mutation_receipts WHERE space_id=?1 AND request_id=?2",
+                    params![space.id, id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1);
+        }
+        drop(conn);
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp17_preexisting_needs_repair_parent_fences_scope_before_open_returns() {
+        let root = temp_root("cp17-health-barrier");
+        let space_id = {
+            let engine = StorageEngine::open(&root).unwrap();
+            let (_, space) = fixture(&engine);
+            let conn = engine.connection.lock().unwrap();
+            conn.execute("INSERT INTO durable_operations(scope_kind,scope_id,request_id,kind,owner_application_id,request_fingerprint,phase,request_started_at_ms,created_at_ms,updated_at_ms) SELECT 'space',?1,'cp17-repair','DELETE',owner_application_id,'fp','NEEDS_REPAIR',?2,?2,?2 FROM spaces WHERE id=?1",params![space.id,now_ms()]).unwrap();
+            space.id
+        };
+        let engine = StorageEngine::open(&root).unwrap();
+        assert_eq!(
+            engine.get_space(&space_id).unwrap().unwrap().state,
+            "recovery_required"
+        );
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+    // G7 U3 end-to-end native regression sources. Never substitute
+    // source-linked Python SQL tests for running these with Cargo.
+    #[test]
+    fn cp14_g7_active_batch_write_copy_copy_exclusive_and_paid_terminal() {
+        let root = temp_root("g7-active-chain");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (owner, space) = fixture(&engine);
+        let plan = vec![
+            BatchCapacityOperation::Write { path: "/a".into() },
+            BatchCapacityOperation::Copy {
+                from: "/a".into(),
+                to: "/b".into(),
+            },
+            BatchCapacityOperation::Copy {
+                from: "/b".into(),
+                to: "/c".into(),
+            },
+        ];
+        let fingerprints = vec!["fp-write".into(), "fp-copy-1".into(), "fp-copy-2".into()];
+        let batch = engine
+            .begin_batch_execution(
+                &owner.id,
+                &space.id,
+                "g7-chain",
+                "root-fp",
+                &fingerprints,
+                &plan,
+            )
+            .unwrap();
+        assert!(matches!(
+            engine.admission.try_acquire(vec![
+                Claim::global_shared(),
+                Claim::space_shared(&space.id),
+                Claim::path(&space.id, "/a")
+            ]),
+            Err(StorageError::Conflict(_))
+        ));
+        for (index, kind, id) in [
+            (0, "write-file", "g7-chain-write"),
+            (1, "copy", "g7-chain-copy-1"),
+            (2, "copy", "g7-chain-copy-2"),
+        ] {
+            engine
+                .mark_batch_item_running(&space.id, "g7-chain", index, id, kind)
+                .unwrap();
+            match index {
+                0 => {
+                    engine
+                        .execute_batch_write(
+                            &batch, index, &space.id, "/a", b"proof", None, None, id,
+                        )
+                        .unwrap();
+                }
+                1 => {
+                    assert_eq!(
+                        engine
+                            .execute_batch_copy(
+                                &batch,
+                                index,
+                                &space.id,
+                                "/a",
+                                "/b",
+                                false,
+                                id,
+                                || false,
+                                |_, _| {}
+                            )
+                            .unwrap(),
+                        1
+                    );
+                }
+                _ => {
+                    assert_eq!(
+                        engine
+                            .execute_batch_copy(
+                                &batch,
+                                index,
+                                &space.id,
+                                "/b",
+                                "/c",
+                                false,
+                                id,
+                                || false,
+                                |_, _| {}
+                            )
+                            .unwrap(),
+                        1
+                    );
+                }
+            }
+            engine
+                .record_batch_item(
+                    &space.id,
+                    "g7-chain",
+                    index,
+                    true,
+                    &json!({"index":index,"ok":true}),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            engine.read_file(&space.id, "/c").unwrap().as_slice(),
+            b"proof"
+        );
+        assert!(engine
+            .finish_batch_items(&space.id, "g7-chain", &json!({"completedItems":3}), false)
+            .unwrap());
+        let conn = engine.connection.lock().unwrap();
+        let (total,remaining,state):(i64,i64,String)=conn.query_row(
+            "SELECT total_slots,remaining_slots,state FROM durable_capacity_escrows WHERE scope_kind='space' AND scope_id=?1 AND root_request_id='g7-chain'",
+            params![space.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).unwrap();
+        assert_eq!((total, remaining, state), (7, 0, "TERMINAL".into()));
+        drop(conn);
+        drop(batch);
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_g7_active_batch_nested_move_fallback_is_fully_paid() {
+        let root = temp_root("g7-active-move");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (owner, space) = fixture(&engine);
+        engine
+            .write_file(&space.id, "/origin", b"origin", None, "origin-setup")
+            .unwrap();
+        engine
+            .write_file(&space.id, "/target", b"target", None, "target-setup")
+            .unwrap();
+        let plan = vec![BatchCapacityOperation::Move {
+            from: "/origin".into(),
+            to: "/target".into(),
+        }];
+        let batch = engine
+            .begin_batch_execution(
+                &owner.id,
+                &space.id,
+                "g7-move-root",
+                "move-root-fp",
+                &["move-child-fp".into()],
+                &plan,
+            )
+            .unwrap();
+        engine
+            .mark_batch_item_running(&space.id, "g7-move-root", 0, "g7-move-child", "move")
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_batch_move(
+                    &batch,
+                    0,
+                    &space.id,
+                    "/origin",
+                    "/target",
+                    true,
+                    None,
+                    "g7-move-child",
+                    || false,
+                    |_, _| {}
+                )
+                .unwrap(),
+            1
+        );
+        engine
+            .record_batch_item(
+                &space.id,
+                "g7-move-root",
+                0,
+                true,
+                &json!({"index":0,"ok":true}),
+            )
+            .unwrap();
+        assert!(engine
+            .finish_batch_items(
+                &space.id,
+                "g7-move-root",
+                &json!({"completedItems":1}),
+                false
+            )
+            .unwrap());
+        assert_eq!(
+            engine.read_file(&space.id, "/target").unwrap().as_slice(),
+            b"origin"
+        );
+        assert!(engine.stat_file(&space.id, "/origin").unwrap().is_none());
+        let conn = engine.connection.lock().unwrap();
+        let (total,remaining,state):(i64,i64,String)=conn.query_row(
+            "SELECT total_slots,remaining_slots,state FROM durable_capacity_escrows WHERE scope_kind='space' AND scope_id=?1 AND root_request_id='g7-move-root'",
+            params![space.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).unwrap();
+        assert_eq!((total, remaining, state), (7, 0, "TERMINAL".into()));
+        drop(conn);
+        drop(batch);
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_g7_standalone_move_fallback_uses_same_escrow_transfer() {
+        let root = temp_root("g7-standalone-move");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (_, space) = fixture(&engine);
+        engine
+            .write_file(&space.id, "/origin", b"a", None, "standalone-setup-a")
+            .unwrap();
+        engine
+            .write_file(&space.id, "/target", b"b", None, "standalone-setup-b")
+            .unwrap();
+        assert_eq!(
+            engine
+                .move_path_with_progress(
+                    &space.id,
+                    "/origin",
+                    "/target",
+                    true,
+                    None,
+                    "g7-standalone-move",
+                    || false,
+                    |_, _| {}
+                )
+                .unwrap(),
+            1
+        );
+        let conn = engine.connection.lock().unwrap();
+        let (total,remaining,state):(i64,i64,String)=conn.query_row(
+            "SELECT total_slots,remaining_slots,state FROM durable_capacity_escrows WHERE scope_kind='space' AND scope_id=?1 AND root_request_id='g7-standalone-move'",
+            params![space.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).unwrap();
+        assert_eq!((total, remaining, state), (6, 0, "TERMINAL".into()));
+        drop(conn);
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_g7_cancel_before_first_effect_frees_only_proven_unused_escrow() {
+        let root = temp_root("g7-cancel-before-child");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (owner, space) = fixture(&engine);
+        let batch = engine
+            .begin_batch_execution(
+                &owner.id,
+                &space.id,
+                "g7-cancelled",
+                "fp-root",
+                &["fp-child".into()],
+                &[BatchCapacityOperation::Write { path: "/a".into() }],
+            )
+            .unwrap();
+        assert!(engine
+            .finish_batch_items(
+                &space.id,
+                "g7-cancelled",
+                &json!({"cancelled":true,"completedItems":0}),
+                true
+            )
+            .unwrap());
+        let conn = engine.connection.lock().unwrap();
+        let (phase,remaining,state):(String,i64,String)=conn.query_row(
+            "SELECT p.phase,e.remaining_slots,e.state FROM durable_operations p JOIN durable_capacity_escrows e ON e.scope_kind=p.scope_kind AND e.scope_id=p.scope_id AND e.root_request_id=p.request_id WHERE p.scope_id=?1 AND p.request_id='g7-cancelled'",
+            params![space.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).unwrap();
+        assert_eq!(phase, "ABORTED");
+        assert_eq!(remaining, 0);
+        assert_eq!(state, "TERMINAL");
+        drop(conn);
+        drop(batch);
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_g7_exclusive_batch_does_not_block_another_space_lease() {
+        let root = temp_root("g7-independent-space");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (owner, space) = fixture(&engine);
+        let second = engine
+            .open_space(
+                &owner.id,
+                "second",
+                StorageClass::Persistent,
+                Some("Second"),
+            )
+            .unwrap();
+        let batch = engine
+            .begin_batch_execution(
+                &owner.id,
+                &space.id,
+                "g7-exclusive",
+                "fp-root",
+                &["fp-child".into()],
+                &[BatchCapacityOperation::Write { path: "/a".into() }],
+            )
+            .unwrap();
+        let other = engine.admission.try_acquire(vec![
+            Claim::global_shared(),
+            Claim::space_shared(&second.id),
+            Claim::path(&second.id, "/unrelated"),
+        ]);
+        assert!(other.is_ok());
+        drop(other);
+        drop(batch);
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_g7_unfinished_root_keeps_credits_after_restart() {
+        let root = temp_root("g7-uncertain-after-restart");
+        let space_id;
+        {
+            let engine = StorageEngine::open(&root).unwrap();
+            let (owner, space) = fixture(&engine);
+            space_id = space.id.clone();
+            let batch = engine
+                .begin_batch_execution(
+                    &owner.id,
+                    &space.id,
+                    "g7-uncertain",
+                    "fp",
+                    &["item".into()],
+                    &[BatchCapacityOperation::Write { path: "/a".into() }],
+                )
+                .unwrap();
+            engine
+                .mark_batch_item_running(
+                    &space.id,
+                    "g7-uncertain",
+                    0,
+                    "g7-unknown-child",
+                    "write-file",
+                )
+                .unwrap();
+            drop(batch);
+            drop(engine);
+        }
+        let engine = StorageEngine::open(&root).unwrap();
+        let conn = engine.connection.lock().unwrap();
+        let (phase,remaining):(String,i64)=conn.query_row(
+            "SELECT p.phase,e.remaining_slots FROM durable_operations p JOIN durable_capacity_escrows e ON e.scope_kind=p.scope_kind AND e.scope_id=p.scope_id AND e.root_request_id=p.request_id WHERE p.scope_id=?1 AND p.request_id='g7-uncertain'",
+            params![space_id],|r|Ok((r.get(0)?,r.get(1)?)),
+        ).unwrap();
+        assert!(matches!(phase.as_str(), "RUNNING" | "RECONCILING"));
+        assert_eq!(remaining, 1); // never release when child outcome is unknown
+        drop(conn);
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // CP14 G7: native regression source (not run when Cargo is absent).
+    // The root, protected budget and child spend are all committed atomically.
+    #[test]
+    fn cp14_g7_batch_budget_counts_paths_generated_earlier_in_batch() {
+        let empty: Vec<String> = vec![];
+        let plan = vec![
+            BatchCapacityOperation::Write { path: "/a".into() },
+            BatchCapacityOperation::Copy {
+                from: "/a".into(),
+                to: "/b".into(),
+            },
+            BatchCapacityOperation::Copy {
+                from: "/b".into(),
+                to: "/c".into(),
+            },
+        ];
+        assert_eq!(batch_capacity_envelope(&empty, &plan).unwrap(), 1 + 3 + 3);
+        let mixed = vec![
+            BatchCapacityOperation::Delete {
+                path: "/src".into(),
+            },
+            BatchCapacityOperation::Move {
+                from: "/src".into(),
+                to: "/moved".into(),
+            },
+            BatchCapacityOperation::Copy {
+                from: "/moved".into(),
+                to: "/third".into(),
+            },
+            BatchCapacityOperation::Kv,
+        ];
+        let existing = vec!["/src/a".into(), "/src/b".into(), "/src/c".into()];
+        // Failed DELETE cannot reduce the upper bound, MOVE has 6+3, COPY 2+3.
+        assert_eq!(
+            batch_capacity_envelope(&existing, &mixed).unwrap(),
+            2 + 9 + 5 + 1
+        );
+        assert_eq!(budget_move_fallback(3).unwrap(), 9);
+        assert!(matches!(
+            budget_copy(V3_PROTECTED_RECEIPT_CAPACITY as usize),
+            Err(StorageError::StorageUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn cp14_g7_composable_context_reuses_space_lease_and_rejects_foreign_scope() {
+        let root = temp_root("cp14-g7-composable-space");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (app, space) = fixture(&engine);
+        assert!(matches!(
+            engine.try_begin_batch_mutation("different-owner", &space.id, "batch-owner"),
+            Err(StorageError::RequestInvalid(_))
+        ));
+        let context = engine
+            .try_begin_batch_mutation(&app.id, &space.id, "batch-context")
+            .unwrap();
+        let planned = vec![
+            BatchCapacityOperation::Write { path: "/a".into() },
+            BatchCapacityOperation::Copy {
+                from: "/a".into(),
+                to: "/b".into(),
+            },
+            BatchCapacityOperation::Copy {
+                from: "/b".into(),
+                to: "/c".into(),
+            },
+        ];
+        assert_eq!(
+            engine
+                .batch_capacity_budget(&context, &space.id, &planned)
+                .unwrap(),
+            7
+        );
+        assert!(matches!(
+            engine.batch_capacity_budget(&context, "other-space", &planned),
+            Err(StorageError::RequestInvalid(_))
+        ));
+        // The worker owns the exclusive space lease and the normal public
+        // mutator's claims cannot enter. Child calls must not reacquire it.
+        assert!(matches!(
+            engine.admission.try_acquire(vec![
+                Claim::global_shared(),
+                Claim::space_shared(&space.id),
+                Claim::path(&space.id, "/a")
+            ]),
+            Err(StorageError::Conflict(_))
+        ));
+        engine
+            .batch_write_file_with_metadata(
+                &context,
+                &space.id,
+                "/a",
+                b"hello",
+                None,
+                None,
+                "batch-child-write",
+            )
+            .unwrap();
+        engine
+            .batch_kv_set_outcome(
+                &context,
+                &space.id,
+                "key",
+                &json!({"ok":true}),
+                None,
+                None,
+                "batch-child-kv",
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .batch_copy_path_with_progress(
+                    &context,
+                    &space.id,
+                    "/a",
+                    "/b",
+                    false,
+                    "batch-child-copy",
+                    || false,
+                    |_, _| {}
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            engine
+                .batch_move_path_with_progress(
+                    &context,
+                    &space.id,
+                    "/b",
+                    "/c",
+                    false,
+                    None,
+                    "batch-child-move",
+                    || false,
+                    |_, _| {}
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            engine
+                .batch_delete_path_with_progress(
+                    &context,
+                    &space.id,
+                    "/c",
+                    false,
+                    None,
+                    "batch-child-delete",
+                    || false,
+                    |_, _| {}
+                )
+                .unwrap(),
+            1
+        );
+        assert!(matches!(
+            engine.batch_copy_path_with_progress(
+                &context,
+                "foreign-space",
+                "/a",
+                "/b",
+                false,
+                "foreign-child",
+                || false,
+                |_, _| {}
+            ),
+            Err(StorageError::RequestInvalid(_))
+        ));
+        drop(context);
+        assert!(engine
+            .admission
+            .try_acquire(vec![Claim::space_shared(&space.id)])
+            .is_ok());
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_g7_batch_kv_receipt_consumes_exactly_one_escrow_credit_atomically() {
+        let root = temp_root("cp14-g7-batch-kv-credit");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (owner, space) = fixture(&engine);
+        let context = engine
+            .try_begin_batch_mutation(&owner.id, &space.id, "kv-credit-root")
+            .unwrap();
+        engine
+            .prepare_batch_items_in_context(
+                &context,
+                &space.id,
+                "kv-credit-root",
+                "root-fp",
+                &["item-fp".to_owned()],
+                &[BatchCapacityOperation::Kv],
+            )
+            .unwrap();
+        engine
+            .mark_batch_item_running(&space.id, "kv-credit-root", 0, "kv-credit-child", "kv-set")
+            .unwrap();
+        let value = json!({"data":"hello"});
+        assert!(matches!(
+            engine.batch_kv_set_with_credit(
+                &context,
+                &space.id,
+                0,
+                "WRONG",
+                "key",
+                &value,
+                None,
+                None,
+                "kv-credit-child"
+            ),
+            Err(StorageError::RequestIdConflict)
+        ));
+        {
+            let conn = engine.connection.lock().unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM kv_entries WHERE space_id=?1 AND key='key'",
+                    params![space.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0);
+        }
+        // The payload can be committed only under the matching immutable
+        // BATCH index/owner/space and the already-held exclusive Core lease.
+        let result = engine
+            .batch_kv_set_with_credit(
+                &context,
+                &space.id,
+                0,
+                "item-fp",
+                "key",
+                &value,
+                None,
+                None,
+                "kv-credit-child",
+            )
+            .unwrap();
+        assert_eq!(result.disposition, MutationDisposition::Applied);
+        let replay = engine
+            .batch_kv_set_with_credit(
+                &context,
+                &space.id,
+                0,
+                "item-fp",
+                "key",
+                &value,
+                None,
+                None,
+                "kv-credit-child",
+            )
+            .unwrap();
+        assert_eq!(replay.disposition, MutationDisposition::Replayed);
+        {
+            let conn = engine.connection.lock().unwrap();
+            let (left,total):(i64,i64)=conn.query_row(
+                "SELECT remaining_slots,total_slots FROM durable_capacity_escrows WHERE scope_kind='space' AND scope_id=?1 AND root_request_id='kv-credit-root'",
+                params![space.id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!((left, total), (0, 1));
+            let spends:i64=conn.query_row("SELECT COUNT(*) FROM durable_capacity_spends WHERE scope_kind='space' AND scope_id=?1 AND root_request_id='kv-credit-root' AND child_request_id='kv-credit-child'",
+                params![space.id],|r|r.get(0)).unwrap();
+            assert_eq!(spends, 1);
+            let receipts:i64=conn.query_row("SELECT COUNT(*) FROM mutation_receipts WHERE space_id=?1 AND request_id='kv-credit-child'",
+                params![space.id],|r|r.get(0)).unwrap();
+            assert_eq!(receipts, 1);
+        }
+        assert!(matches!(
+            engine.batch_kv_set_with_credit(
+                &context,
+                &space.id,
+                0,
+                "item-fp",
+                "key",
+                &json!({"data":"changed"}),
+                None,
+                None,
+                "kv-credit-child"
+            ),
+            Err(StorageError::RequestIdConflict)
+        ));
+        drop(context);
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_g7_failed_batch_kv_precondition_cannot_consume_credit() {
+        let root = temp_root("cp14-g7-batch-kv-rollback");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (owner, space) = fixture(&engine);
+        let context = engine
+            .try_begin_batch_mutation(&owner.id, &space.id, "kv-rollback-root")
+            .unwrap();
+        engine
+            .prepare_batch_items_in_context(
+                &context,
+                &space.id,
+                "kv-rollback-root",
+                "root-fp",
+                &["item-fp".to_owned()],
+                &[BatchCapacityOperation::Kv],
+            )
+            .unwrap();
+        engine
+            .mark_batch_item_running(
+                &space.id,
+                "kv-rollback-root",
+                0,
+                "kv-rollback-child",
+                "kv-set",
+            )
+            .unwrap();
+        let value = json!({"attempt":1});
+        assert!(matches!(
+            engine.batch_kv_set_with_credit(
+                &context,
+                &space.id,
+                0,
+                "item-fp",
+                "key",
+                &value,
+                Some(999),
+                None,
+                "kv-rollback-child"
+            ),
+            Err(StorageError::Conflict(_))
+        ));
+        {
+            let conn = engine.connection.lock().unwrap();
+            let left:i64=conn.query_row("SELECT remaining_slots FROM durable_capacity_escrows WHERE scope_kind='space' AND scope_id=?1 AND root_request_id='kv-rollback-root'",
+                params![space.id],|r|r.get(0)).unwrap();
+            assert_eq!(left, 1);
+            let spent:i64=conn.query_row("SELECT COUNT(*) FROM durable_capacity_spends WHERE scope_kind='space' AND scope_id=?1 AND root_request_id='kv-rollback-root'",
+                params![space.id],|r|r.get(0)).unwrap();
+            assert_eq!(spent, 0);
+        }
+        drop(context);
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_g7_batch_root_and_escrow_are_one_immediate_admission() {
+        let root = temp_root("cp14-g7-batch-root-atomic");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (owner, space) = fixture(&engine);
+        let operations = vec![
+            BatchCapacityOperation::Write { path: "/a".into() },
+            BatchCapacityOperation::Copy {
+                from: "/a".into(),
+                to: "/b".into(),
+            },
+            BatchCapacityOperation::Copy {
+                from: "/b".into(),
+                to: "/c".into(),
+            },
+        ];
+        let fingerprints = vec!["f0".to_owned(), "f1".to_owned(), "f2".to_owned()];
+        let context = engine
+            .try_begin_batch_mutation(&owner.id, &space.id, "batch-root")
+            .unwrap();
+        assert!(matches!(
+            engine.prepare_batch_items_in_context(
+                &context,
+                &space.id,
+                "other-root",
+                "batch-fp",
+                &fingerprints,
+                &operations
+            ),
+            Err(StorageError::RequestInvalid(_))
+        ));
+        let credits = engine
+            .prepare_batch_items_in_context(
+                &context,
+                &space.id,
+                "batch-root",
+                "batch-fp",
+                &fingerprints,
+                &operations,
+            )
+            .unwrap();
+        assert_eq!(credits, 7); // WRITE /a, COPY /a=>/b, COPY /b=>/c
+        {
+            let conn = engine.connection.lock().unwrap();
+            let (actual_credits,unspent,state): (i64,i64,String) = conn.query_row(
+                "SELECT total_slots,remaining_slots,state FROM durable_capacity_escrows WHERE scope_kind='space' AND scope_id=?1 AND root_request_id='batch-root'",
+                params![space.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+            assert_eq!((actual_credits, unspent, state.as_str()), (7, 7, "HELD"));
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM durable_operation_items WHERE scope_kind='space' AND scope_id=?1 AND request_id='batch-root'",params![space.id],|r|r.get(0)).unwrap();
+            assert_eq!(count, 3);
+        }
+        assert_eq!(
+            engine
+                .prepare_batch_items_in_context(
+                    &context,
+                    &space.id,
+                    "batch-root",
+                    "batch-fp",
+                    &fingerprints,
+                    &operations
+                )
+                .unwrap(),
+            7
+        );
+        assert!(matches!(
+            engine.prepare_batch_items_in_context(
+                &context,
+                &space.id,
+                "batch-root",
+                "changed-fingerprint",
+                &fingerprints,
+                &operations
+            ),
+            Err(StorageError::RequestIdConflict)
+        ));
+        // If quota cannot fund the complete envelope, the just-inserted
+        // durable parent and all ordered items are rolled back atomically.
+        assert!(matches!(
+            engine.prepare_batch_items_transaction(
+                &owner.id,
+                &space.id,
+                "unfundable-root",
+                "unfundable-fp",
+                &fingerprints,
+                Some(V3_PROTECTED_RECEIPT_CAPACITY)
+            ),
+            Err(StorageError::StorageUnavailable(_))
+        ));
+        {
+            let conn = engine.connection.lock().unwrap();
+            let count: i64=conn.query_row("SELECT COUNT(*) FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND request_id='unfundable-root'",params![space.id],|r|r.get(0)).unwrap();
+            assert_eq!(count, 0);
+            let count: i64=conn.query_row("SELECT COUNT(*) FROM durable_operation_items WHERE scope_kind='space' AND scope_id=?1 AND request_id='unfundable-root'",params![space.id],|r|r.get(0)).unwrap();
+            assert_eq!(count, 0);
+        }
+        drop(context);
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_g7_batch_root_replay_uses_saved_envelope_not_mutated_tree() {
+        let root = temp_root("cp14-g7-immutable-envelope-replay");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (owner, space) = fixture(&engine);
+        let children = vec!["write-fp".to_owned(), "copy-fp".to_owned()];
+        let plan = vec![
+            BatchCapacityOperation::Write {
+                path: "/folder/one".into(),
+            },
+            BatchCapacityOperation::Copy {
+                from: "/folder".into(),
+                to: "/target".into(),
+            },
+        ];
+        {
+            let context = engine
+                .try_begin_batch_mutation(&owner.id, &space.id, "immutable-batch")
+                .unwrap();
+            assert_eq!(
+                engine
+                    .prepare_batch_items_in_context(
+                        &context,
+                        &space.id,
+                        "immutable-batch",
+                        "fp",
+                        &children,
+                        &plan
+                    )
+                    .unwrap(),
+                4
+            );
+        }
+        // Represents a changed indexed source tree after the original root
+        // admission; this is a proof of replay *identity*, not permission to
+        // rerun any child with an unknown outcome.
+        engine
+            .write_file(&space.id, "/folder/two", b"two", None, "replay-extra-file")
+            .unwrap();
+        let context = engine
+            .try_begin_batch_mutation(&owner.id, &space.id, "immutable-batch")
+            .unwrap();
+        assert_eq!(
+            engine
+                .batch_capacity_budget(&context, &space.id, &plan)
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            engine
+                .prepare_batch_items_in_context(
+                    &context,
+                    &space.id,
+                    "immutable-batch",
+                    "fp",
+                    &children,
+                    &plan
+                )
+                .unwrap(),
+            4
+        );
+        drop(context);
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_g7_unescrowed_running_batch_must_not_be_topped_up() {
+        let root = temp_root("cp14-g7-legacy-root-fail-closed");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (owner, space) = fixture(&engine);
+        let children = vec!["legacy-child-fp".to_owned()];
+        engine
+            .prepare_batch_items(&owner.id, &space.id, "legacy-batch", "legacy-fp", &children)
+            .unwrap();
+        let context = engine
+            .try_begin_batch_mutation(&owner.id, &space.id, "legacy-batch")
+            .unwrap();
+        assert!(matches!(
+            engine.prepare_batch_items_in_context(
+                &context,
+                &space.id,
+                "legacy-batch",
+                "legacy-fp",
+                &children,
+                &[BatchCapacityOperation::Kv]
+            ),
+            Err(StorageError::RecoveryRequired)
+        ));
+        let conn = engine.connection.lock().unwrap();
+        let count:i64=conn.query_row("SELECT COUNT(*) FROM durable_capacity_escrows WHERE scope_kind='space' AND scope_id=?1 AND root_request_id='legacy-batch'",params![space.id],|r|r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        drop(conn);
+        drop(context);
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_g7_escrow_survives_restart_and_exact_replay_cannot_double_debit() {
+        let root = temp_root("cp14-g7-escrow-atomic");
+        let (owner, space_id) = {
+            let engine = StorageEngine::open(&root).unwrap();
+            let (owner, space) = fixture(&engine);
+            let now = now_ms();
+            let mut conn = engine.connection.lock().unwrap();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute("INSERT INTO durable_operations(scope_kind,scope_id,request_id,kind,owner_application_id,identity_version,request_fingerprint,phase,request_started_at_ms,created_at_ms,updated_at_ms) VALUES('space',?1,'escrow-root','BATCH',?2,3,'root-fp','RUNNING',?3,?3,?3)",
+                params![space.id,owner.id,now]).unwrap();
+            reserve_capacity_escrow(
+                &tx,
+                "space",
+                &space.id,
+                "escrow-root",
+                &owner.id,
+                "root-fp",
+                3,
+                true,
+            )
+            .unwrap();
+            assert!(spend_capacity_escrow(
+                &tx,
+                "space",
+                &space.id,
+                "escrow-root",
+                &owner.id,
+                0,
+                "child-request",
+                "RECEIPT",
+                "child-fp",
+                1
+            )
+            .unwrap());
+            // The child receipt is inserted before committing its spent credit.
+            tx.execute("INSERT INTO mutation_receipts(space_id,request_id,operation,result_json,created_at_ms,identity_version,request_fingerprint,terminal_at_ms,expires_at_ms) VALUES(?1,'child-request','kv-set:k','{}',?2,3,'child-fp',?2,?3)",
+                params![space.id,now,now.saturating_add(DURABLE_SQL_RECEIPT_TTL_MS)]).unwrap();
+            tx.commit().unwrap();
+            (owner.id, space.id)
+        };
+        let engine = StorageEngine::open(&root).unwrap();
+        let mut conn = engine.connection.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        reserve_capacity_escrow(
+            &tx,
+            "space",
+            &space_id,
+            "escrow-root",
+            &owner,
+            "root-fp",
+            3,
+            false,
+        )
+        .unwrap();
+        assert!(!spend_capacity_escrow(
+            &tx,
+            "space",
+            &space_id,
+            "escrow-root",
+            &owner,
+            0,
+            "child-request",
+            "RECEIPT",
+            "child-fp",
+            1
+        )
+        .unwrap());
+        assert!(matches!(
+            spend_capacity_escrow(
+                &tx,
+                "space",
+                &space_id,
+                "escrow-root",
+                &owner,
+                0,
+                "child-request",
+                "RECEIPT",
+                "changed-fp",
+                1
+            ),
+            Err(StorageError::RequestIdConflict)
+        ));
+        let slots: i64 = tx.query_row("SELECT remaining_slots FROM durable_capacity_escrows WHERE scope_kind='space' AND scope_id=?1 AND root_request_id='escrow-root'",params![space_id],|r|r.get(0)).unwrap();
+        assert_eq!(slots, 2);
+        assert!(matches!(
+            close_capacity_escrow(&tx, "space", &space_id, "escrow-root"),
+            Err(StorageError::RecoveryRequired)
+        ));
+        tx.commit().unwrap();
+        drop(conn);
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
     use super::*;
 
     fn temp_root(label: &str) -> PathBuf {
@@ -7287,7 +16758,1112 @@ mod tests {
     }
 
     #[test]
-    fn deletion_cleans_terminal_stream_journal_and_keeps_other_spaces() {
+    fn cp14_interrupted_space_open_resolves_verified_manifest_without_reapplying() {
+        let root = temp_root("cp14-space-open-startup-terminal");
+        let (owner, request, space_id) = {
+            let engine = StorageEngine::open(&root).unwrap();
+            let app = engine
+                .register_application(
+                    ApplicationKind::FigmaPlugin,
+                    "space-open-recover",
+                    "Recover",
+                )
+                .unwrap();
+            let space = engine
+                .open_space(&app.id, "recover-key", StorageClass::Persistent, None)
+                .unwrap();
+            let request = "space-open-after-manifest".to_string();
+            let fingerprint = semantic_fingerprint(
+                "space-open-existing",
+                &json!({
+                    "applicationId":app.id,"key":"recover-key","storageClass":"persistent",
+                    "storageCategory":null,"displayName":null,
+                }),
+            )
+            .unwrap();
+            let plan = SpaceOpenRecoveryPlan {
+                application_id: app.id.clone(),
+                key: "recover-key".into(),
+                storage_class: StorageClass::Persistent,
+                storage_category: None,
+                display_name: None,
+                before: None,
+            };
+            let conn = engine.connection.lock().unwrap();
+            conn.execute(
+                "INSERT INTO durable_operations(scope_kind,scope_id,request_id,kind,owner_application_id,identity_version,request_fingerprint,phase,result_json,request_started_at_ms,created_at_ms,updated_at_ms) VALUES('application',?1,?2,'SPACE_OPEN',?1,3,?3,'ADMITTED',?4,?5,?5,?5)",
+                params![app.id,request,fingerprint,serde_json::to_string(&plan).unwrap(),space.created_at_ms.saturating_sub(1)],
+            ).unwrap();
+            drop(conn);
+            // Display name can legitimately change without rewriting the
+            // space manifest; it must not force false NEEDS_REPAIR.
+            engine
+                .register_application(
+                    ApplicationKind::FigmaPlugin,
+                    "space-open-recover",
+                    "Recover Renamed",
+                )
+                .unwrap();
+            (app.id, request, space.id)
+        };
+        let engine = StorageEngine::open(&root).unwrap();
+        let conn = engine.connection.lock().unwrap();
+        let phase: String = conn
+            .query_row(
+                "SELECT phase FROM durable_operations WHERE scope_id=?1 AND request_id=?2",
+                params![owner, request],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "COMMITTED");
+        let linked: i64 = conn.query_row("SELECT COUNT(*) FROM application_mutation_receipts WHERE application_id=?1 AND request_id=?2 AND identity_version=3",params![owner,request],|r|r.get(0)).unwrap();
+        assert_eq!(linked, 1);
+        drop(conn);
+        assert_eq!(
+            engine
+                .open_space_with_request(
+                    &owner,
+                    "recover-key",
+                    StorageClass::Persistent,
+                    None,
+                    None,
+                    &request
+                )
+                .unwrap()
+                .id,
+            space_id
+        );
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_interrupted_space_open_before_first_effect_aborts_without_new_space() {
+        let root = temp_root("cp14-space-open-startup-unapplied");
+        let (owner, request) = {
+            let engine = StorageEngine::open(&root).unwrap();
+            let app = engine
+                .register_application(ApplicationKind::FigmaPlugin, "space-open-abort", "Abort")
+                .unwrap();
+            let fingerprint = semantic_fingerprint(
+                "space-open-existing",
+                &json!({
+                    "applicationId":app.id,"key":"never-created","storageClass":"persistent",
+                    "storageCategory":null,"displayName":null,
+                }),
+            )
+            .unwrap();
+            let plan = SpaceOpenRecoveryPlan {
+                application_id: app.id.clone(),
+                key: "never-created".into(),
+                storage_class: StorageClass::Persistent,
+                storage_category: None,
+                display_name: None,
+                before: None,
+            };
+            let now = now_ms();
+            engine.connection.lock().unwrap().execute(
+                "INSERT INTO durable_operations(scope_kind,scope_id,request_id,kind,owner_application_id,identity_version,request_fingerprint,phase,result_json,request_started_at_ms,created_at_ms,updated_at_ms) VALUES('application',?1,'unapplied-open','SPACE_OPEN',?1,3,?2,'ADMITTED',?3,?4,?4,?4)",
+                params![app.id,fingerprint,serde_json::to_string(&plan).unwrap(),now],
+            ).unwrap();
+            (app.id, "unapplied-open".to_string())
+        };
+        let engine = StorageEngine::open(&root).unwrap();
+        assert!(engine.list_spaces(&owner).unwrap().is_empty());
+        let phase: String = engine
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT phase FROM durable_operations WHERE scope_id=?1 AND request_id=?2",
+                params![owner, request],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "ABORTED");
+        assert!(matches!(
+            engine.open_space_with_request(
+                &owner,
+                "never-created",
+                StorageClass::Persistent,
+                None,
+                None,
+                &request
+            ),
+            Err(StorageError::Conflict(_))
+        ));
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_interrupted_space_open_with_changed_manifest_requires_repair() {
+        let root = temp_root("cp14-space-open-startup-mismatch");
+        let (owner, request, space_id) = {
+            let engine = StorageEngine::open(&root).unwrap();
+            let app = engine
+                .register_application(
+                    ApplicationKind::FigmaPlugin,
+                    "space-open-mismatch",
+                    "Mismatch",
+                )
+                .unwrap();
+            let space = engine
+                .open_space(&app.id, "protected", StorageClass::Persistent, None)
+                .unwrap();
+            let request = "space-open-mismatch".to_string();
+            let fingerprint = semantic_fingerprint(
+                "space-open-existing",
+                &json!({
+                    "applicationId":app.id,"key":"protected","storageClass":"persistent",
+                    "storageCategory":null,"displayName":null,
+                }),
+            )
+            .unwrap();
+            let plan = SpaceOpenRecoveryPlan {
+                application_id: app.id.clone(),
+                key: "protected".into(),
+                storage_class: StorageClass::Persistent,
+                storage_category: None,
+                display_name: None,
+                before: Some(space.clone()),
+            };
+            let now = now_ms();
+            engine.connection.lock().unwrap().execute(
+                "INSERT INTO durable_operations(scope_kind,scope_id,request_id,kind,owner_application_id,identity_version,request_fingerprint,phase,result_json,request_started_at_ms,created_at_ms,updated_at_ms) VALUES('application',?1,?2,'SPACE_OPEN',?1,3,?3,'ADMITTED',?4,?5,?5,?5)",
+                params![app.id,request,fingerprint,serde_json::to_string(&plan).unwrap(),now],
+            ).unwrap();
+            let file = root
+                .join("spaces")
+                .join(&space.id)
+                .join(".vontaqfs/manifest.json");
+            let mut manifest: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+            manifest["storageCategory"] = json!("custom");
+            fs::write(&file, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            (app.id, request, space.id)
+        };
+        let engine = StorageEngine::open(&root).unwrap();
+        let conn = engine.connection.lock().unwrap();
+        let phase: String = conn
+            .query_row(
+                "SELECT phase FROM durable_operations WHERE scope_id=?1 AND request_id=?2",
+                params![owner, request],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "NEEDS_REPAIR");
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM spaces WHERE id=?1",
+                params![space_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "recovery_required");
+        drop(conn);
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn public_space_open_replays_create_and_category_without_second_manifest_mutation() {
+        let root = temp_root("cp14-space-open-replay");
+        let (application_id, space_id) = {
+            let engine = StorageEngine::open(&root).unwrap();
+            let app = engine
+                .register_application(ApplicationKind::FigmaPlugin, "space-open-test", "Open Test")
+                .unwrap();
+            let first = engine
+                .open_space_with_request(
+                    &app.id,
+                    "documents",
+                    StorageClass::Persistent,
+                    Some(StorageCategory::Generated),
+                    Some("Documents"),
+                    "cp14-space-open-1",
+                )
+                .unwrap();
+            let repeated = engine
+                .open_space_with_request(
+                    &app.id,
+                    "documents",
+                    StorageClass::Persistent,
+                    Some(StorageCategory::Generated),
+                    Some("Documents"),
+                    "cp14-space-open-1",
+                )
+                .unwrap();
+            assert_eq!(first, repeated);
+            assert!(matches!(
+                engine.open_space_with_request(
+                    &app.id,
+                    "documents",
+                    StorageClass::Persistent,
+                    Some(StorageCategory::Backup),
+                    Some("Documents"),
+                    "cp14-space-open-1",
+                ),
+                Err(StorageError::RequestIdConflict)
+            ));
+            let changed = engine
+                .open_space_with_request(
+                    &app.id,
+                    "documents",
+                    StorageClass::Persistent,
+                    Some(StorageCategory::Backup),
+                    Some("Documents"),
+                    "cp14-space-open-2",
+                )
+                .unwrap();
+            assert_eq!(changed.id, first.id);
+            assert_eq!(changed.storage_category, StorageCategory::Backup);
+            assert_eq!(
+                changed,
+                engine
+                    .open_space_with_request(
+                        &app.id,
+                        "documents",
+                        StorageClass::Persistent,
+                        Some(StorageCategory::Backup),
+                        Some("Documents"),
+                        "cp14-space-open-2",
+                    )
+                    .unwrap()
+            );
+            let conn = engine.connection.lock().unwrap();
+            let confirmed: (String, i64, String) = conn.query_row(
+                "SELECT p.phase,r.identity_version,p.request_fingerprint FROM durable_operations p JOIN application_mutation_receipts r ON r.application_id=p.scope_id AND r.request_id=p.request_id AND r.request_fingerprint=p.request_fingerprint WHERE p.scope_kind='application' AND p.scope_id=?1 AND p.request_id=?2",
+                params![app.id,"cp14-space-open-1"],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            ).unwrap();
+            assert_eq!(confirmed.0, "COMMITTED");
+            assert_eq!(confirmed.1, 3);
+            assert_eq!(confirmed.2.len(), 64);
+            (app.id, first.id)
+        };
+        let reopened = StorageEngine::open(&root).unwrap();
+        let replay = reopened
+            .open_space_with_request(
+                &application_id,
+                "documents",
+                StorageClass::Persistent,
+                Some(StorageCategory::Generated),
+                Some("Documents"),
+                "cp14-space-open-1",
+            )
+            .unwrap();
+        assert_eq!(replay.id, space_id);
+        assert_eq!(replay.storage_category, StorageCategory::Generated);
+        assert_eq!(
+            reopened
+                .get_space(&space_id)
+                .unwrap()
+                .unwrap()
+                .storage_category,
+            StorageCategory::Backup
+        );
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn incomplete_public_space_open_is_not_reapplied() {
+        let root = temp_root("cp14-space-open-uncertain");
+        let engine = StorageEngine::open(&root).unwrap();
+        let app = engine
+            .register_application(
+                ApplicationKind::FigmaPlugin,
+                "open-uncertain",
+                "Open Uncertain",
+            )
+            .unwrap();
+        let payload = json!({
+            "applicationId":app.id,"key":"uncertain", "storageClass":"persistent",
+            "storageCategory":null,"displayName":null,
+        });
+        let fingerprint = semantic_fingerprint("space-open-existing", &payload).unwrap();
+        let now = now_ms();
+        engine.connection.lock().unwrap().execute(
+            "INSERT INTO durable_operations(scope_kind,scope_id,request_id,kind,owner_application_id,identity_version,request_fingerprint,phase,request_started_at_ms,created_at_ms,updated_at_ms) VALUES('application',?1,'space-open-uncertain','SPACE_OPEN',?1,3,?2,'ADMITTED',?3,?3,?3)",
+            params![app.id,fingerprint,now],
+        ).unwrap();
+        assert!(matches!(
+            engine.open_space_with_request(
+                &app.id,
+                "uncertain",
+                StorageClass::Persistent,
+                None,
+                None,
+                "space-open-uncertain",
+            ),
+            Err(StorageError::RecoveryRequired)
+        ));
+        assert!(engine.list_spaces(&app.id).unwrap().is_empty());
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_delete_replay_uses_public_request_identity_across_restart() {
+        let root = temp_root("cp14-snapshot-delete-replay");
+        let (space_id, snapshot_id, other_snapshot_id) = {
+            let engine = StorageEngine::open(&root).unwrap();
+            let (_, space) = fixture(&engine);
+            let first = engine
+                .create_snapshot(&space.id, Some("one"), || false, |_, _, _, _| {})
+                .unwrap();
+            let second = engine
+                .create_snapshot(&space.id, Some("two"), || false, |_, _, _, _| {})
+                .unwrap();
+            assert!(engine
+                .delete_snapshot_with_request(&space.id, &first.id, "cp14-snapshot-delete-1")
+                .unwrap());
+            // No second effect for an identical request; the snapshot is already gone.
+            assert!(engine
+                .delete_snapshot_with_request(&space.id, &first.id, "cp14-snapshot-delete-1")
+                .unwrap());
+            assert!(matches!(
+                engine.delete_snapshot_with_request(
+                    &space.id,
+                    &second.id,
+                    "cp14-snapshot-delete-1"
+                ),
+                Err(StorageError::RequestIdConflict)
+            ));
+            let conn = engine.connection.lock().unwrap();
+            let recorded: (i64, Option<String>, Option<i64>) = conn.query_row(
+                "SELECT identity_version, request_fingerprint, expires_at_ms FROM mutation_receipts WHERE space_id=?1 AND request_id=?2",
+                params![space.id, "cp14-snapshot-delete-1"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!(recorded.0, 3);
+            assert!(recorded.1.as_ref().is_some_and(|value| value.len() == 64));
+            assert!(recorded.2.unwrap() > now_ms());
+            (space.id, first.id, second.id)
+        };
+        let reopened = StorageEngine::open(&root).unwrap();
+        assert!(reopened
+            .delete_snapshot_with_request(&space_id, &snapshot_id, "cp14-snapshot-delete-1")
+            .unwrap());
+        assert!(matches!(
+            reopened.delete_snapshot_with_request(
+                &space_id,
+                &other_snapshot_id,
+                "cp14-snapshot-delete-1"
+            ),
+            Err(StorageError::RequestIdConflict)
+        ));
+        assert!(reopened
+            .get_snapshot(&space_id, &other_snapshot_id)
+            .unwrap()
+            .is_some());
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_write_receipt_binds_bytes_preconditions_and_metadata_across_restart() {
+        let root = temp_root("file-fingerprint-replay");
+        let space_id = {
+            let engine = StorageEngine::open(&root).unwrap();
+            let (_, space) = fixture(&engine);
+            let first = engine
+                .write_file(&space.id, "/test.json", b"first", None, "fp-file-one")
+                .unwrap();
+            let replay = engine
+                .write_file(&space.id, "/test.json", b"first", None, "fp-file-one")
+                .unwrap();
+            assert_eq!(first, replay);
+            assert_eq!(first.version, 1);
+            assert!(matches!(
+                engine.write_file(&space.id, "/test.json", b"second", None, "fp-file-one"),
+                Err(StorageError::RequestIdConflict)
+            ));
+            assert!(matches!(
+                engine.write_file(
+                    &space.id,
+                    "/test.json",
+                    b"first",
+                    Some(&first.etag),
+                    "fp-file-one"
+                ),
+                Err(StorageError::RequestIdConflict)
+            ));
+            let changed_metadata = FileMetadata {
+                content_type: Some("application/json".into()),
+                format_id: None,
+                opaque: None,
+            };
+            assert!(matches!(
+                engine.write_file_with_metadata(
+                    &space.id,
+                    "/test.json",
+                    b"first",
+                    None,
+                    Some(&changed_metadata),
+                    "fp-file-one"
+                ),
+                Err(StorageError::RequestIdConflict)
+            ));
+            let conn = engine.connection.lock().unwrap();
+            let recorded: (i64, Option<String>, Option<i64>) = conn.query_row(
+                "SELECT identity_version,request_fingerprint,expires_at_ms FROM mutation_receipts WHERE space_id=?1 AND request_id=?2",
+                params![space.id, "fp-file-one"],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            ).unwrap();
+            assert_eq!(recorded.0, 3);
+            assert_eq!(recorded.1.unwrap().len(), 64);
+            assert!(recorded.2.unwrap() > now_ms());
+            space.id
+        };
+        let reopened = StorageEngine::open(&root).unwrap();
+        let replay = reopened
+            .write_file(&space_id, "/test.json", b"first", None, "fp-file-one")
+            .unwrap();
+        assert_eq!(replay.version, 1);
+        assert_eq!(
+            reopened.read_file(&space_id, "/test.json").unwrap(),
+            b"first"
+        );
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_intent_replay_preserves_semantic_identity_after_restart() {
+        let root = temp_root("cp14-delete-intent-replay");
+        let space_id = {
+            let engine = StorageEngine::open(&root).unwrap();
+            let (_, space) = fixture(&engine);
+            engine
+                .write_file(
+                    &space.id,
+                    "/delete.txt",
+                    b"payload",
+                    None,
+                    "cp14-delete-setup",
+                )
+                .unwrap();
+            assert_eq!(
+                engine
+                    .delete_path(&space.id, "/delete.txt", false, None, "cp14-delete-id")
+                    .unwrap(),
+                1
+            );
+            let conn = engine.connection.lock().unwrap();
+            let entry: (i64, String, i64) = conn.query_row(
+                "SELECT identity_version,request_fingerprint,expires_at_ms FROM mutation_receipts WHERE space_id=?1 AND request_id=?2",
+                params![space.id, "cp14-delete-id"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!(entry.0, 3);
+            assert_eq!(entry.1.len(), 64);
+            assert!(entry.2 > now_ms());
+            space.id
+        };
+        let reopened = StorageEngine::open(&root).unwrap();
+        assert_eq!(
+            reopened
+                .delete_path(&space_id, "/delete.txt", false, None, "cp14-delete-id")
+                .unwrap(),
+            1
+        );
+        assert!(matches!(
+            reopened.delete_path(&space_id, "/delete.txt", true, None, "cp14-delete-id"),
+            Err(StorageError::RequestIdConflict)
+        ));
+        assert!(matches!(
+            reopened.delete_path(
+                &space_id,
+                "/delete.txt",
+                false,
+                Some("changed"),
+                "cp14-delete-id"
+            ),
+            Err(StorageError::RequestIdConflict)
+        ));
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn move_intent_replay_checks_payload_after_source_disappeared() {
+        let root = temp_root("cp14-move-intent-replay");
+        let space_id = {
+            let engine = StorageEngine::open(&root).unwrap();
+            let (_, space) = fixture(&engine);
+            engine
+                .write_file(
+                    &space.id,
+                    "/before.txt",
+                    b"payload",
+                    None,
+                    "cp14-move-setup",
+                )
+                .unwrap();
+            assert_eq!(
+                engine
+                    .move_path(
+                        &space.id,
+                        "/before.txt",
+                        "/after.txt",
+                        false,
+                        None,
+                        "cp14-move-id"
+                    )
+                    .unwrap(),
+                1
+            );
+            space.id
+        };
+        let reopened = StorageEngine::open(&root).unwrap();
+        assert_eq!(
+            reopened
+                .move_path(
+                    &space_id,
+                    "/before.txt",
+                    "/after.txt",
+                    false,
+                    None,
+                    "cp14-move-id"
+                )
+                .unwrap(),
+            1
+        );
+        assert!(matches!(
+            reopened.move_path(
+                &space_id,
+                "/before.txt",
+                "/after.txt",
+                true,
+                None,
+                "cp14-move-id"
+            ),
+            Err(StorageError::RequestIdConflict)
+        ));
+        assert!(matches!(
+            reopened.move_path(
+                &space_id,
+                "/before.txt",
+                "/after.txt",
+                false,
+                Some("mismatch"),
+                "cp14-move-id"
+            ),
+            Err(StorageError::RequestIdConflict)
+        ));
+        assert_eq!(
+            reopened.read_file(&space_id, "/after.txt").unwrap(),
+            b"payload"
+        );
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_copy_preallocates_full_child_plan_in_one_durable_admission() {
+        let root = temp_root("cp14-copy-durable-quota-plan");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (_, space) = fixture(&engine);
+        engine
+            .write_file(&space.id, "/src", b"payload", None, "g7-copy-source")
+            .unwrap();
+        let records = engine.file_records_under(&space.id, "/src").unwrap();
+        let fingerprint = semantic_fingerprint("COPY",&json!({
+            "from":"/src","to":"/dst","overwrite":false,
+            "records":records.iter().map(|r|json!({"path":r.path,"etag":r.etag,"size":r.size,"version":r.version})).collect::<Vec<_>>()
+        })).unwrap();
+        let fp = semantic_fingerprint(
+            "COPY_ITEM",
+            &json!({
+                "from":records[0].path,"to":"/dst","etag":records[0].etag,
+                "size":records[0].size,"version":records[0].version
+            }),
+        )
+        .unwrap();
+        engine
+            .prepare_composite_copy(
+                &space.id,
+                "g7-copy-plan",
+                &fingerprint,
+                "fs-copy:/src:/dst:false",
+                &[fp.clone()],
+            )
+            .unwrap();
+        {
+            let conn = engine.connection.lock().unwrap();
+            let (count,stored_fp,child): (i64,String,String) = conn.query_row(
+                "SELECT COUNT(*),MAX(item_fingerprint),MAX(json_extract(result_json,'$.childRequestId'))
+                 FROM durable_operation_items WHERE scope_kind='space' AND scope_id=?1 AND request_id='g7-copy-plan'",
+                params![space.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+            assert_eq!(count, 1);
+            assert_eq!(stored_fp, fp);
+            assert_eq!(child, "g7-copy-plan:copy:0");
+        }
+        assert!(engine.stat_file(&space.id, "/dst").unwrap().is_none());
+        drop(engine);
+        let reopened = StorageEngine::open(&root).unwrap();
+        let count: i64 = reopened.connection.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM durable_operation_items WHERE scope_id=?1 AND request_id='g7-copy-plan'",
+            params![space.id],|r|r.get(0)).unwrap();
+        assert_eq!(count, 1);
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_native_import_preallocates_each_child_before_external_file_changes() {
+        let root = temp_root("cp14-import-durable-quota-plan");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (_, space) = fixture(&engine);
+        let fingerprints = vec!["item-one".to_owned(), "item-two".to_owned()];
+        engine
+            .prepare_native_import_items(
+                &space.id,
+                "g7-import-plan",
+                "import-plan-fp",
+                &fingerprints,
+                false,
+            )
+            .unwrap();
+        let count: i64 = engine.connection.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM durable_operation_items WHERE scope_kind='space' AND scope_id=?1 AND request_id='g7-import-plan' AND phase='PENDING'",
+            params![space.id],|r|r.get(0)).unwrap();
+        assert_eq!(count, 2);
+        drop(engine);
+        let reopened = StorageEngine::open(&root).unwrap();
+        let count: i64 = reopened.connection.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM durable_operation_items WHERE scope_kind='space' AND scope_id=?1 AND request_id='g7-import-plan' AND phase='PENDING'",
+            params![space.id],|r|r.get(0)).unwrap();
+        assert_eq!(count, 2);
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copy_parent_receipt_binds_selected_source_manifest() {
+        let root = temp_root("cp14-copy-parent-replay");
+        let space_id = {
+            let engine = StorageEngine::open(&root).unwrap();
+            let (_, space) = fixture(&engine);
+            engine
+                .write_file(&space.id, "/source.txt", b"v1", None, "cp14-copy-source")
+                .unwrap();
+            assert_eq!(
+                engine
+                    .copy_path(&space.id, "/source.txt", "/copy.txt", false, "cp14-copy-id")
+                    .unwrap(),
+                1
+            );
+            space.id
+        };
+        let reopened = StorageEngine::open(&root).unwrap();
+        assert_eq!(
+            reopened
+                .copy_path(&space_id, "/source.txt", "/copy.txt", false, "cp14-copy-id")
+                .unwrap(),
+            1
+        );
+        assert!(matches!(
+            reopened.copy_path(&space_id, "/source.txt", "/copy.txt", true, "cp14-copy-id"),
+            Err(StorageError::RequestIdConflict)
+        ));
+        reopened
+            .write_file(
+                &space_id,
+                "/source.txt",
+                b"v2",
+                None,
+                "cp14-copy-source-updated",
+            )
+            .unwrap();
+        // The original terminal result is independent of subsequent source
+        // writes. A different destination/overwrite still conflicts.
+        assert_eq!(
+            reopened
+                .copy_path(&space_id, "/source.txt", "/copy.txt", false, "cp14-copy-id")
+                .unwrap(),
+            1
+        );
+        assert!(matches!(
+            reopened.copy_path(
+                &space_id,
+                "/source.txt",
+                "/other.txt",
+                false,
+                "cp14-copy-id"
+            ),
+            Err(StorageError::RequestIdConflict)
+        ));
+        reopened
+            .delete_path(
+                &space_id,
+                "/source.txt",
+                false,
+                None,
+                "cp14-copy-source-removed",
+            )
+            .unwrap();
+        assert_eq!(
+            reopened
+                .copy_path(&space_id, "/source.txt", "/copy.txt", false, "cp14-copy-id")
+                .unwrap(),
+            1
+        );
+        assert_eq!(reopened.read_file(&space_id, "/copy.txt").unwrap(), b"v1");
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_running_copy_changed_or_missing_source_never_reruns_children() {
+        let root = temp_root("cp14-running-copy-original-manifest");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (_, space) = fixture(&engine);
+        engine
+            .write_file(
+                &space.id,
+                "/src",
+                b"original",
+                None,
+                "copy-running-original",
+            )
+            .unwrap();
+        let records = engine.file_records_under(&space.id, "/src").unwrap();
+        let fingerprint = semantic_fingerprint("COPY",&json!({
+            "from":"/src","to":"/dst","overwrite":false,
+            "records":records.iter().map(|r|json!({"path":r.path,"etag":r.etag,"size":r.size,"version":r.version})).collect::<Vec<_>>()
+        })).unwrap();
+        engine
+            .prepare_composite_copy(
+                &space.id,
+                "copy-running-parent",
+                &fingerprint,
+                "fs-copy:/src:/dst:false",
+                &[],
+            )
+            .unwrap();
+        engine
+            .write_file(&space.id, "/src", b"modified", None, "copy-running-edited")
+            .unwrap();
+        assert!(matches!(
+            engine.copy_path(&space.id, "/src", "/dst", false, "copy-running-parent"),
+            Err(StorageError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            engine.copy_path(&space.id, "/src", "/other", false, "copy-running-parent"),
+            Err(StorageError::RequestIdConflict)
+        ));
+        assert!(engine.stat_file(&space.id, "/dst").unwrap().is_none());
+        engine
+            .delete_path(&space.id, "/src", false, None, "copy-running-deleted")
+            .unwrap();
+        assert!(matches!(
+            engine.copy_path(&space.id, "/src", "/dst", false, "copy-running-parent"),
+            Err(StorageError::RecoveryRequired)
+        ));
+        assert!(engine.stat_file(&space.id, "/dst").unwrap().is_none());
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unfingerprinted_legacy_delete_receipt_is_not_safe_replay_evidence() {
+        let root = temp_root("cp14-legacy-delete");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (_, space) = fixture(&engine);
+        engine
+            .write_file(&space.id, "/legacy.txt", b"data", None, "cp14-legacy-setup")
+            .unwrap();
+        {
+            let conn = engine.connection.lock().unwrap();
+            store_receipt(
+                &conn,
+                &space.id,
+                "legacy-delete-id",
+                "fs-delete:/legacy.txt:false",
+                &1_u64,
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            engine.delete_path(&space.id, "/legacy.txt", false, None, "legacy-delete-id"),
+            Err(StorageError::OutcomeUnknown)
+        ));
+        assert_eq!(engine.read_file(&space.id, "/legacy.txt").unwrap(), b"data");
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_file_write_keeps_fingerprint_during_recovery() {
+        let root = temp_root("pending-file-fingerprint");
+        let space_id =
+            {
+                let engine = StorageEngine::open(&root).unwrap();
+                let (_, space) = fixture(&engine);
+                assert!(engine
+                    .write_file_fault(
+                        &space.id,
+                        "/data",
+                        b"payload",
+                        None,
+                        "fp-file-crash",
+                        AtomicWriteFault::AfterJournal
+                    )
+                    .is_err());
+                let conn = engine.connection.lock().unwrap();
+                let fingerprint: Option<String> = conn.query_row(
+                "SELECT request_fingerprint FROM pending_mutations WHERE space_id=?1 AND id=?2",
+                params![space.id,"fp-file-crash"], |row| row.get(0),
+            ).unwrap();
+                assert_eq!(fingerprint.unwrap().len(), 64);
+                space.id
+            };
+        let recovered = StorageEngine::open(&root).unwrap();
+        let result = recovered
+            .write_file(&space_id, "/data", b"payload", None, "fp-file-crash")
+            .unwrap();
+        assert_eq!(result.version, 1);
+        assert!(matches!(
+            recovered.write_file(&space_id, "/data", b"changed", None, "fp-file-crash"),
+            Err(StorageError::RequestIdConflict)
+        ));
+        drop(recovered);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn v3_request_ids_cannot_enter_unfingerprinted_legacy_receipt_paths() {
+        // A versioned ID carries retention and semantic-fingerprint guarantees
+        // that the legacy FS/application receipt helpers cannot enforce.
+        let root = temp_root("v3-legacy-receipt-fence");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (app, space) = fixture(&engine);
+        let request_id = format!("request-v3-{}-{}", now_ms(), "a".repeat(32));
+        let conn = engine.connection.lock().unwrap();
+        assert!(matches!(
+            receipt::<u64>(&conn, &space.id, &request_id, "fs-delete:/test:false"),
+            Err(StorageError::RequestIdMigrationRequired)
+        ));
+        assert!(matches!(
+            application_receipt::<bool>(&conn, &app.id, &request_id, "revoke-grant"),
+            Err(StorageError::RequestIdMigrationRequired)
+        ));
+        drop(conn);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn v3_stream_status_reads_only_retained_fingerprinted_file_receipt() {
+        let root = temp_root("v3-stream-confirmed-receipt");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (_app, space) = fixture(&engine);
+        let request_id = format!("request-v3-{}-{}", now_ms(), "c".repeat(32));
+        let conn = engine.connection.lock().unwrap();
+        let stored = FileRecord {
+            path: "/stream.txt".into(),
+            version: 1,
+            etag: "f".repeat(64),
+            size: 5,
+            updated_at_ms: now_ms(),
+            content_type: None,
+            format_id: None,
+            opaque: None,
+        };
+        assert!(
+            confirmed_stream_file_receipt(&conn, &space.id, &request_id, "/stream.txt")
+                .unwrap()
+                .is_none()
+        );
+        sql_atomic_store(
+            &conn,
+            false,
+            &space.id,
+            &request_id,
+            &file_write_operation("/stream.txt"),
+            &"a".repeat(64),
+            &stored,
+        )
+        .unwrap();
+        assert_eq!(
+            confirmed_stream_file_receipt(&conn, &space.id, &request_id, "/stream.txt")
+                .unwrap()
+                .unwrap()
+                .etag,
+            stored.etag
+        );
+        assert!(matches!(
+            confirmed_stream_file_receipt(&conn, &space.id, &request_id, "/else.txt"),
+            Err(StorageError::RequestIdConflict)
+        ));
+        conn.execute("UPDATE mutation_receipts SET request_fingerprint=NULL WHERE space_id=?1 AND request_id=?2",
+            params![space.id,request_id]).unwrap();
+        assert!(matches!(
+            confirmed_stream_file_receipt(&conn, &space.id, &request_id, "/stream.txt"),
+            Err(StorageError::RecoveryRequired)
+        ));
+        drop(conn);
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stream_begin_persists_fingerprint_and_retains_terminal_evidence_seven_days() {
+        let root = temp_root("stream-fingerprint-retention");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (app, space) = fixture(&engine);
+        let pairing = engine
+            .create_pairing(&app.id, "stream-client", &"d".repeat(64))
+            .unwrap();
+        let operation = StreamOperationRecord {
+            pairing_id: pairing.id.clone(),
+            space_id: space.id.clone(),
+            request_id: "stream-begin-identity".into(),
+            stream_id: Uuid::new_v4().to_string(),
+            method: "PUT".into(),
+            path: "/example.txt".into(),
+            declared_size: Some(4),
+            request_fingerprint: Some("b".repeat(64)),
+            phase: "OPEN".into(),
+            state_revision: 1,
+            next_seq: 0,
+            confirmed_bytes: 0,
+            last_chunk_sha256: None,
+            last_chunk_len: 0,
+            result: None,
+        };
+        engine.begin_stream_operation(&operation).unwrap();
+        assert_eq!(
+            engine
+                .resolve_stream_operation(&pairing.id, &space.id, &operation.request_id)
+                .unwrap()
+                .unwrap()
+                .request_fingerprint,
+            operation.request_fingerprint
+        );
+        // Three-day-old terminal rows must survive both routine pruning paths.
+        let three_days_ago = now_ms() - 3 * 24 * 60 * 60 * 1000;
+        {
+            let conn = engine.connection.lock().unwrap();
+            conn.execute("UPDATE stream_operations SET phase='COMMITTED', updated_at_ms=?1 WHERE stream_id=?2",
+                params![three_days_ago, operation.stream_id]).unwrap();
+        }
+        engine.prune_stream_operations().unwrap();
+        assert!(engine
+            .resolve_stream_operation(&pairing.id, &space.id, &operation.request_id)
+            .unwrap()
+            .is_some());
+        let older_than_window = now_ms() - DURABLE_SQL_RECEIPT_TTL_MS - 60_000;
+        {
+            let conn = engine.connection.lock().unwrap();
+            conn.execute(
+                "UPDATE stream_operations SET updated_at_ms=?1 WHERE stream_id=?2",
+                params![older_than_window, operation.stream_id],
+            )
+            .unwrap();
+        }
+        engine.prune_stream_operations().unwrap();
+        assert!(engine
+            .resolve_stream_operation(&pairing.id, &space.id, &operation.request_id)
+            .unwrap()
+            .is_none());
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stream_abort_fence_recovers_terminal_after_restart_without_restarting_commit() {
+        let root = temp_root("stream-abort-fence-restart");
+        let (pairing_id, space_id) = {
+            let engine = StorageEngine::open(&root).unwrap();
+            let (app, space) = fixture(&engine);
+            let pairing = engine
+                .create_pairing(&app.id, "abort-client", &"9".repeat(64))
+                .unwrap();
+            for (id, phase) in [
+                ("abort-fenced", "ABORTING"),
+                ("commit-unknown", "COMMITTING"),
+            ] {
+                let op = StreamOperationRecord {
+                    pairing_id: pairing.id.clone(),
+                    space_id: space.id.clone(),
+                    request_id: id.into(),
+                    stream_id: format!("stream-{id}"),
+                    method: "PUT".into(),
+                    path: format!("/{id}.txt"),
+                    declared_size: None,
+                    request_fingerprint: Some("a".repeat(64)),
+                    phase: "OPEN".into(),
+                    state_revision: 1,
+                    next_seq: 0,
+                    confirmed_bytes: 0,
+                    last_chunk_sha256: None,
+                    last_chunk_len: 0,
+                    result: None,
+                };
+                engine.begin_stream_operation(&op).unwrap();
+                engine
+                    .finish_stream_operation(&op.stream_id, &pairing.id, "OPEN", phase, None)
+                    .unwrap();
+            }
+            (pairing.id, space.id)
+        };
+        let engine = StorageEngine::open(&root).unwrap();
+        let aborted = engine
+            .resolve_stream_operation(&pairing_id, &space_id, "abort-fenced")
+            .unwrap()
+            .unwrap();
+        assert_eq!(aborted.phase, "ABORTED");
+        assert!(aborted.result.is_none());
+        let unknown = engine
+            .resolve_stream_operation(&pairing_id, &space_id, "commit-unknown")
+            .unwrap()
+            .unwrap();
+        assert_eq!(unknown.phase, "UNCERTAIN");
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stream_begin_requires_semantic_identity_before_sql_insert() {
+        let root = temp_root("stream-fingerprint-required");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (app, space) = fixture(&engine);
+        let pairing = engine
+            .create_pairing(&app.id, "stream-client", &"e".repeat(64))
+            .unwrap();
+        let operation = StreamOperationRecord {
+            pairing_id: pairing.id.clone(),
+            space_id: space.id.clone(),
+            request_id: "stream-without-fingerprint".into(),
+            stream_id: Uuid::new_v4().to_string(),
+            method: "PUT".into(),
+            path: "/example.txt".into(),
+            declared_size: None,
+            request_fingerprint: None,
+            phase: "OPEN".into(),
+            state_revision: 1,
+            next_seq: 0,
+            confirmed_bytes: 0,
+            last_chunk_sha256: None,
+            last_chunk_len: 0,
+            result: None,
+        };
+        assert!(matches!(
+            engine.begin_stream_operation(&operation),
+            Err(StorageError::RequestInvalid(_))
+        ));
+        assert!(engine
+            .resolve_stream_operation(&pairing.id, &space.id, &operation.request_id)
+            .unwrap()
+            .is_none());
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deletion_retains_terminal_stream_journal_and_keeps_other_spaces() {
         let root = temp_root("delete-stream-fk");
         let engine = StorageEngine::open(&root).unwrap();
         let (app, doomed) = fixture(&engine);
@@ -7312,12 +17888,296 @@ mod tests {
             engine.read_file(&survivor.id, "/keep.txt").unwrap(),
             b"safe"
         );
-        assert!(engine
+        let retained = engine
             .resolve_stream_operation(&pairing.id, &doomed.id, "request-one")
+            .unwrap()
+            .expect("terminal stream evidence must survive owner deletion");
+        assert_eq!(retained.phase, "COMMITTED");
+        assert!(engine
+            .retained_stream_owned_by(&app.id, &pairing.id, &doomed.id, "request-one")
+            .unwrap());
+        assert!(!engine
+            .retained_stream_owned_by("other-app", &pairing.id, &doomed.id, "request-one")
+            .unwrap());
+        drop(engine);
+        StorageEngine::open(&root).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn space_deletion_preserves_owner_bound_receipt_across_restart() {
+        let root = temp_root("retained-space-receipt");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (app, space) = fixture(&engine);
+        engine
+            .write_file(&space.id, "/history.txt", b"content", None, "history-id")
+            .unwrap();
+        assert!(engine
+            .retained_space_receipt(&app.id, &space.id, "history-id")
+            .unwrap()
+            .is_none());
+        engine.delete_space(&space.id).unwrap();
+        assert!(engine.get_space(&space.id).unwrap().is_none());
+        assert!(engine
+            .retained_space_receipt(&app.id, &space.id, "history-id")
+            .unwrap()
+            .is_some());
+        assert!(engine
+            .retained_space_receipt("different-owner", &space.id, "history-id")
             .unwrap()
             .is_none());
         drop(engine);
-        StorageEngine::open(&root).unwrap();
+        let reopened = StorageEngine::open(&root).unwrap();
+        assert!(reopened
+            .retained_space_receipt(&app.id, &space.id, "history-id")
+            .unwrap()
+            .is_some());
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stable_space_deletion_replays_after_restart_without_recreating_owner() {
+        let root = temp_root("delete-space-idempotent");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (_, space) = fixture(&engine);
+        engine
+            .write_file(&space.id, "/one", b"abcd", None, "test-write")
+            .unwrap();
+        let request = "space-delete-stable-request-12345";
+        let first = engine
+            .delete_space_with_request(&space.id, request)
+            .unwrap();
+        assert_eq!(first, (4, 1));
+        drop(engine);
+        let reopened = StorageEngine::open(&root).unwrap();
+        assert_eq!(
+            reopened
+                .delete_space_with_request(&space.id, request)
+                .unwrap(),
+            first
+        );
+        let status = reopened
+            .desktop_owner_deletion_status(request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status["phase"], "COMMITTED");
+        assert!(status["result"].is_array());
+        assert!(matches!(
+            reopened.delete_space_with_request(&space.id, "different-request-abc"),
+            Err(StorageError::NotFound(_))
+        ));
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stable_application_deletion_replays_after_restart_without_reauth() {
+        let root = temp_root("delete-application-idempotent");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (app, space) = fixture(&engine);
+        engine
+            .write_file(&space.id, "/one", b"abcd", None, "test-write")
+            .unwrap();
+        let request = "application-delete-stable-request-12345";
+        let first = engine
+            .delete_application_data_with_request(&app.id, request)
+            .unwrap();
+        assert_eq!(first, (1, 4, 1));
+        drop(engine);
+        let reopened = StorageEngine::open(&root).unwrap();
+        assert_eq!(
+            reopened
+                .delete_application_data_with_request(&app.id, request)
+                .unwrap(),
+            first
+        );
+        let status = reopened
+            .desktop_owner_deletion_status(request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status["phase"], "COMMITTED");
+        assert!(status["result"].is_array());
+        assert!(matches!(
+            reopened.delete_application_data_with_request(&app.id, "another-request-abc"),
+            Err(StorageError::NotFound(_))
+        ));
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owner_deletion_rejects_reused_identity_and_uncertain_parent() {
+        let root = temp_root("delete-owner-unknown");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (_, space) = fixture(&engine);
+        let request = "delete-stable-incomplete-12345";
+        let now = now_ms();
+        {
+            let conn = engine.connection.lock().unwrap();
+            conn.execute("INSERT INTO durable_operations(scope_kind,scope_id,request_id,kind,owner_application_id,identity_version,request_fingerprint,phase,request_started_at_ms,created_at_ms,updated_at_ms) VALUES('space',?1,?2,'SPACE_DELETE',?3,3,?4,'ADMITTED',?5,?5,?5)",
+                params![space.id,request,space.owner_application_id,owner_deletion_fingerprint("SPACE_DELETE", &space.id).unwrap(),now]).unwrap();
+        }
+        assert!(matches!(
+            engine.delete_space_with_request(&space.id, request),
+            Err(StorageError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            engine.delete_application_data_with_request(&space.owner_application_id, request),
+            Err(StorageError::RecoveryRequired)
+        ));
+        {
+            let conn = engine.connection.lock().unwrap();
+            conn.execute("UPDATE durable_operations SET kind='OTHER' WHERE scope_kind='space' AND scope_id=?1 AND request_id=?2",
+                params![space.id,request]).unwrap();
+        }
+        assert!(matches!(
+            engine.delete_space_with_request(&space.id, request),
+            Err(StorageError::RequestIdConflict)
+        ));
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deleted_application_history_proof_is_terminal_scoped_and_cannot_repair_pairing() {
+        let root = temp_root("deleted-owner-history-proof");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (app, _) = fixture(&engine);
+        let old_secret = sha256_hex(b"old credential");
+        let new_secret = sha256_hex(b"new credential");
+        let old = engine
+            .create_pairing(&app.id, "same-client", &old_secret)
+            .unwrap();
+        let active = engine
+            .create_pairing(&app.id, "same-client", &new_secret)
+            .unwrap();
+        assert!(engine
+            .pairing_by_id(&old.id)
+            .unwrap()
+            .unwrap()
+            .revoked_at_ms
+            .is_some());
+        let operation_id = "history-job-abcdef1234567890";
+        assert!(engine
+            .admit_application_long_job(&app.id, operation_id, "batch", "owner-fingerprint")
+            .unwrap());
+        let snapshot = json!({"id": operation_id, "result": {"confirmed": true}});
+        engine
+            .finish_application_long_job(&app.id, operation_id, "COMMITTED", &snapshot)
+            .unwrap();
+        engine.delete_application_data(&app.id).unwrap();
+        assert!(engine.pairing_by_id(&active.id).unwrap().is_none());
+        assert!(engine
+            .retained_status_owner("same-client", &old_secret)
+            .unwrap()
+            .is_none());
+        assert!(engine
+            .retained_status_owner("new-client", &new_secret)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            engine
+                .retained_status_owner("same-client", &new_secret)
+                .unwrap(),
+            Some((app.id.clone(), active.id.clone()))
+        );
+        assert_eq!(
+            engine
+                .retained_challenge_hash(app.kind.clone(), &app.external_id, "same-client")
+                .unwrap(),
+            Some(new_secret.clone())
+        );
+        assert!(engine
+            .retained_challenge_hash(app.kind.clone(), &app.external_id, "new-client")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            engine
+                .retained_terminal_operation(&app.id, operation_id)
+                .unwrap(),
+            Some(snapshot.clone())
+        );
+        assert!(engine
+            .retained_terminal_operation(&Uuid::new_v4().to_string(), operation_id)
+            .unwrap()
+            .is_none());
+        drop(engine);
+        let reopened = StorageEngine::open(&root).unwrap();
+        assert_eq!(
+            reopened
+                .retained_status_owner("same-client", &new_secret)
+                .unwrap(),
+            Some((app.id.clone(), active.id.clone()))
+        );
+        assert_eq!(
+            reopened
+                .retained_terminal_operation(&app.id, operation_id)
+                .unwrap(),
+            Some(snapshot)
+        );
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nonterminal_deleted_application_jobs_have_no_terminal_history_result() {
+        let root = temp_root("deleted-owner-unresolved-proof");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (app, _) = fixture(&engine);
+        let id = "history-job-running-abcdef123456";
+        assert!(engine
+            .admit_application_long_job(&app.id, id, "native-export", "fingerprint")
+            .unwrap());
+        assert!(engine
+            .retained_terminal_operation(&app.id, id)
+            .unwrap()
+            .is_none());
+        // Incomplete evidence forbids owner deletion before cleanup or repair.
+        assert!(engine.delete_application_data(&app.id).is_err());
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn application_deletion_retains_results_without_reactivating_pairing() {
+        let root = temp_root("retained-application-evidence");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (app, space) = fixture(&engine);
+        engine
+            .write_file(&space.id, "/data.txt", b"payload", None, "owned-receipt")
+            .unwrap();
+        let pair = engine
+            .create_pairing(&app.id, "client-history", &"d".repeat(64))
+            .unwrap();
+        engine.delete_application_data(&app.id).unwrap();
+        assert!(engine.get_application(&app.id).unwrap().is_none());
+        assert!(engine.pairing_by_id(&pair.id).unwrap().is_none());
+        assert!(engine
+            .retained_space_receipt(&app.id, &space.id, "owned-receipt")
+            .unwrap()
+            .is_some());
+        assert!(!engine
+            .retained_stream_owned_by(&app.id, &pair.id, &space.id, "stream-unknown")
+            .unwrap());
+        let conn = engine.connection.lock().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT owner_application_id FROM retained_pairing_owners WHERE pairing_id=?1",
+                params![pair.id],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            app.id
+        );
+        drop(conn);
+        drop(engine);
+        let reopened = StorageEngine::open(&root).unwrap();
+        assert!(reopened
+            .retained_space_receipt(&app.id, &space.id, "owned-receipt")
+            .unwrap()
+            .is_some());
+        drop(reopened);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7444,19 +18304,23 @@ mod tests {
             .kv_set(&space.id, "resume", &json!({"rev":1}), None, None, "req-1")
             .unwrap();
         let replay = engine
-            .kv_set(
+            .kv_set(&space.id, "resume", &json!({"rev":1}), None, None, "req-1")
+            .unwrap();
+        assert_eq!(first, replay);
+        assert!(matches!(
+            engine.kv_set(
                 &space.id,
                 "resume",
                 &json!({"rev":999}),
                 None,
                 None,
-                "req-1",
-            )
-            .unwrap();
-        assert_eq!(first, replay);
+                "req-1"
+            ),
+            Err(StorageError::RequestIdConflict)
+        ));
         assert!(matches!(
             engine.kv_set(&space.id, "other", &json!({"rev":1}), None, None, "req-1"),
-            Err(StorageError::Conflict(_))
+            Err(StorageError::RequestIdConflict)
         ));
         assert!(matches!(
             engine.kv_set(
@@ -7480,6 +18344,162 @@ mod tests {
             )
             .unwrap();
         assert_eq!(second.version, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sql_identity_replays_without_update_and_conflicts_on_changed_intent() {
+        let root = temp_root("sql-identity");
+        let destination = temp_root("sql-identity-destination");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (app, space) = fixture(&engine);
+        let first = engine
+            .kv_set_outcome(&space.id, "key", &json!({"a":1}), None, None, "sql-kv-1")
+            .unwrap();
+        assert_eq!(first.disposition, MutationDisposition::Applied);
+        let replay = engine
+            .kv_set_outcome(&space.id, "key", &json!({"a":1}), None, None, "sql-kv-1")
+            .unwrap();
+        assert_eq!(replay.disposition, MutationDisposition::Replayed);
+        assert_eq!(first.value.version, replay.value.version);
+        assert!(matches!(
+            engine.kv_set_outcome(&space.id, "key", &json!({"a":2}), None, None, "sql-kv-1"),
+            Err(StorageError::RequestIdConflict)
+        ));
+        let grant = engine
+            .create_directory_grant(
+                &app.id,
+                &destination,
+                None,
+                DirectoryGrantCapability::ReadWrite,
+            )
+            .unwrap();
+        let first_preset = engine
+            .save_export_preset_with_request(
+                &app.id,
+                None,
+                "Export",
+                &grant.id,
+                NativeExportMode::Directory,
+                ExportConflictPolicy::UpdateChanged,
+                "/",
+                None,
+                "sql-preset-1",
+            )
+            .unwrap();
+        let replay_preset = engine
+            .save_export_preset_with_request(
+                &app.id,
+                None,
+                "Export",
+                &grant.id,
+                NativeExportMode::Directory,
+                ExportConflictPolicy::UpdateChanged,
+                "/",
+                None,
+                "sql-preset-1",
+            )
+            .unwrap();
+        assert_eq!(first_preset.id, replay_preset.id);
+        assert_eq!(first_preset.created_at_ms, replay_preset.created_at_ms);
+        assert!(matches!(
+            engine.save_export_preset_with_request(
+                &app.id,
+                None,
+                "Other",
+                &grant.id,
+                NativeExportMode::Directory,
+                ExportConflictPolicy::UpdateChanged,
+                "/",
+                None,
+                "sql-preset-1"
+            ),
+            Err(StorageError::RequestIdConflict)
+        ));
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(destination);
+    }
+
+    #[test]
+    fn cp14_live_receipt_status_is_owner_scoped_and_survives_restart() {
+        let root = temp_root("cp14-live-sql-status");
+        let (owner, space_id) = {
+            let engine = StorageEngine::open(&root).unwrap();
+            let (app, space) = fixture(&engine);
+            engine
+                .kv_set(
+                    &space.id,
+                    "status",
+                    &json!({"value":1}),
+                    None,
+                    None,
+                    "live-receipt-1",
+                )
+                .unwrap();
+            let stored = engine
+                .live_sql_receipt(&app.id, "space", &space.id, "live-receipt-1")
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored["identityVersion"], 3);
+            assert_eq!(stored["requestId"], "live-receipt-1");
+            assert_eq!(stored["result"]["version"], 1);
+            assert_eq!(stored["requestFingerprint"].as_str().unwrap().len(), 64);
+            assert!(engine
+                .live_sql_receipt("wrong-owner", "space", &space.id, "live-receipt-1")
+                .unwrap()
+                .is_none());
+            assert!(engine
+                .live_sql_receipt(&app.id, "space", "wrong-space", "live-receipt-1")
+                .unwrap()
+                .is_none());
+            assert!(matches!(
+                engine.live_sql_receipt(&app.id, "application", &space.id, "live-receipt-1"),
+                Err(StorageError::RequestInvalid(_))
+            ));
+            {
+                let conn = engine.connection.lock().unwrap();
+                sql_atomic_store(
+                    &conn,
+                    true,
+                    &app.id,
+                    "app-receipt-1",
+                    "test-operation",
+                    &"a".repeat(64),
+                    &json!({"ok":true}),
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                engine
+                    .live_sql_receipt(&app.id, "application", &app.id, "app-receipt-1")
+                    .unwrap()
+                    .unwrap()["result"]["ok"],
+                true
+            );
+            (app.id, space.id)
+        };
+        let reopened = StorageEngine::open(&root).unwrap();
+        assert_eq!(
+            reopened
+                .live_sql_receipt(&owner, "space", &space_id, "live-receipt-1")
+                .unwrap()
+                .unwrap()["result"]["version"],
+            1
+        );
+        {
+            let conn = reopened.connection.lock().unwrap();
+            conn.execute(
+                "UPDATE mutation_receipts SET expires_at_ms=?1 WHERE space_id=?2 AND request_id=?3",
+                params![now_ms() - 1, space_id, "live-receipt-1"],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            reopened.live_sql_receipt(&owner, "space", &space_id, "live-receipt-1"),
+            Err(StorageError::ResultExpired)
+        ));
+        drop(reopened);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7578,64 +18598,79 @@ mod tests {
     }
 
     #[test]
-    fn cp1_old_registry_pairings_migrate_to_put_without_credential_loss() {
-        let root = temp_root("cp1-migrate");
+    fn registry_v2_upgrade_retains_pairings_and_pre_v3_backup() {
+        let root = temp_root("registry-v2-migrate");
         let engine = StorageEngine::open(&root).unwrap();
-        let app = engine
-            .register_application(ApplicationKind::FigmaPlugin, "cp1.legacy", "Legacy")
-            .unwrap();
-        let legacy = engine
-            .create_pairing(&app.id, "legacy", &"d".repeat(64))
-            .unwrap();
         drop(engine);
-        // Simulate the old pre-CP1 registry: schema_meta and pairings exist, policy table doesn't.
-        let db = root.join("runtime/registry.sqlite3");
-        let conn = Connection::open(&db).unwrap();
-        conn.execute_batch(
-            "DROP TABLE pairing_transport_policies; UPDATE schema_meta SET version=1;",
-        )
-        .unwrap();
-        drop(conn);
-        let reopened = StorageEngine::open(&root).unwrap();
-        let backups = fs::read_dir(root.join("runtime/registry-backups"))
+        // Exercise an actual v2-shaped backup, not a v3 schema with its
+        // version number manually overwritten.
+        let backups = root.join("runtime/registry-backups");
+        let source = fs::read_dir(&backups)
             .unwrap()
             .filter_map(Result::ok)
             .map(|entry| entry.path())
-            .filter(|path| {
+            .find(|path| {
                 path.file_name()
                     .unwrap()
                     .to_string_lossy()
-                    .contains("-pre-v2-")
+                    .contains("-pre-v3-")
             })
-            .collect::<Vec<_>>();
-        assert_eq!(backups.len(), 1);
-        let old_conn = Connection::open(&backups[0]).unwrap();
-        let original_version: i64 = old_conn
-            .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(original_version, 1);
-        drop(old_conn);
+        let db = root.join("runtime/registry.sqlite3");
+        for suffix in ["-wal", "-shm"] {
+            let _ = fs::remove_file(format!("{}{}", db.display(), suffix));
+        }
+        fs::copy(&source, &db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let app_id = Uuid::new_v4().to_string();
+        let pairing_id = Uuid::new_v4().to_string();
+        conn.execute("INSERT INTO applications(id,kind,external_id,display_name,created_at_ms) VALUES(?1,'figma-plugin','legacy.v2','Legacy',1)", params![app_id]).unwrap();
+        conn.execute("INSERT INTO pairings(id,application_id,client_instance_id,credential_hash,created_at_ms) VALUES(?1,?2,'client','1234567890123456789012345678901234567890123456789012345678901234',1)", params![pairing_id,app_id]).unwrap();
+        conn.execute("INSERT INTO pairing_transport_policies(pairing_id,declared_methods,selected_method,revision,updated_at_ms) VALUES(?1,'[\"PUT\"]','PUT',1,1)", params![pairing_id]).unwrap();
+        drop(conn);
+        let reopened = StorageEngine::open(&root).unwrap();
         assert_eq!(
             reopened
-                .pairing_by_id(&legacy.id)
+                .pairing_by_id(&pairing_id)
                 .unwrap()
                 .unwrap()
-                .credential_hash,
-            "d".repeat(64)
+                .application_id,
+            app_id
         );
-        let policy = reopened
-            .pairing_transport_policy(&legacy.id)
+        assert_eq!(
+            reopened
+                .pairing_transport_policy(&pairing_id)
+                .unwrap()
+                .unwrap()
+                .selected_method,
+            "PUT"
+        );
+        let version: i64 = reopened
+            .connection
+            .lock()
             .unwrap()
-            .unwrap();
-        assert_eq!(policy.declared_methods, vec!["PUT"]);
-        assert_eq!(policy.selected_method, "PUT");
-        let conn = Connection::open(&db).unwrap();
-        let schema: i64 = conn
             .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(schema, 2);
-        drop(conn);
+        assert_eq!(version, 3);
+        assert!(fs::read_dir(&backups)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains("-pre-v3-")));
         drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn second_core_owner_cannot_open_same_storage_root() {
+        let root = temp_root("root-owner");
+        let first = StorageEngine::open(&root).unwrap();
+        assert!(matches!(
+            StorageEngine::open(&root),
+            Err(StorageError::StorageRootBusy)
+        ));
+        drop(first);
+        let second = StorageEngine::open(&root).unwrap();
+        drop(second);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7733,6 +18768,257 @@ mod tests {
             .unwrap();
         assert_eq!(second.version, 2);
         assert_eq!(engine.read_file(&space.id, &second.path).unwrap(), b"two");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_composite_move_overwrite_replays_after_restart() {
+        let root = temp_root("move-composite-replay");
+        let space_id = {
+            let engine = StorageEngine::open(&root).unwrap();
+            let (_, space) = fixture(&engine);
+            engine
+                .write_file(&space.id, "/old.txt", b"new", None, "move-old")
+                .unwrap();
+            engine
+                .write_file(&space.id, "/new.txt", b"old", None, "move-new")
+                .unwrap();
+            assert_eq!(
+                engine
+                    .move_path(&space.id, "/old.txt", "/new.txt", true, None, "move-stable")
+                    .unwrap(),
+                1
+            );
+            space.id
+        };
+        let engine = StorageEngine::open(&root).unwrap();
+        assert_eq!(
+            engine
+                .move_path(&space_id, "/old.txt", "/new.txt", true, None, "move-stable")
+                .unwrap(),
+            1
+        );
+        assert_eq!(engine.read_file(&space_id, "/new.txt").unwrap(), b"new");
+        assert!(engine.stat_file(&space_id, "/old.txt").unwrap().is_none());
+        assert!(matches!(
+            engine.move_path(
+                &space_id,
+                "/old.txt",
+                "/new.txt",
+                true,
+                Some("changed"),
+                "move-stable"
+            ),
+            Err(StorageError::RequestIdConflict)
+        ));
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_composite_move_reconciles_committed_copy_before_delete() {
+        let root = temp_root("move-composite-copy-recovery");
+        let space_id = {
+            let engine = StorageEngine::open(&root).unwrap();
+            let (_, space) = fixture(&engine);
+            engine
+                .write_file(&space.id, "/old.txt", b"new", None, "move-child-old")
+                .unwrap();
+            engine
+                .write_file(&space.id, "/new.txt", b"old", None, "move-child-new")
+                .unwrap();
+            let plan = MoveFallbackPlan {
+                from: "/old.txt".into(),
+                to: "/new.txt".into(),
+                overwrite: true,
+                if_match: None,
+                records: engine.file_records_under(&space.id, "/old.txt").unwrap(),
+            };
+            engine
+                .prepare_composite_move(
+                    &space.id,
+                    "move-composite-2",
+                    &semantic_fingerprint(
+                        "MOVE",
+                        &json!({"from":"/old.txt","to":"/new.txt","overwrite":true,"ifMatch":null}),
+                    )
+                    .unwrap(),
+                    &plan,
+                )
+                .unwrap();
+            engine
+                .set_composite_move_item(&space.id, "move-composite-2", 0, "RUNNING", None)
+                .unwrap();
+            assert_eq!(
+                engine
+                    .copy_path(
+                        &space.id,
+                        "/old.txt",
+                        "/new.txt",
+                        true,
+                        "move-composite-2:copy"
+                    )
+                    .unwrap(),
+                1
+            );
+            space.id
+        };
+        let engine = StorageEngine::open(&root).unwrap();
+        assert_eq!(
+            engine
+                .move_path(
+                    &space_id,
+                    "/old.txt",
+                    "/new.txt",
+                    true,
+                    None,
+                    "move-composite-2"
+                )
+                .unwrap(),
+            1
+        );
+        assert!(engine.stat_file(&space_id, "/old.txt").unwrap().is_none());
+        assert_eq!(engine.read_file(&space_id, "/new.txt").unwrap(), b"new");
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_cancel_request_survives_restart_and_never_becomes_false_abort() {
+        let root = temp_root("cp14-cancel-intent-restart");
+        let operation_id = "operation-cancel-intent-0001";
+        {
+            let engine = StorageEngine::open(&root).unwrap();
+            assert!(engine
+                .admit_application_long_job("owner-one", operation_id, "native-import", "fp-one")
+                .unwrap());
+            // Original source selection must survive the cancellation marker.
+            let conn = engine.connection.lock().unwrap();
+            conn.execute("UPDATE durable_operations SET result_json=?1 WHERE scope_kind='application' AND scope_id='owner-one' AND request_id=?2",
+                params![r#"{"spaceId":"space-a","requestId":"native-child-a"}"#,operation_id]).unwrap();
+            drop(conn);
+            engine
+                .request_application_long_job_cancel("owner-one", operation_id, "fp-one")
+                .unwrap();
+            engine
+                .request_application_long_job_cancel("owner-one", operation_id, "fp-one")
+                .unwrap();
+            assert!(matches!(
+                engine.request_application_long_job_cancel("owner-one", operation_id, "changed"),
+                Err(StorageError::RequestIdConflict)
+            ));
+            assert!(matches!(
+                engine.request_application_long_job_cancel("owner-two", operation_id, "fp-one"),
+                Err(StorageError::RecoveryRequired)
+            ));
+        }
+        let engine = StorageEngine::open(&root).unwrap();
+        let (_, _, phase, evidence) = engine
+            .application_long_job("owner-one", operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(phase, "RECONCILING");
+        let evidence = evidence.unwrap();
+        assert!(evidence.get("_cancelRequestedAtMs").is_some());
+        assert_eq!(evidence["spaceId"], "space-a");
+        assert!(matches!(
+            engine.resume_application_native_import(
+                "owner-one",
+                operation_id,
+                "fp-one",
+                "space-a",
+                "native-child-a"
+            ),
+            Err(StorageError::OutcomeUnknown)
+        ));
+        // Only a real worker outcome may transition cancellation to terminal.
+        engine
+            .finish_application_long_job("owner-one", operation_id, "ABORTED", &json!({"ok":false}))
+            .unwrap();
+        let (_, _, phase, _) = engine
+            .application_long_job("owner-one", operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(phase, "ABORTED");
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_cancel_intent_can_be_terminalized_by_inflight_worker() {
+        let root = temp_root("cp14-cancel-worker-terminal");
+        let engine = StorageEngine::open(&root).unwrap();
+        let id = "operation-cancel-worker-0001";
+        engine
+            .admit_application_long_job("owner-one", id, "batch", "fp")
+            .unwrap();
+        engine
+            .request_application_long_job_cancel("owner-one", id, "fp")
+            .unwrap();
+        engine
+            .finish_application_long_job("owner-one", id, "COMMITTED", &json!({"completed":true}))
+            .unwrap();
+        let (_, _, phase, evidence) = engine
+            .application_long_job("owner-one", id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(phase, "COMMITTED");
+        assert_eq!(evidence.unwrap()["completed"], true);
+        assert!(matches!(
+            engine.request_application_long_job_cancel("owner-one", id, "fp"),
+            Err(StorageError::RecoveryRequired)
+        ));
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_composite_move_running_without_child_receipt_is_uncertain() {
+        let root = temp_root("move-composite-uncertain");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (_, space) = fixture(&engine);
+        engine
+            .write_file(&space.id, "/old.txt", b"new", None, "move-uncertain-old")
+            .unwrap();
+        engine
+            .write_file(&space.id, "/new.txt", b"old", None, "move-uncertain-new")
+            .unwrap();
+        let plan = MoveFallbackPlan {
+            from: "/old.txt".into(),
+            to: "/new.txt".into(),
+            overwrite: true,
+            if_match: None,
+            records: engine.file_records_under(&space.id, "/old.txt").unwrap(),
+        };
+        engine
+            .prepare_composite_move(
+                &space.id,
+                "move-composite-3",
+                &semantic_fingerprint(
+                    "MOVE",
+                    &json!({"from":"/old.txt","to":"/new.txt","overwrite":true,"ifMatch":null}),
+                )
+                .unwrap(),
+                &plan,
+            )
+            .unwrap();
+        engine
+            .set_composite_move_item(&space.id, "move-composite-3", 0, "RUNNING", None)
+            .unwrap();
+        assert!(matches!(
+            engine.move_path(
+                &space.id,
+                "/old.txt",
+                "/new.txt",
+                true,
+                None,
+                "move-composite-3"
+            ),
+            Err(StorageError::RecoveryRequired)
+        ));
+        assert_eq!(engine.read_file(&space.id, "/old.txt").unwrap(), b"new");
+        assert_eq!(engine.read_file(&space.id, "/new.txt").unwrap(), b"old");
+        drop(engine);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7937,7 +19223,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, 2);
+        assert_eq!(schema_version, 3);
         assert_eq!(
             fs::read(&persistent_manifest_path).unwrap(),
             manifest_before
@@ -8047,12 +19333,12 @@ mod tests {
         }
         {
             let conn = Connection::open(root.join("runtime/registry.sqlite3")).unwrap();
-            conn.execute("UPDATE schema_meta SET version=3", [])
+            conn.execute("UPDATE schema_meta SET version=4", [])
                 .unwrap();
         }
         assert!(matches!(
             StorageEngine::open(&root),
-            Err(StorageError::SchemaUnsupported(3))
+            Err(StorageError::SchemaUnsupported(4))
         ));
         let conn = Connection::open(root.join("runtime/registry.sqlite3")).unwrap();
         let version: i64 = conn
@@ -8152,6 +19438,97 @@ mod tests {
             engine.clear_cache_space(&persistent.id),
             Err(StorageError::RequestInvalid(_))
         ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn public_space_clear_replays_original_report_after_restart_without_erasing_new_data() {
+        let root = temp_root("cp14-space-clear-replay");
+        let space_id = {
+            let engine = StorageEngine::open(&root).unwrap();
+            let app = engine
+                .register_application(ApplicationKind::FigmaPlugin, "cp14-clear", "Clear Test")
+                .unwrap();
+            let space = engine
+                .open_space(&app.id, "cache", StorageClass::Cache, None)
+                .unwrap();
+            engine
+                .write_file(&space.id, "/old.bin", b"old", None, "old-clear-write")
+                .unwrap();
+            engine
+                .kv_set(
+                    &space.id,
+                    "old",
+                    &json!({"v":1}),
+                    None,
+                    None,
+                    "old-clear-kv",
+                )
+                .unwrap();
+            let first = engine
+                .clear_disposable_space_with_request(&space.id, "clear-id-one")
+                .unwrap();
+            assert_eq!(first.disposition, MutationDisposition::Applied);
+            assert_eq!(first.value.deleted_files, 1);
+            assert_eq!(first.value.deleted_kv_entries, 1);
+            space.id
+        };
+        let engine = StorageEngine::open(&root).unwrap();
+        engine
+            .write_file(&space_id, "/new.bin", b"new", None, "new-clear-write")
+            .unwrap();
+        let prior = engine
+            .clear_disposable_space_with_request(&space_id, "clear-id-one")
+            .unwrap();
+        assert_eq!(prior.disposition, MutationDisposition::Replayed);
+        assert_eq!(prior.value.deleted_files, 1);
+        assert_eq!(engine.read_file(&space_id, "/new.bin").unwrap(), b"new");
+        let conn = engine.connection.lock().unwrap();
+        let stored: (String,String) = conn.query_row(
+            "SELECT phase,request_fingerprint FROM durable_operations WHERE scope_kind='space' AND scope_id=?1 AND request_id='clear-id-one'",
+            params![space_id],|r|Ok((r.get(0)?,r.get(1)?)),
+        ).unwrap();
+        assert_eq!(stored.0, "COMMITTED");
+        let receipt: String = conn.query_row(
+            "SELECT request_fingerprint FROM mutation_receipts WHERE space_id=?1 AND request_id='clear-id-one'",
+            params![space_id],|r|r.get(0),
+        ).unwrap();
+        assert_eq!(stored.1, receipt);
+        drop(conn);
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn admitted_space_clear_is_not_reexecuted_without_verified_outcome() {
+        let root = temp_root("cp14-space-clear-uncertain");
+        let engine = StorageEngine::open(&root).unwrap();
+        let app = engine
+            .register_application(
+                ApplicationKind::FigmaPlugin,
+                "cp14-clear-uncertain",
+                "Uncertain",
+            )
+            .unwrap();
+        let space = engine
+            .open_space(&app.id, "cache", StorageClass::Cache, None)
+            .unwrap();
+        engine
+            .write_file(&space.id, "/remain", b"present", None, "clear-remain-write")
+            .unwrap();
+        let fingerprint =
+            semantic_fingerprint("space-clear", &json!({"spaceId":space.id})).unwrap();
+        let now = now_ms();
+        engine.connection.lock().unwrap().execute(
+            "INSERT INTO durable_operations(scope_kind,scope_id,request_id,kind,owner_application_id,identity_version,request_fingerprint,phase,request_started_at_ms,created_at_ms,updated_at_ms) VALUES('space',?1,'uncertain-clear','SPACE_CLEAR',?2,3,?3,'ADMITTED',?4,?4,?4)",
+            params![space.id,app.id,fingerprint,now],
+        ).unwrap();
+        assert!(matches!(
+            engine.clear_disposable_space_with_request(&space.id, "uncertain-clear"),
+            Err(StorageError::RecoveryRequired)
+        ));
+        assert_eq!(engine.read_file(&space.id, "/remain").unwrap(), b"present");
+        drop(engine);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -8296,6 +19673,91 @@ mod tests {
         assert!(archive_text.contains("files/project.txt"));
         assert!(archive_text.contains("user-payload-marker"));
         assert!(!archive_text.contains(&pairing_marker));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp19_external_change_is_not_silently_adopted_by_usage_reconciliation() {
+        let root = temp_root("cp19-adoption");
+        let engine = StorageEngine::open(&root).unwrap();
+        let (_, space) = fixture(&engine);
+        engine
+            .write_file(&space.id, "/known.txt", b"known", None, "cp19-known")
+            .unwrap();
+        let before = engine.get_space(&space.id).unwrap().unwrap();
+        let data = root.join("spaces").join(&space.id).join("data");
+        fs::write(data.join("external.txt"), b"external").unwrap();
+        assert!(matches!(
+            engine.verify_space_usage(&space.id, || false),
+            Err(StorageError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            engine.reconcile_space_usage(&space.id, || false),
+            Err(StorageError::RecoveryRequired)
+        ));
+        assert_eq!(
+            engine.get_space(&space.id).unwrap().unwrap().file_count,
+            before.file_count
+        );
+        let repaired = engine
+            .repair_space(&space.id, || false, |_, _, _, _| {})
+            .unwrap();
+        assert_eq!(repaired.outcome, RepairOutcome::Repaired);
+        assert_eq!(repaired.file_count, 2);
+        assert_eq!(engine.verify_space_usage(&space.id, || false).unwrap().1, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp19_repair_keeps_space_lease_through_scan_and_commit() {
+        use std::{
+            sync::{mpsc, Arc},
+            thread,
+            time::Duration,
+        };
+        let root = temp_root("cp19-lease");
+        let engine = Arc::new(StorageEngine::open(&root).unwrap());
+        let (_, space) = fixture(&engine);
+        engine
+            .write_file(&space.id, "/original.txt", b"one", None, "cp19-original")
+            .unwrap();
+        let (scan_tx, scan_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let repair_engine = Arc::clone(&engine);
+        let repair_space_id = space.id.clone();
+        let repair = thread::spawn(move || {
+            repair_engine.repair_space(
+                &repair_space_id,
+                || false,
+                |phase, _, _, _| {
+                    if phase == "scan-and-reconcile" {
+                        scan_tx.send(()).unwrap();
+                        continue_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                    }
+                },
+            )
+        });
+        scan_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let writer_engine = Arc::clone(&engine);
+        let writer_space = space.id.clone();
+        let (write_tx, write_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let result =
+                writer_engine.write_file(&writer_space, "/later.txt", b"two", None, "cp19-later");
+            write_tx.send(result).unwrap();
+        });
+        assert!(
+            write_rx.recv_timeout(Duration::from_millis(70)).is_err(),
+            "writer entered while repair scanned"
+        );
+        continue_tx.send(()).unwrap();
+        repair.join().unwrap().unwrap();
+        assert!(write_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .is_ok());
+        writer.join().unwrap();
+        assert_eq!(engine.get_space(&space.id).unwrap().unwrap().file_count, 2);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -8695,6 +20157,86 @@ mod tests {
         let _ = fs::remove_dir_all(destination);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cp11_saved_grant_root_replacement_and_unbound_legacy_fail_closed() {
+        let root = temp_root("cp11-grant-binding");
+        let parent = temp_root("cp11-grant-parent");
+        let selected = parent.join("selected");
+        fs::create_dir(&selected).unwrap();
+        let engine = StorageEngine::open(&root).unwrap();
+        let (app, space) = fixture(&engine);
+        engine
+            .write_file(&space.id, "/saved.txt", b"bytes", None, "cp11-grant-file")
+            .unwrap();
+        let grant = engine
+            .create_directory_grant(
+                &app.id,
+                &selected,
+                None,
+                DirectoryGrantCapability::ReadWrite,
+            )
+            .unwrap();
+        let source = vec!["/saved.txt".to_string()];
+        fs::rename(&selected, parent.join("moved")).unwrap();
+        fs::create_dir(&selected).unwrap();
+        let changed = engine.native_export_bound(
+            &app.id,
+            &space.id,
+            &source,
+            &selected,
+            "Saved",
+            NativeExportMode::File,
+            ExportConflictPolicy::Replace,
+            None,
+            ExportBookkeepingPolicy::Destination,
+            ExportPrunePolicy::None,
+            None,
+            DirectoryExportLayout::Preserve,
+            Some(&grant.id),
+            || false,
+            |_, _, _, _| {},
+            |_| Ok(true),
+        );
+        assert!(matches!(changed, Err(StorageError::RequestInvalid(_))));
+        assert!(!selected.join("saved.txt").exists());
+
+        // An old path-only grant cannot acquire a historical identity merely
+        // because its old string path currently resolves to a directory.
+        engine
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM directory_grant_root_bindings WHERE grant_id=?1",
+                params![grant.id],
+            )
+            .unwrap();
+        let unbound = engine.native_export_bound(
+            &app.id,
+            &space.id,
+            &source,
+            &selected,
+            "Saved",
+            NativeExportMode::File,
+            ExportConflictPolicy::Replace,
+            None,
+            ExportBookkeepingPolicy::Destination,
+            ExportPrunePolicy::None,
+            None,
+            DirectoryExportLayout::Preserve,
+            Some(&grant.id),
+            || false,
+            |_, _, _, _| {},
+            |_| Ok(true),
+        );
+        assert!(matches!(unbound, Err(StorageError::RequestInvalid(_))));
+        assert!(!selected.join("saved.txt").exists());
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(parent);
+    }
+
     #[test]
     fn d5_grants_presets_enforce_capabilities_and_revocation_without_deleting_external_files() {
         let root = temp_root("d5-grants");
@@ -8930,7 +20472,7 @@ mod tests {
         fs::write(&source, b"new-source-bytes").unwrap();
         fs::write(&target, b"existing-target").unwrap();
         let expected = sha256_hex(b"different-selected-bytes");
-        let result = copy_file_atomic_stage(&source, &temp, &target, &expected, &|| false, |_| {});
+        let result = copy_file_atomic_stage(&source, &target, &expected, &|| false, |_| {});
         assert!(matches!(result, Err(StorageError::ExportSourceChanged)));
         assert_eq!(fs::read(&target).unwrap(), b"existing-target");
         assert!(!temp.exists());
@@ -9248,6 +20790,184 @@ mod tests {
                 .size,
             b"current-bytes".len() as u64
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_destination_picker_admits_once_and_replays_without_a_new_grant() {
+        let root = temp_root("cp14-destination-picker-id");
+        let destination = root.join("chosen-output");
+        fs::create_dir_all(&destination).unwrap();
+        let app_id;
+        let grant_id;
+        {
+            let engine = StorageEngine::open(&root).unwrap();
+            let (app, _) = fixture(&engine);
+            app_id = app.id.clone();
+            assert!(matches!(
+                engine
+                    .admit_directory_grant_request(
+                        &app_id,
+                        "picker-id-01",
+                        Some("Output"),
+                        DirectoryGrantCapability::ReadWrite,
+                        None,
+                        false
+                    )
+                    .unwrap(),
+                DestinationGrantAdmission::New
+            ));
+            assert!(matches!(
+                engine.admit_directory_grant_request(
+                    &app_id,
+                    "picker-id-01",
+                    Some("Output"),
+                    DirectoryGrantCapability::ReadWrite,
+                    None,
+                    false
+                ),
+                Err(StorageError::RecoveryRequired)
+            ));
+            assert!(matches!(
+                engine.admit_directory_grant_request(
+                    &app_id,
+                    "picker-id-01",
+                    Some("Different"),
+                    DirectoryGrantCapability::ReadWrite,
+                    None,
+                    false
+                ),
+                Err(StorageError::RequestIdConflict)
+            ));
+            let grant = engine
+                .finish_directory_grant_request(
+                    &app_id,
+                    "picker-id-01",
+                    &destination,
+                    Some("Output"),
+                    DirectoryGrantCapability::ReadWrite,
+                    None,
+                    false,
+                )
+                .unwrap();
+            grant_id = grant.id.clone();
+            assert_eq!(engine.list_directory_grants(&app_id).unwrap().len(), 1);
+            assert_eq!(
+                engine
+                    .live_sql_receipt(&app_id, "application", &app_id, "picker-id-01")
+                    .unwrap()
+                    .unwrap()["operation"],
+                "DESTINATION_CREATE"
+            );
+        }
+        {
+            let engine = StorageEngine::open(&root).unwrap();
+            match engine
+                .admit_directory_grant_request(
+                    &app_id,
+                    "picker-id-01",
+                    Some("Output"),
+                    DirectoryGrantCapability::ReadWrite,
+                    None,
+                    false,
+                )
+                .unwrap()
+            {
+                DestinationGrantAdmission::Replayed(grant) => assert_eq!(grant.id, grant_id),
+                _ => panic!("committed grant must replay"),
+            }
+            assert_eq!(engine.list_directory_grants(&app_id).unwrap().len(), 1);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cp14_destination_picker_cancel_and_restart_do_not_reopen_prompt() {
+        let root = temp_root("cp14-destination-picker-cancel");
+        let app_id;
+        {
+            let engine = StorageEngine::open(&root).unwrap();
+            let (app, _) = fixture(&engine);
+            app_id = app.id.clone();
+            assert!(matches!(
+                engine
+                    .admit_directory_grant_request(
+                        &app_id,
+                        "picker-cancel-1",
+                        None,
+                        DirectoryGrantCapability::Write,
+                        None,
+                        false
+                    )
+                    .unwrap(),
+                DestinationGrantAdmission::New
+            ));
+            engine
+                .cancel_directory_grant_request(&app_id, "picker-cancel-1")
+                .unwrap();
+            assert!(matches!(
+                engine
+                    .admit_directory_grant_request(
+                        &app_id,
+                        "picker-cancel-1",
+                        None,
+                        DirectoryGrantCapability::Write,
+                        None,
+                        false
+                    )
+                    .unwrap(),
+                DestinationGrantAdmission::UserCancelled
+            ));
+            assert!(matches!(
+                engine
+                    .admit_directory_grant_request(
+                        &app_id,
+                        "picker-pending-1",
+                        None,
+                        DirectoryGrantCapability::Write,
+                        None,
+                        false
+                    )
+                    .unwrap(),
+                DestinationGrantAdmission::New
+            ));
+        }
+        {
+            let engine = StorageEngine::open(&root).unwrap();
+            assert!(matches!(
+                engine.admit_directory_grant_request(
+                    &app_id,
+                    "picker-pending-1",
+                    None,
+                    DirectoryGrantCapability::Write,
+                    None,
+                    false
+                ),
+                Err(StorageError::RecoveryRequired)
+            ));
+            assert!(matches!(
+                engine
+                    .admit_directory_grant_request(
+                        &app_id,
+                        "picker-cancel-1",
+                        None,
+                        DirectoryGrantCapability::Write,
+                        None,
+                        false
+                    )
+                    .unwrap(),
+                DestinationGrantAdmission::UserCancelled
+            ));
+            // Status distinguishes pending parent from an absent SQL receipt.
+            assert!(matches!(
+                engine.live_sql_receipt(&app_id, "application", &app_id, "picker-pending-1"),
+                Err(StorageError::RecoveryRequired)
+            ));
+            assert!(engine
+                .live_sql_receipt(&app_id, "application", &app_id, "picker-cancel-1")
+                .unwrap()
+                .is_some());
+        }
         let _ = fs::remove_dir_all(root);
     }
 }

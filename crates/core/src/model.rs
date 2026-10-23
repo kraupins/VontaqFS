@@ -474,3 +474,16 @@ pub struct StorageDiagnostics {
     pub logical_bytes: u64,
     pub file_count: u64,
 }
+
+/// Shared internal Core mutation disposition; adapters may retain old return shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationDisposition {
+    Applied,
+    Replayed,
+}
+
+#[derive(Debug, Clone)]
+pub struct MutationResult<T> {
+    pub value: T,
+    pub disposition: MutationDisposition,
+}

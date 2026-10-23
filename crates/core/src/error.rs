@@ -10,6 +10,20 @@ pub enum StorageError {
     NotFound(String),
     #[error("CONFLICT: {0}")]
     Conflict(String),
+    #[error("STORAGE_ROOT_BUSY: another Core engine owns this storage root")]
+    StorageRootBusy,
+    #[error("REQUEST_ID_CONFLICT: requestId has a different semantic fingerprint")]
+    RequestIdConflict,
+    #[error("REQUEST_ID_MIGRATION_REQUIRED: v3 replay is not supported for this mutation class")]
+    RequestIdMigrationRequired,
+    #[error("RECOVERY_REQUIRED: scope has unresolved filesystem intent")]
+    RecoveryRequired,
+    #[error("OUTCOME_UNKNOWN: legacy receipt cannot prove equivalent replay")]
+    OutcomeUnknown,
+    #[error("RESULT_EXPIRED: the replay window for this request identity has elapsed")]
+    ResultExpired,
+    #[error("REQUEST_CLOCK_SKEW: request identity timestamp is outside the accepted window")]
+    RequestClockSkew,
     #[error("STORAGE_UNAVAILABLE: {0}")]
     StorageUnavailable(String),
     #[error("DISK_SPACE_LOW: {0}")]

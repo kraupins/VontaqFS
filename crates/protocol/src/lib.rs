@@ -41,6 +41,82 @@ pub const CAPABILITY_INTERNAL_EXPORT_BOOKKEEPING: &str = "internal-export-bookke
 pub const CAPABILITY_TRACKED_EXPORT_PRUNE: &str = "tracked-export-prune";
 pub const CAPABILITY_DIRECTORY_CONTENTS_EXPORT: &str = "directory-contents-export";
 
+// Inert durable-operation vocabulary; no v3 capability is advertised yet.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MutationDisposition {
+    Applied,
+    Replayed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DurableOperationPhase {
+    Admitted,
+    Running,
+    Reconciling,
+    Committed,
+    Aborted,
+    PartiallyApplied,
+    NeedsRepair,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DurableOperationItemPhase {
+    Pending,
+    Running,
+    Committed,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DurableReplayNegotiation {
+    pub identity_version: u32,
+    pub server_time_ms: i64,
+    pub min_replay_window_ms: i64,
+    pub max_future_skew_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DurableOperationItemOutcome {
+    pub item_index: u32,
+    pub item_fingerprint: String,
+    pub phase: DurableOperationItemPhase,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DurableMutationOutcome {
+    pub request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_fingerprint: Option<String>,
+    pub phase: DurableOperationPhase,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<MutationDisposition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<DurableOperationItemOutcome>>,
+    #[serde(default)]
+    pub cleanup_pending: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProtocolRange {
@@ -57,6 +133,8 @@ pub struct HealthResponse {
     pub storage_format_version: u32,
     pub status: String,
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_replay: Option<DurableReplayNegotiation>,
 }
 
 impl HealthResponse {
@@ -71,6 +149,7 @@ impl HealthResponse {
             storage_format_version: STORAGE_FORMAT_VERSION,
             status: "starting".to_owned(),
             capabilities: Vec::new(),
+            durable_replay: None,
         }
     }
 
@@ -84,6 +163,7 @@ impl HealthResponse {
             },
             storage_format_version: STORAGE_FORMAT_VERSION,
             status: "ready".to_owned(),
+            durable_replay: None,
             capabilities: vec![
                 "files".into(),
                 "kv".into(),
@@ -206,6 +286,9 @@ pub struct RuntimeIdentityChallengeRequest {
     pub application: RuntimeIdentityApplication,
     pub client_instance_id: String,
     pub nonce: String,
+    /// Strictly read-only challenge for an already deleted application.
+    #[serde(default)]
+    pub history_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -232,6 +315,10 @@ pub struct SessionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_chunk_method: Option<ChunkMethod>,
     pub capabilities: Vec<String>,
+    /// Present only when every advertised mutation class has durable replay,
+    /// capacity admission, authenticated result lookup and the retention floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_replay: Option<DurableReplayNegotiation>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -372,6 +459,53 @@ pub struct OperationRequestWire {
 #[serde(rename_all = "camelCase")]
 pub struct OperationStatusRequest {
     pub operation_id: String,
+    /// Optional restricted proof for an archived application after deletion.
+    /// Never creates a session or authorizes file/space operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_proof: Option<HistoricalStatusProof>,
+    /// Optional ordinary SQL receipt scope. When present, operation_id is the
+    /// original requestId; without it, the original long-job status contract applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_scope: Option<RetainedReceiptScope>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RetainedReceiptScope {
+    pub kind: RetainedReceiptScopeKind,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RetainedReceiptScopeKind {
+    Space,
+    Application,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RetainedReceiptOutcome {
+    pub scope_kind: RetainedReceiptScopeKind,
+    pub scope_id: String,
+    pub request_id: String,
+    pub operation: String,
+    pub result: Value,
+    pub identity_version: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_fingerprint: Option<String>,
+    pub created_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoricalStatusProof {
+    pub client_instance_id: String,
+    pub pairing_credential: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -993,6 +1127,18 @@ pub enum ErrorCode {
     BatchCancelled,
     InternalError,
     RequestInvalid,
+    ProtocolError,
+    RequestIdConflict,
+    OperationIdConflict,
+    ResultExpired,
+    OutcomeUnknown,
+    Reconciling,
+    PartiallyApplied,
+    NeedsRepair,
+    RecoveryRequired,
+    RequestClockSkew,
+    RequestIdMigrationRequired,
+    StorageRootBusy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

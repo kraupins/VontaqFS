@@ -55,11 +55,63 @@ export type PairingStatus = 'pending' | 'approved' | 'denied' | 'expired';
 export type ChunkMethod = 'PUT' | 'POST';
 
 export type ProgressPresentation = 'silent' | 'client' | 'vontaqfs';
-export type OperationStatus = 'queued' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
+export type OperationStatus = 'queued' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled' | 'reconciling';
+
+// Durable identity vocabulary. Optional and NOT advertised by v1 Runtime until enabled.
+export type MutationDisposition = 'APPLIED' | 'REPLAYED';
+export type DurableOperationPhase = 'ADMITTED' | 'RUNNING' | 'RECONCILING' | 'COMMITTED' | 'ABORTED' | 'PARTIALLY_APPLIED' | 'NEEDS_REPAIR';
+export type DurableOperationItemPhase = 'PENDING' | 'RUNNING' | 'COMMITTED' | 'FAILED' | 'SKIPPED';
+export interface DurableOperationIdentity {
+  requestId: string;
+  operationId?: string;
+  identityVersion?: number;
+  requestFingerprint?: string;
+}
+export interface DurableOperationItemOutcome {
+  itemIndex: number;
+  itemFingerprint: string;
+  phase: DurableOperationItemPhase;
+  result?: unknown;
+  errorCode?: string;
+}
+export interface DurableMutationOutcome<T = unknown> extends DurableOperationIdentity {
+  phase: DurableOperationPhase;
+  disposition?: MutationDisposition;
+  result?: T;
+  items?: readonly DurableOperationItemOutcome[];
+  cleanupPending?: boolean;
+  terminalAtMs?: number;
+  expiresAtMs?: number;
+}
+export interface DurableReplayNegotiation {
+  identityVersion: 3;
+  serverTimeMs: number;
+  minReplayWindowMs: number;
+  maxFutureSkewMs: number;
+}
+
 
 export interface OperationErrorInfo {
   code: string;
   message: string;
+}
+
+/** Historical SQL result, not a mutation replay authorization. */
+export interface RetainedReceiptScope {
+  kind: 'space' | 'application';
+  id: string;
+}
+export interface RetainedReceiptOutcome<T = unknown> {
+  scopeKind: RetainedReceiptScope['kind'];
+  scopeId: string;
+  requestId: string;
+  operation: string;
+  result: T;
+  identityVersion: number;
+  requestFingerprint?: string | null;
+  createdAtMs: number;
+  terminalAtMs?: number | null;
+  expiresAtMs?: number | null;
 }
 
 export interface OperationProgress {
@@ -174,6 +226,7 @@ export interface RuntimeStatus {
   storageFormatVersion: number;
   status: 'starting' | 'ready' | 'stopping' | 'error';
   capabilities: readonly string[];
+  durableReplay?: DurableReplayNegotiation;
 }
 
 export interface PairingRequestResponse {
@@ -197,6 +250,7 @@ export interface SessionResponse {
   connectionId?: string;
   effectiveChunkMethod?: ChunkMethod;
   capabilities: readonly string[];
+  durableReplay?: DurableReplayNegotiation;
 }
 
 export interface SpaceInfo {
@@ -257,11 +311,11 @@ export interface FormatDescriptor {
 }
 
 export type BatchOperation =
-  | { type: 'write-file'; path: string; bytes: Uint8Array; ifMatch?: string; metadata?: FileMetadataInput }
-  | { type: 'delete'; path: string; recursive?: boolean; ifMatch?: string }
-  | { type: 'copy'; from: string; to: string; overwrite?: boolean }
-  | { type: 'move'; from: string; to: string; overwrite?: boolean; ifMatch?: string }
-  | { type: 'kv-set'; key: string; value: unknown; ifVersion?: number; ifMatch?: string };
+  | { type: 'write-file'; requestId?: string; path: string; bytes: Uint8Array; ifMatch?: string; metadata?: FileMetadataInput }
+  | { type: 'delete'; requestId?: string; path: string; recursive?: boolean; ifMatch?: string }
+  | { type: 'copy'; requestId?: string; from: string; to: string; overwrite?: boolean }
+  | { type: 'move'; requestId?: string; from: string; to: string; overwrite?: boolean; ifMatch?: string }
+  | { type: 'kv-set'; requestId?: string; key: string; value: unknown; ifVersion?: number; ifMatch?: string };
 
 export interface BatchItemError {
   code: string;

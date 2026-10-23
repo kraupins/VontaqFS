@@ -6,7 +6,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc, Mutex,
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -23,22 +23,24 @@ use tokio::{
 use uuid::Uuid;
 pub use vontaqfs_core::SnapshotRecord;
 use vontaqfs_core::{
-    ApplicationFormatDescriptor, ApplicationKind, ApplicationRecord, DirectoryExportLayout,
+    AdmissionLease, ApplicationFormatDescriptor, ApplicationKind, ApplicationRecord,
+    BatchCapacityOperation, DestinationGrantAdmission, DirectoryExportLayout,
     DirectoryGrantCapability, DirectoryGrantRecord, ExportBookkeepingPolicy, ExportConflictPolicy,
     ExportPresetRecord, ExportPrunePolicy, FileMetadata, FileRecord, ImportConflictPolicy,
-    KvRecord, LogicalPath, NativeExportMode, NativeImportMode, RestoreConflictPolicy, SpaceRecord,
-    StorageCategory, StorageClass, StorageDiagnostics, StorageEngine, StorageError, StorageResult,
-    StreamOperationRecord,
+    KvRecord, LogicalPath, MutationDisposition, NativeExportMode, NativeImportMode,
+    RestoreConflictPolicy, SpaceRecord, StorageCategory, StorageClass, StorageDiagnostics,
+    StorageEngine, StorageError, StorageResult, StreamOperationRecord,
 };
 use vontaqfs_protocol::{
     BatchItemErrorWire, BatchItemResultWire, BatchOperationWire, BatchRequest, BatchResponse,
     ChunkMethod, ClearSpaceRequest, ClearSpaceResponse, ClientIdentity, ClientKind,
     CreateDestinationGrantRequest, CreateSnapshotRequest, DeleteExportPresetRequest,
     DeleteFormatRequest, DeleteSnapshotRequest, DestinationGrantWire, DirectoryExportLayoutWire,
-    DirectoryGrantCapabilityWire, ErrorBody, ErrorCode, ErrorResponse, EventKindWire,
-    EventPollRequest, EventPollResponse, ExportBookkeepingPolicyWire, ExportConflictPolicyWire,
-    ExportPresetWire, ExportPrunePolicyWire, FileMetadataWire, FileStatRequest, FileStatResponse,
-    FileWire, FormatDescriptorWire, FsCopyRequest, FsDeleteRequest, FsMoveRequest, HealthResponse,
+    DirectoryGrantCapabilityWire, DurableReplayNegotiation, ErrorBody, ErrorCode, ErrorResponse,
+    EventKindWire, EventPollRequest, EventPollResponse, ExportBookkeepingPolicyWire,
+    ExportConflictPolicyWire, ExportPresetWire, ExportPrunePolicyWire, FileMetadataWire,
+    FileStatRequest, FileStatResponse, FileWire, FormatDescriptorWire, FsCopyRequest,
+    FsDeleteRequest, FsMoveRequest, HealthResponse, HistoricalStatusProof,
     ImportConflictPolicyWire, KvGetRequest, KvGetResponse, KvSetRequest, KvWire,
     ListDestinationGrantsResponse, ListExportPresetsResponse, ListFormatsResponse,
     ListSnapshotsRequest, ListSnapshotsResponse, ListSpacesResponse, NativeExportModeWire,
@@ -66,6 +68,7 @@ const PAIRING_RATE_WINDOW_MS: i64 = 60_000;
 const PAIRING_RATE_MAX: usize = 10;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30); // Per-read inactivity, not a whole-file deadline.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const RECEIPT_GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const SLEEP_RESUME_GAP_MS: i64 = 45_000;
 const LIFECYCLE_RUNNING: u8 = 0;
 const LIFECYCLE_SUSPENDED: u8 = 1;
@@ -74,6 +77,42 @@ const LIFECYCLE_STOPPED: u8 = 3;
 const OPERATION_RETENTION_MS: i64 = 5 * 60 * 1000;
 const OPERATION_DESKTOP_COMPLETION_HOLD_MS: i64 = 1_200;
 const OPERATION_MAX_ROWS: usize = 2048;
+
+// One authoritative gate for both the session promise and the two ID
+// validators. A production build can never announce v3, even when built with
+// --all-features: only explicit native unit-test builds exercise the ON path.
+// Removal of the test-only fence requires native release validation G1–G8.
+fn v3_admission_enabled() -> bool {
+    cfg!(all(test, feature = "v3-native-validation"))
+}
+
+fn negotiated_durable_replay() -> Option<DurableReplayNegotiation> {
+    if !v3_admission_enabled() {
+        return None;
+    }
+    Some(DurableReplayNegotiation {
+        identity_version: 3,
+        server_time_ms: now_ms(),
+        min_replay_window_ms: 7 * 24 * 60 * 60 * 1000,
+        max_future_skew_ms: 5 * 60 * 1000,
+    })
+}
+
+/// Parse only format at the HTTP boundary. Core checks time/skew on first
+/// admission, after checking stored evidence; rejecting expired IDs here would
+/// also reject legitimate terminal-result lookups long after their admission.
+fn validate_v3_id_shape(value: &str, prefix: &str) -> bool {
+    let Some(rest) = value.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some((ms, entropy)) = rest.split_once('-') else {
+        return false;
+    };
+    ms.len() == 13
+        && ms.bytes().all(|byte| byte.is_ascii_digit())
+        && entropy.len() == 32
+        && entropy.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 
 #[derive(Debug, Default)]
 pub struct RuntimeFoundation;
@@ -216,6 +255,7 @@ pub enum LongOperationStatus {
     Completed,
     Failed,
     Cancelled,
+    Reconciling,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -363,7 +403,7 @@ impl RuntimeHandle {
     }
 
     pub fn pending_pairings(&self) -> Vec<PendingPairingSummary> {
-        self.state.prune_ephemeral();
+        self.state.prune_session_ephemeral();
         let now = now_ms();
         let pending = self
             .state
@@ -515,7 +555,7 @@ impl RuntimeHandle {
     }
 
     pub fn approve_pairing(&self, request_id: &str) -> Result<PairingApproval, RuntimeAdminError> {
-        self.state.prune_ephemeral();
+        self.state.prune_session_ephemeral();
         let mut pending =
             self.state.pending_pairings.lock().map_err(|_| {
                 RuntimeAdminError::Internal("pending pairing mutex poisoned".into())
@@ -577,7 +617,7 @@ impl RuntimeHandle {
     }
 
     pub fn deny_pairing(&self, request_id: &str) -> Result<(), RuntimeAdminError> {
-        self.state.prune_ephemeral();
+        self.state.prune_session_ephemeral();
         let mut pending =
             self.state.pending_pairings.lock().map_err(|_| {
                 RuntimeAdminError::Internal("pending pairing mutex poisoned".into())
@@ -643,7 +683,12 @@ impl RuntimeHandle {
                 }
                 if safe_to_unlock {
                     if let Ok(mut paths) = self.state.active_write_paths.lock() {
-                        paths.remove(&write_path_key(&stream.space_id, &stream.path));
+                        release_write_path_if_owner(
+                            &mut paths,
+                            &stream.space_id,
+                            &stream.path,
+                            &id,
+                        );
                     }
                 }
             }
@@ -678,7 +723,7 @@ impl RuntimeHandle {
     }
 
     pub fn active_session_count(&self) -> usize {
-        self.state.prune_ephemeral();
+        self.state.prune_session_ephemeral();
         self.state
             .sessions
             .lock()
@@ -689,7 +734,7 @@ impl RuntimeHandle {
     pub fn desktop_applications(
         &self,
     ) -> Result<Vec<DesktopApplicationSummary>, RuntimeAdminError> {
-        self.state.prune_ephemeral();
+        self.state.prune_session_ephemeral();
         let session_counts = {
             let sessions = self
                 .state
@@ -1511,8 +1556,10 @@ impl RuntimeHandle {
         admin_executor.spawn(async move {
             let storage = Arc::clone(&state.storage);
             let work_space_id = space_id.clone();
-            let result =
-                tokio::task::spawn_blocking(move || storage.delete_space(&work_space_id)).await;
+            let durable_request_id = operation_id.clone();
+            let result = tokio::task::spawn_blocking(move ||
+                storage.delete_space_with_request(&work_space_id, &durable_request_id)
+            ).await;
             match result {
                 Ok(Ok((bytes, files))) => state.complete_operation(&operation_id, "complete", Some(serde_json::json!({"spaceId":space_id.clone(),"removedBytes":bytes,"removedFiles":files}))),
                 Ok(Err(error)) => state.fail_operation(&operation_id, error.to_string()),
@@ -1530,7 +1577,7 @@ impl RuntimeHandle {
         application_id: String,
     ) -> Result<LongOperationSnapshot, RuntimeAdminError> {
         let admin_executor = self.state.admin_executor()?;
-        self.state.prune_ephemeral();
+        self.state.prune_session_ephemeral();
         self.state
             .storage
             .get_application(&application_id)?
@@ -1665,9 +1712,10 @@ impl RuntimeHandle {
         admin_executor.spawn(async move {
             let storage = Arc::clone(&state.storage);
             let work_id = application_id.clone();
-            let outcome =
-                tokio::task::spawn_blocking(move || storage.delete_application_data(&work_id))
-                    .await;
+            let durable_request_id = id.clone();
+            let outcome = tokio::task::spawn_blocking(move ||
+                storage.delete_application_data_with_request(&work_id, &durable_request_id)
+            ).await;
             match outcome {
                 Ok(Ok((count, bytes, files))) => state.complete_operation(&id, "complete",
                     Some(serde_json::json!({"applicationId":application_id.clone(),"removedSpaces":count,"removedBytes":bytes,"removedFiles":files}))),
@@ -1764,15 +1812,123 @@ impl RuntimeHandle {
         &self,
         operation_id: &str,
     ) -> Result<Option<LongOperationSnapshot>, RuntimeAdminError> {
-        self.state
+        let live = self
+            .state
             .operations
             .lock()
-            .map(|operations| {
-                operations
-                    .get(operation_id)
-                    .map(|entry| entry.snapshot.clone())
-            })
-            .map_err(|_| RuntimeAdminError::Internal("operation mutex poisoned".into()))
+            .map_err(|_| RuntimeAdminError::Internal("operation mutex poisoned".into()))?
+            .get(operation_id)
+            .map(|entry| entry.snapshot.clone());
+        if live.is_some() {
+            return Ok(live);
+        }
+        // Desktop is a privileged local surface. On restart its in-memory
+        // operation list is empty, but Core's terminal/uncertain owner-delete
+        // parent survives and remains accessible by the same operation ID.
+        let Some(saved) = self
+            .state
+            .storage
+            .desktop_owner_deletion_status(operation_id)?
+        else {
+            return Ok(None);
+        };
+        let kind = saved
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| RuntimeAdminError::Internal("owner deletion kind missing".into()))?;
+        let target = saved
+            .get("targetId")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| RuntimeAdminError::Internal("owner deletion target missing".into()))?;
+        let phase = saved
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| RuntimeAdminError::Internal("owner deletion phase missing".into()))?;
+        let (public_kind, public_result) = match kind {
+            "SPACE_DELETE" => {
+                let values = saved
+                    .get("result")
+                    .filter(|v| !v.is_null())
+                    .map(|v| serde_json::from_value::<(u64, u64)>(v.clone()))
+                    .transpose()
+                    .map_err(|_| {
+                        RuntimeAdminError::Internal("invalid saved space deletion result".into())
+                    })?;
+                ("delete-space", values.map(|(bytes,files)|
+                    serde_json::json!({"spaceId":target,"removedBytes":bytes,"removedFiles":files})))
+            }
+            "APP_DELETE" => {
+                let values = saved
+                    .get("result")
+                    .filter(|v| !v.is_null())
+                    .map(|v| serde_json::from_value::<(u64, u64, u64)>(v.clone()))
+                    .transpose()
+                    .map_err(|_| {
+                        RuntimeAdminError::Internal(
+                            "invalid saved application deletion result".into(),
+                        )
+                    })?;
+                ("delete-application", values.map(|(count,bytes,files)|
+                    serde_json::json!({"applicationId":target,"removedSpaces":count,"removedBytes":bytes,"removedFiles":files})))
+            }
+            _ => {
+                return Err(RuntimeAdminError::Internal(
+                    "unexpected durable deletion kind".into(),
+                ))
+            }
+        };
+        let (status, shown_phase, error) = match phase {
+            "COMMITTED" => (LongOperationStatus::Completed, "complete", None),
+            "ABORTED" => (
+                LongOperationStatus::Failed,
+                "aborted",
+                Some(LongOperationError {
+                    code: "OWNER_DELETION_ABORTED".into(),
+                    message: "deletion was confirmed aborted before commit".into(),
+                }),
+            ),
+            "NEEDS_REPAIR" => (
+                LongOperationStatus::Reconciling,
+                "needs-repair",
+                Some(LongOperationError {
+                    code: "NEEDS_REPAIR".into(),
+                    message:
+                        "deletion needs filesystem reconciliation before a final outcome is known"
+                            .into(),
+                }),
+            ),
+            _ => (LongOperationStatus::Reconciling, "reconciling", None),
+        };
+        Ok(Some(LongOperationSnapshot {
+            id: operation_id.to_owned(),
+            kind: public_kind.into(),
+            phase: shown_phase.into(),
+            presentation: OperationPresentationWire::Client,
+            completed: None,
+            total: None,
+            bytes_completed: None,
+            bytes_total: None,
+            items_completed: None,
+            items_total: None,
+            throughput_bytes_per_second: None,
+            eta_ms: None,
+            started_at_ms: saved
+                .get("startedAtMs")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| {
+                    RuntimeAdminError::Internal("missing deletion start timestamp".into())
+                })?,
+            updated_at_ms: saved
+                .get("updatedAtMs")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| {
+                    RuntimeAdminError::Internal("missing deletion update timestamp".into())
+                })?,
+            cancellable: false,
+            status,
+            error,
+            result: public_result,
+        }))
     }
 
     pub fn cancel_operation(&self, operation_id: &str) -> Result<bool, RuntimeAdminError> {
@@ -1937,6 +2093,10 @@ impl RuntimeServer {
         let cleanup_state = Arc::clone(&self.state);
         let cleanup = tokio::spawn(async move {
             let mut last_tick_ms = now_ms();
+            // Tokio's monotonic clock keeps maintenance progressing even if the
+            // OS wall clock jumps backward; SQL TTL still uses real time.
+            let mut last_gc = tokio::time::Instant::now();
+            let mut first_gc = true;
             loop {
                 if cleanup_state.shutdown_requested.load(Ordering::SeqCst) {
                     break;
@@ -1949,7 +2109,24 @@ impl RuntimeServer {
                             cleanup_state.handle_detected_resume();
                         }
                         last_tick_ms = current_tick_ms;
-                        cleanup_state.prune_ephemeral();
+                        let sweep_state = Arc::clone(&cleanup_state);
+                        if let Err(error) = tokio::task::spawn_blocking(move ||
+                            sweep_state.prune_ephemeral()).await {
+                            cleanup_state.audit_log("ephemeral-sweep", &format!("worker-error: {error}"));
+                        }
+                        // CP17: only AFTER StorageEngine::open has completed all
+                        // recovery barriers. Run short, bounded SQL maintenance
+                        // off the Tokio executor; never from auth/chunk PUT.
+                        if first_gc || last_gc.elapsed() >= RECEIPT_GC_INTERVAL {
+                            first_gc = false;
+                            last_gc = tokio::time::Instant::now();
+                            let storage = Arc::clone(&cleanup_state.storage);
+                            match tokio::task::spawn_blocking(move || storage.run_bounded_receipt_gc()).await {
+                                Ok(Ok(())) => {},
+                                Ok(Err(error)) => cleanup_state.audit_log("receipt-gc", &format!("error: {error}")),
+                                Err(error) => cleanup_state.audit_log("receipt-gc", &format!("worker-error: {error}")),
+                            }
+                        }
                     },
                 }
             }
@@ -1959,11 +2136,17 @@ impl RuntimeServer {
             let state = Arc::clone(&self.state);
             acceptors.push(tokio::spawn(async move {
                 loop {
+                    // Register before checking shutdown, including before an
+                    // optional semaphore wait, so a missed Notify cannot strand
+                    // the acceptor while serve() waits for it to join.
+                    let notified = state.shutdown_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
                     if state.shutdown_requested.load(Ordering::SeqCst) {
                         break;
                     }
                     let accepted = tokio::select! {
-                        _ = state.shutdown_notify.notified() => break,
+                        _ = &mut notified => break,
                         _ = tokio::time::sleep(Duration::from_millis(100)) => continue,
                         accepted = listener.accept() => accepted,
                     };
@@ -1973,9 +2156,22 @@ impl RuntimeServer {
                     if !peer.ip().is_loopback() {
                         continue;
                     }
-                    let Ok(permit) = Arc::clone(&state.request_slots).acquire_owned().await else {
+                    let notified = state.shutdown_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if state.shutdown_requested.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let permit = tokio::select! {
+                        _ = &mut notified => break,
+                        permit = Arc::clone(&state.request_slots).acquire_owned() => permit,
+                    };
+                    let Ok(permit) = permit else {
                         break;
                     };
+                    if state.shutdown_requested.load(Ordering::SeqCst) {
+                        break;
+                    }
                     let state = Arc::clone(&state);
                     tokio::spawn(async move {
                         let _permit = permit;
@@ -1993,11 +2189,26 @@ impl RuntimeServer {
         }
         let _ = cleanup.await;
         let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
-        while (self.state.request_slots.available_permits() < MAX_ACTIVE_REQUESTS
-            || self.state.has_active_long_operations())
-            && tokio::time::Instant::now() < deadline
-        {
+        while !self.state.shutdown_drain_complete() {
+            if tokio::time::Instant::now() >= deadline {
+                // A timeout is not durable proof of completed work. Continue
+                // owning the Core root lock and keep DRAINING until workers
+                // have actually reached their completion/recovery boundaries.
+                self.state
+                    .audit_log("runtime-shutdown-drain", "waiting-for-owned-workers");
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        while !self.state.shutdown_drain_complete() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // No request or owned worker can race this fence. An unprovable stream
+        // stays in its journal and must never be called committed on exit.
+        while !self.state.fence_streams_for_shutdown() {
+            self.state
+                .audit_log("runtime-shutdown-stream-fence", "recovery-boundary-pending");
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
         self.state.invalidate_sessions_and_streams();
         self.state
@@ -2093,8 +2304,7 @@ struct RuntimeState {
     active_upload_receives: Mutex<HashMap<String, usize>>,
     read_streams: Mutex<HashMap<String, ReadStreamState>>,
     active_write_paths: Mutex<HashMap<String, String>>,
-    events: Mutex<VecDeque<BufferedEvent>>,
-    event_sequence: AtomicU64,
+    events: Mutex<OwnerEventBuffer>,
     event_notify: Notify,
     lifecycle: AtomicU8,
     shutdown_requested: AtomicBool,
@@ -2132,8 +2342,7 @@ impl RuntimeState {
             active_upload_receives: Mutex::new(HashMap::new()),
             read_streams: Mutex::new(HashMap::new()),
             active_write_paths: Mutex::new(HashMap::new()),
-            events: Mutex::new(VecDeque::new()),
-            event_sequence: AtomicU64::new(0),
+            events: Mutex::new(OwnerEventBuffer::default()),
             event_notify: Notify::new(),
             lifecycle: AtomicU8::new(LIFECYCLE_RUNNING),
             shutdown_requested: AtomicBool::new(false),
@@ -2221,6 +2430,60 @@ impl RuntimeState {
         self.event_notify.notify_waiters();
     }
 
+    // A safe shutdown boundary for active write streams is a durable journal
+    // entry, never just a closed socket or a dropped File. An OPEN stream is
+    // fenced in SQLite first; COMMITTING is deliberately left for recovery.
+    // Return false if any live stream lacks an authoritative journal proof.
+    fn fence_streams_for_shutdown(&self) -> bool {
+        let handles = match self.write_streams.lock() {
+            Ok(writes) => writes
+                .iter()
+                .map(|(id, handle)| (id.clone(), Arc::clone(handle)))
+                .collect::<Vec<_>>(),
+            Err(_) => return false,
+        };
+        for (stream_id, handle) in handles {
+            let stream = match handle.lock() {
+                Ok(stream) => stream,
+                Err(_) => return false,
+            };
+            let journal = match self
+                .storage
+                .resolve_stream_by_id(&stream.pairing_id, &stream_id)
+            {
+                Ok(Some(journal)) => journal,
+                _ => return false,
+            };
+            if journal.phase == "OPEN"
+                && self
+                    .storage
+                    .finish_stream_operation(
+                        &stream_id,
+                        &stream.pairing_id,
+                        "OPEN",
+                        "EXPIRED_FENCED",
+                        None,
+                    )
+                    .is_err()
+            {
+                return false;
+            }
+            // COMMITTING and other unproven phases keep their durable evidence
+            // and temporary bytes for StorageEngine startup reconciliation.
+        }
+        true
+    }
+
+    fn shutdown_drain_complete(&self) -> bool {
+        self.request_slots.available_permits() == MAX_ACTIVE_REQUESTS
+            && !self.has_active_long_operations()
+            && self
+                .active_upload_receives
+                .lock()
+                .map(|receives| receives.is_empty())
+                .unwrap_or(false)
+    }
+
     fn handle_detected_resume(&self) {
         if matches!(
             self.lifecycle_status(),
@@ -2240,34 +2503,63 @@ impl RuntimeState {
         if let Ok(mut revoked_sessions) = self.revoked_sessions.lock() {
             revoked_sessions.clear();
         }
-        let mut expired = Vec::new();
-        if let Ok(mut writes) = self.write_streams.lock() {
-            expired.extend(writes.drain());
-        }
-        for (stream_id, handle) in expired {
+        // A suspension/resume invalidates sessions, not durable work. Do not
+        // discard COMMITTING stream bytes or path leases on an unknown outcome.
+        // Fenced OPEN streams may be safely dropped only after the journal update.
+        let handles = self
+            .write_streams
+            .lock()
+            .map(|writes| {
+                writes
+                    .iter()
+                    .map(|(id, handle)| (id.clone(), Arc::clone(handle)))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (stream_id, handle) in handles {
             let Ok(mut stream) = handle.lock() else {
                 continue;
             };
-            stream.file.take();
-            let safe = stream.committed.is_some()
-                || self
+            let journal = self
+                .storage
+                .resolve_stream_by_id(&stream.pairing_id, &stream_id);
+            let phase = match journal {
+                Ok(Some(journal)) => journal.phase,
+                _ => continue,
+            };
+            let terminal = match phase.as_str() {
+                "OPEN" => self
                     .storage
-                    .abort_stream_temp(&stream.space_id, &stream.temp_path)
-                    .is_ok();
-            if safe {
-                if stream.committed.is_none() {
-                    let _ = self.storage.finish_stream_operation(
+                    .finish_stream_operation(
                         &stream_id,
                         &stream.pairing_id,
                         "OPEN",
                         "EXPIRED_FENCED",
                         None,
-                    );
+                    )
+                    .is_ok(),
+                "COMMITTED" | "ABORTED" | "EXPIRED_FENCED" => true,
+                _ => false,
+            };
+            if !terminal {
+                continue;
+            }
+            // Never remove a new stream that has replaced this handle.
+            if self.remove_current_write_stream(&stream_id, &handle).ok() != Some(true) {
+                continue;
+            }
+            stream.file.take();
+            if phase == "OPEN" || phase == "EXPIRED_FENCED" {
+                if let Err(error) = self
+                    .storage
+                    .abort_stream_temp(&stream.space_id, &stream.temp_path)
+                {
+                    self.audit_log("stream-temp-cleanup", &format!("error: {error}"));
                 }
-                // Lock order is per-stream -> active paths everywhere.
-                if let Ok(mut paths) = self.active_write_paths.lock() {
-                    paths.remove(&write_path_key(&stream.space_id, &stream.path));
-                }
+            }
+            stream.admission_lease.take();
+            if let Ok(mut paths) = self.active_write_paths.lock() {
+                release_write_path_if_owner(&mut paths, &stream.space_id, &stream.path, &stream_id);
             }
         }
         if let Ok(mut reads) = self.read_streams.lock() {
@@ -2400,6 +2692,311 @@ impl RuntimeState {
         result
     }
 
+    // Look up the in-process worker first, then the durable application-scoped
+    // registry. A previous process cannot leave a usable in-memory worker.
+    fn replay_started_operation(
+        &self,
+        application_id: &str,
+        id: &str,
+        kind: &str,
+        fingerprint: &str,
+    ) -> Result<Option<LongOperationSnapshot>, ApiError> {
+        {
+            let operations = self.operations.lock().map_err(|_| ApiError::internal())?;
+            if let Some(entry) = operations.get(id) {
+                if entry.owner_application_id.as_deref() != Some(application_id) {
+                    return Err(ApiError::new(
+                        403,
+                        ErrorCode::OperationNotOwned,
+                        "operation belongs to another application",
+                    ));
+                }
+                if entry.snapshot.kind != kind
+                    || entry.request_fingerprint.as_deref() != Some(fingerprint)
+                {
+                    return Err(ApiError::new(
+                        409,
+                        ErrorCode::OperationIdConflict,
+                        "operationId has a different semantic request fingerprint",
+                    ));
+                }
+                let snapshot = entry.snapshot.clone();
+                // No SQLite call while holding operations lock. The live map
+                // may be stale if its terminal application receipt failed.
+                if snapshot.status == LongOperationStatus::Reconciling && kind == "batch" {
+                    drop(operations);
+                    let saved =
+                        serde_json::to_value(&snapshot).map_err(|_| ApiError::internal())?;
+                    return Ok(Some(self.resolve_durable_batch(
+                        application_id,
+                        id,
+                        kind,
+                        fingerprint,
+                        "RECONCILING",
+                        Some(saved),
+                    )?));
+                }
+                return Ok(Some(snapshot));
+            }
+        }
+        let previous = self
+            .storage
+            .application_long_job(application_id, id)
+            .map_err(ApiError::from_storage)?;
+        let Some((prior_kind, prior_fingerprint, phase, snapshot_json)) = previous else {
+            return Ok(None);
+        };
+        if prior_kind != kind || prior_fingerprint != fingerprint {
+            return Err(ApiError::new(
+                409,
+                ErrorCode::OperationIdConflict,
+                "operationId is bound to a different durable request",
+            ));
+        }
+        Ok(Some(self.resolve_durable_batch(
+            application_id,
+            id,
+            kind,
+            fingerprint,
+            &phase,
+            snapshot_json,
+        )?))
+    }
+
+    /// Called only by explicit /v1/imports/resume after owner/scope and
+    /// fingerprint verification. Never automatically restart a lost-ACK job.
+    fn claim_native_import_resume_worker(
+        &self,
+        owner: &str,
+        id: &str,
+        fingerprint: &str,
+        space_id: &str,
+        request_id: &str,
+    ) -> Result<(), ApiError> {
+        self.storage
+            .resume_application_native_import(owner, id, fingerprint, space_id, request_id)
+            .map_err(ApiError::from_storage)?;
+        let mut operations = self.operations.lock().map_err(|_| ApiError::internal())?;
+        let entry = operations.get_mut(id).ok_or_else(ApiError::internal)?;
+        if entry.owner_application_id.as_deref() != Some(owner)
+            || entry.snapshot.kind != "native-import"
+        {
+            return Err(ApiError::new(
+                409,
+                ErrorCode::OperationIdConflict,
+                "import resume ownership changed",
+            ));
+        }
+        entry.request_fingerprint = Some(fingerprint.to_owned());
+        Ok(())
+    }
+
+    /// Reconcile an application batch ACK from its independently durable
+    /// space-level result. The terminal application record must commit before
+    /// the recovered status can be exposed as Completed.
+    fn resolve_durable_batch(
+        &self,
+        owner: &str,
+        id: &str,
+        kind: &str,
+        fingerprint: &str,
+        phase: &str,
+        saved: Option<serde_json::Value>,
+    ) -> Result<LongOperationSnapshot, ApiError> {
+        let mut snapshot = Self::durable_snapshot(id, kind, phase, saved.clone());
+        if kind == "native-export" && matches!(phase, "ADMITTED" | "RUNNING" | "RECONCILING") {
+            let items = self
+                .storage
+                .native_export_confirmed_items(owner, id)
+                .map_err(ApiError::from_storage)?;
+            snapshot.result = Some(serde_json::json!({"items":items}));
+            return Ok(snapshot);
+        }
+        if kind == "native-import" && matches!(phase, "ADMITTED" | "RUNNING" | "RECONCILING") {
+            if let Some(source) = saved.as_ref() {
+                if let (Some(space_id), Some(request_id)) = (
+                    source.get("spaceId").and_then(serde_json::Value::as_str),
+                    source.get("requestId").and_then(serde_json::Value::as_str),
+                ) {
+                    let (terminal, items) = self
+                        .storage
+                        .native_import_status_evidence(owner, space_id, request_id)
+                        .map_err(ApiError::from_storage)?;
+                    if let Some(terminal) = terminal {
+                        snapshot.status = LongOperationStatus::Completed;
+                        snapshot.phase = "complete".into();
+                        snapshot.result = Some(terminal);
+                        snapshot.error = None;
+                        snapshot.cancellable = false;
+                        snapshot.updated_at_ms = now_ms();
+                        let stored =
+                            serde_json::to_value(&snapshot).map_err(|_| ApiError::internal())?;
+                        self.storage
+                            .finish_application_long_job(owner, id, "COMMITTED", &stored)
+                            .map_err(ApiError::from_storage)?;
+                    } else {
+                        snapshot.result = Some(serde_json::json!({"items":items}));
+                    }
+                }
+            }
+            return Ok(snapshot);
+        }
+        if kind != "batch" || !matches!(phase, "ADMITTED" | "RUNNING" | "RECONCILING") {
+            return Ok(snapshot);
+        }
+        let terminal = self
+            .storage
+            .finished_batch_result(owner, id, fingerprint)
+            .map_err(ApiError::from_storage)?;
+        let Some((terminal_phase, report)) = terminal else {
+            // An interrupted batch can contain confirmed child results even
+            // when its parent was never finalized. Report the exact evidence
+            // without turning it into a completed or retryable operation.
+            let items = self
+                .storage
+                .batch_item_evidence(owner, id, fingerprint)
+                .map_err(ApiError::from_storage)?;
+            snapshot.result = Some(serde_json::json!({"items":items}));
+            return Ok(snapshot);
+        };
+        snapshot.status = LongOperationStatus::Completed;
+        snapshot.phase = if terminal_phase == "COMMITTED" {
+            "complete"
+        } else {
+            "partial"
+        }
+        .into();
+        snapshot.result = Some(report);
+        snapshot.error = None;
+        snapshot.cancellable = false;
+        snapshot.updated_at_ms = now_ms();
+        let stored = serde_json::to_value(&snapshot).map_err(|_| ApiError::internal())?;
+        self.storage
+            .finish_application_long_job(owner, id, &terminal_phase, &stored)
+            .map_err(ApiError::from_storage)?;
+        Ok(snapshot)
+    }
+
+    fn durable_snapshot(
+        id: &str,
+        kind: &str,
+        phase: &str,
+        saved: Option<serde_json::Value>,
+    ) -> LongOperationSnapshot {
+        if let Some(ref saved) = saved {
+            if let Ok(mut snapshot) = serde_json::from_value::<LongOperationSnapshot>(saved.clone())
+            {
+                if !matches!(phase, "COMMITTED" | "ABORTED" | "PARTIALLY_APPLIED") {
+                    snapshot.status = LongOperationStatus::Reconciling;
+                    snapshot.phase = "reconciling".into();
+                    snapshot.cancellable = false;
+                    if saved.get("_cancelRequestedAtMs").is_some() {
+                        snapshot.error = Some(LongOperationError {
+                            code: "CANCEL_OUTCOME_UNKNOWN".into(),
+                            message: "Cancellation was requested, but the worker outcome is not proven after restart.".into(),
+                        });
+                    }
+                }
+                return snapshot;
+            }
+        }
+        LongOperationSnapshot {
+            id: id.into(),
+            kind: kind.into(),
+            phase: "reconciling".into(),
+            presentation: OperationPresentationWire::Client,
+            completed: None,
+            total: None,
+            bytes_completed: None,
+            bytes_total: None,
+            items_completed: None,
+            items_total: None,
+            throughput_bytes_per_second: None,
+            eta_ms: None,
+            started_at_ms: now_ms(),
+            updated_at_ms: now_ms(),
+            cancellable: false,
+            status: LongOperationStatus::Reconciling,
+            error: Some(LongOperationError {
+                code: if saved
+                    .as_ref()
+                    .is_some_and(|v| v.get("_cancelRequestedAtMs").is_some())
+                {
+                    "CANCEL_OUTCOME_UNKNOWN".into()
+                } else {
+                    "RECONCILING".into()
+                },
+                message:
+                    "The previous worker is no longer running; its outcome needs reconciliation."
+                        .into(),
+            }),
+            result: None,
+        }
+    }
+
+    // Durable SQLite identity admission happens WITHOUT holding the worker map
+    // mutex; strict INSERT transaction decides the cross-process winner.
+    fn claim_operation_worker(&self, id: &str, fingerprint: &str) -> Result<bool, ApiError> {
+        let (owner, kind) = {
+            let operations = self.operations.lock().map_err(|_| ApiError::internal())?;
+            let entry = operations.get(id).ok_or_else(|| {
+                ApiError::new(
+                    404,
+                    ErrorCode::OperationNotFound,
+                    "operation disappeared before worker admission",
+                )
+            })?;
+            match entry.request_fingerprint.as_deref() {
+                Some(existing) if existing == fingerprint => return Ok(false),
+                Some(_) => {
+                    return Err(ApiError::new(
+                        409,
+                        ErrorCode::OperationIdConflict,
+                        "operationId was reused with a different semantic request",
+                    ))
+                }
+                None => {}
+            }
+            (
+                entry.owner_application_id.clone(),
+                entry.snapshot.kind.clone(),
+            )
+        };
+        if let Some(ref owner) = owner {
+            let newly_admitted = self
+                .storage
+                .admit_application_long_job(owner, id, &kind, fingerprint)
+                .map_err(|error| match error {
+                    StorageError::RequestIdConflict => ApiError::new(
+                        409,
+                        ErrorCode::OperationIdConflict,
+                        "operationId has a different durable fingerprint",
+                    ),
+                    other => ApiError::from_storage(other),
+                })?;
+            if !newly_admitted {
+                return Ok(false);
+            }
+        }
+        let mut operations = self.operations.lock().map_err(|_| ApiError::internal())?;
+        let entry = operations.get_mut(id).ok_or_else(|| {
+            ApiError::new(
+                404,
+                ErrorCode::OperationNotFound,
+                "operation disappeared during worker admission",
+            )
+        })?;
+        if entry.request_fingerprint.is_some() {
+            return Err(ApiError::new(
+                409,
+                ErrorCode::OperationIdConflict,
+                "worker ownership changed during durable admission",
+            ));
+        }
+        entry.request_fingerprint = Some(fingerprint.to_owned());
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn insert_operation(
         &self,
@@ -2412,8 +3009,22 @@ impl RuntimeState {
         bytes_total: Option<u64>,
         items_total: Option<u64>,
     ) -> Result<(LongOperationSnapshot, Arc<AtomicBool>), ApiError> {
+        if self.lifecycle_status() != RuntimeLifecycleStatus::Running {
+            return Err(ApiError::new(
+                503,
+                ErrorCode::RuntimeShuttingDown,
+                "runtime is not accepting new operations",
+            ));
+        }
         self.prune_operations();
         let mut operations = self.operations.lock().map_err(|_| ApiError::internal())?;
+        if self.lifecycle_status() != RuntimeLifecycleStatus::Running {
+            return Err(ApiError::new(
+                503,
+                ErrorCode::RuntimeShuttingDown,
+                "runtime is not accepting new operations",
+            ));
+        }
         if let Some(existing) = operations.get(&id) {
             if existing.owner_application_id == owner_application_id
                 && existing.snapshot.kind == kind
@@ -2468,6 +3079,7 @@ impl RuntimeState {
             LongOperationEntry {
                 snapshot: snapshot.clone(),
                 cancel: Arc::clone(&cancel),
+                request_fingerprint: None,
                 owner_application_id,
                 desktop_dismissed: false,
             },
@@ -2540,6 +3152,71 @@ impl RuntimeState {
         }
     }
 
+    fn persist_uncertain_long_job(&self, id: &str) {
+        let snapshot = self.operations.lock().ok().and_then(|ops| {
+            ops.get(id).and_then(|entry| {
+                entry
+                    .owner_application_id
+                    .as_ref()
+                    .map(|owner| (owner.clone(), entry.snapshot.clone()))
+            })
+        });
+        if let Some((owner, snapshot)) = snapshot {
+            if let Ok(payload) = serde_json::to_value(&snapshot) {
+                let _ = self
+                    .storage
+                    .mark_application_long_job_uncertain(&owner, id, &payload);
+            }
+        }
+    }
+
+    fn persist_or_reconcile(&self, id: &str, phase: &str) {
+        let snapshot = self
+            .operations
+            .lock()
+            .ok()
+            .and_then(|ops| ops.get(id).map(|entry| entry.snapshot.clone()));
+        if let Some(snapshot) = snapshot {
+            if !self.persist_terminal_job(id, phase, &snapshot) {
+                if let Ok(mut ops) = self.operations.lock() {
+                    if let Some(entry) = ops.get_mut(id) {
+                        entry.snapshot.status = LongOperationStatus::Reconciling;
+                        entry.snapshot.phase = "reconciling".into();
+                        entry.snapshot.cancellable = false;
+                        entry.snapshot.result = None;
+                        entry.snapshot.error = Some(LongOperationError {
+                            code: "OUTCOME_UNKNOWN".into(),
+                            message: "The worker ended but its durable outcome was not recorded."
+                                .into(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn persist_terminal_job(
+        &self,
+        id: &str,
+        phase: &str,
+        snapshot: &LongOperationSnapshot,
+    ) -> bool {
+        let owner = self.operations.lock().ok().and_then(|ops| {
+            ops.get(id)
+                .and_then(|entry| entry.owner_application_id.clone())
+        });
+        let Some(owner) = owner else {
+            return true;
+        }; // Desktop admin job, not an application RPC.
+        let value = match serde_json::to_value(snapshot) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        self.storage
+            .finish_application_long_job(&owner, id, phase, &value)
+            .is_ok()
+    }
+
     fn complete_operation(&self, id: &str, phase: &str, result: Option<serde_json::Value>) {
         if let Ok(mut operations) = self.operations.lock() {
             if let Some(entry) = operations.get_mut(id) {
@@ -2561,19 +3238,62 @@ impl RuntimeState {
                 }
             }
         }
+        self.persist_or_reconcile(
+            id,
+            if phase == "partial" {
+                "PARTIALLY_APPLIED"
+            } else {
+                "COMMITTED"
+            },
+        );
         self.audit_log("long-operation-completed", "ok");
     }
     fn cancelled_operation(&self, id: &str) {
+        // Cancellation of a native job can occur after a prefix of external
+        // writes has committed, even before progress was delivered. Without
+        // proven per-item rollback, ABORTED would be a false terminal claim.
+        let uncertain_native = self
+            .operations
+            .lock()
+            .ok()
+            .and_then(|ops| {
+                ops.get(id).map(|entry| {
+                    entry.owner_application_id.is_some()
+                        && matches!(
+                            entry.snapshot.kind.as_str(),
+                            "native-import" | "native-export"
+                        )
+                })
+            })
+            .unwrap_or(false);
         if let Ok(mut operations) = self.operations.lock() {
             if let Some(entry) = operations.get_mut(id) {
-                entry.snapshot.phase = "cancelled".into();
-                entry.snapshot.status = LongOperationStatus::Cancelled;
                 entry.snapshot.cancellable = false;
-                entry.snapshot.error = None;
                 entry.snapshot.updated_at_ms = now_ms();
+                if uncertain_native {
+                    entry.snapshot.phase = "reconciling".into();
+                    entry.snapshot.status = LongOperationStatus::Reconciling;
+                    entry.snapshot.error = Some(LongOperationError {
+                        code: "OUTCOME_UNKNOWN".into(),
+                        message: "Cancelled native job may have applied a prefix; durable reconciliation is required.".into(),
+                    });
+                    entry.snapshot.result = None;
+                } else {
+                    entry.snapshot.phase = "cancelled".into();
+                    entry.snapshot.status = LongOperationStatus::Cancelled;
+                    entry.snapshot.error = None;
+                }
             }
         }
-        self.audit_log("long-operation-cancelled", "ok");
+        if uncertain_native {
+            self.persist_uncertain_long_job(id);
+        } else {
+            self.persist_or_reconcile(id, "ABORTED");
+        }
+        self.audit_log(
+            "long-operation-cancelled",
+            if uncertain_native { "unknown" } else { "ok" },
+        );
     }
     fn fail_operation_code(&self, id: &str, code: &str, error: String) {
         if let Ok(mut operations) = self.operations.lock() {
@@ -2588,6 +3308,33 @@ impl RuntimeState {
                 entry.snapshot.result = None;
                 entry.snapshot.updated_at_ms = now_ms();
             }
+        }
+        let potentially_partial = self
+            .operations
+            .lock()
+            .ok()
+            .and_then(|ops| {
+                ops.get(id).map(|entry| {
+                    entry.owner_application_id.is_some()
+                        && matches!(
+                            entry.snapshot.kind.as_str(),
+                            "native-import" | "native-export" | "batch"
+                        )
+                })
+            })
+            .unwrap_or(false);
+        if potentially_partial {
+            if let Ok(mut ops) = self.operations.lock() {
+                if let Some(entry) = ops.get_mut(id) {
+                    entry.snapshot.status = LongOperationStatus::Reconciling;
+                    entry.snapshot.phase = "reconciling".into();
+                    entry.snapshot.cancellable = false;
+                    entry.snapshot.error = Some(LongOperationError { code: "OUTCOME_UNKNOWN".into(), message: "Worker failed after an operation with potentially partial side effects; reconcile its durable result.".into() });
+                }
+            }
+            self.persist_uncertain_long_job(id);
+        } else {
+            self.persist_or_reconcile(id, "ABORTED");
         }
         self.audit_log("long-operation-failed", "error");
     }
@@ -2627,17 +3374,72 @@ impl RuntimeState {
     ) -> Result<LongOperationSnapshot, ApiError> {
         validate_operation_id(operation_id)?;
         let operations = self.operations.lock().map_err(|_| ApiError::internal())?;
-        let entry = operations.get(operation_id).ok_or_else(|| {
-            ApiError::new(404, ErrorCode::OperationNotFound, "operation not found")
-        })?;
-        if entry.owner_application_id.as_deref() != Some(application_id) {
-            return Err(ApiError::new(
-                403,
-                ErrorCode::OperationNotOwned,
-                "operation belongs to another application",
-            ));
+        if let Some(entry) = operations.get(operation_id) {
+            if entry.owner_application_id.as_deref() != Some(application_id) {
+                return Err(ApiError::new(
+                    403,
+                    ErrorCode::OperationNotOwned,
+                    "operation belongs to another application",
+                ));
+            }
+            let snapshot = entry.snapshot.clone();
+            if snapshot.status == LongOperationStatus::Reconciling
+                && matches!(snapshot.kind.as_str(), "batch" | "native-import")
+            {
+                let fingerprint = entry.request_fingerprint.clone();
+                drop(operations);
+                if let Some(fingerprint) = fingerprint {
+                    let saved =
+                        serde_json::to_value(&snapshot).map_err(|_| ApiError::internal())?;
+                    if snapshot.kind == "native-import" {
+                        if let Some((kind, fp, phase, evidence)) = self
+                            .storage
+                            .application_long_job(application_id, operation_id)
+                            .map_err(ApiError::from_storage)?
+                        {
+                            return self.resolve_durable_batch(
+                                application_id,
+                                operation_id,
+                                &kind,
+                                &fp,
+                                &phase,
+                                evidence,
+                            );
+                        }
+                    }
+                    return self.resolve_durable_batch(
+                        application_id,
+                        operation_id,
+                        "batch",
+                        &fingerprint,
+                        "RECONCILING",
+                        Some(saved),
+                    );
+                }
+                return Ok(snapshot);
+            }
+            return Ok(snapshot);
         }
-        Ok(entry.snapshot.clone())
+        drop(operations);
+        let stored = self
+            .storage
+            .application_long_job(application_id, operation_id)
+            .map_err(ApiError::from_storage)?;
+        match stored {
+            Some((kind, fingerprint, phase, json)) => self.resolve_durable_batch(
+                application_id,
+                operation_id,
+                &kind,
+                &fingerprint,
+                &phase,
+                json,
+            ),
+            None => Err(ApiError::new(
+                404,
+                ErrorCode::OperationNotFound,
+                "operation not found",
+            )),
+        }
     }
     fn cancel_application_operation(
         &self,
@@ -2645,6 +3447,48 @@ impl RuntimeState {
         operation_id: &str,
     ) -> Result<LongOperationSnapshot, ApiError> {
         validate_operation_id(operation_id)?;
+        let fingerprint = {
+            let operations = self.operations.lock().map_err(|_| ApiError::internal())?;
+            let entry = operations.get(operation_id).ok_or_else(|| {
+                ApiError::new(404, ErrorCode::OperationNotFound, "operation not found")
+            })?;
+            if entry.owner_application_id.as_deref() != Some(application_id) {
+                return Err(ApiError::new(
+                    403,
+                    ErrorCode::OperationNotOwned,
+                    "operation belongs to another application",
+                ));
+            }
+            if !entry.snapshot.cancellable
+                || !matches!(
+                    entry.snapshot.status,
+                    LongOperationStatus::Queued
+                        | LongOperationStatus::Running
+                        | LongOperationStatus::Cancelling
+                )
+            {
+                return Err(ApiError::new(
+                    409,
+                    ErrorCode::OperationNotCancellable,
+                    "operation is not cancellable",
+                ));
+            }
+            entry.request_fingerprint.clone()
+        };
+        // An in-memory queued entry is NOT proof of durable admission.
+        // Pre-admission cancellation must not ACK or set a worker flag: a lost
+        // start ACK may still need explicit original-operation reconciliation.
+        let fingerprint = fingerprint.ok_or_else(|| {
+            ApiError::new(
+                404,
+                ErrorCode::OperationNotFound,
+                "operation has not completed durable admission; cancellation not acknowledged",
+            )
+        })?;
+        // No worker-map mutex while taking the SQLite registry mutex.
+        self.storage
+            .request_application_long_job_cancel(application_id, operation_id, &fingerprint)
+            .map_err(ApiError::from_storage)?;
         let mut operations = self.operations.lock().map_err(|_| ApiError::internal())?;
         let entry = operations.get_mut(operation_id).ok_or_else(|| {
             ApiError::new(404, ErrorCode::OperationNotFound, "operation not found")
@@ -2654,6 +3498,13 @@ impl RuntimeState {
                 403,
                 ErrorCode::OperationNotOwned,
                 "operation belongs to another application",
+            ));
+        }
+        if entry.request_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+            return Err(ApiError::new(
+                409,
+                ErrorCode::OperationIdConflict,
+                "operation identity changed during cancellation",
             ));
         }
         if !entry.snapshot.cancellable
@@ -2667,7 +3518,7 @@ impl RuntimeState {
             return Err(ApiError::new(
                 409,
                 ErrorCode::OperationNotCancellable,
-                "operation is not cancellable",
+                "operation already reached a non-cancellable stage",
             ));
         }
         entry.cancel.store(true, Ordering::SeqCst);
@@ -2891,6 +3742,11 @@ impl RuntimeState {
         }
     }
     fn lock_global_maintenance(&self, owner: &str) -> Result<(), RuntimeAdminError> {
+        if self.lifecycle_status() != RuntimeLifecycleStatus::Running {
+            return Err(RuntimeAdminError::Internal(
+                "runtime is draining or stopped".into(),
+            ));
+        }
         let mut lock = self
             .global_maintenance
             .lock()
@@ -2934,7 +3790,9 @@ impl RuntimeState {
             .unwrap_or(true)
     }
 
-    fn prune_ephemeral(&self) {
+    // Fast, bounded session bookkeeping. Authentication must never scan every
+    // stream or perform Core disk/SQLite stream-journal work.
+    fn prune_session_ephemeral(&self) {
         let now = now_ms();
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.retain(|_, session| session.expires_at_ms > now);
@@ -2951,6 +3809,13 @@ impl RuntimeState {
                 !samples.is_empty()
             });
         }
+    }
+
+    // CP18: this can perform per-stream journal IO and may touch large upload
+    // maps. Run only in the periodic maintenance task, not per HTTP request.
+    fn prune_ephemeral(&self) {
+        self.prune_session_ephemeral();
+        let now = now_ms();
         // Snapshot handles under the map mutex; the per-stream mutex fences
         // expiry against all in-flight write/commit/abort operations.
         let handles = self
@@ -2978,35 +3843,52 @@ impl RuntimeState {
             if stream.last_activity_ms > now - STREAM_IDLE_TIMEOUT_MS {
                 continue;
             }
-            if self.remove_current_write_stream(&id, &handle).ok() != Some(true) {
-                continue;
-            }
-            drop(active);
-            stream.file.take();
-            let cleanup = if stream.committed.is_none() {
-                self.storage
-                    .abort_stream_temp(&stream.space_id, &stream.temp_path)
-            } else {
-                Ok(())
+            // Journal is authoritative. A stalled commit with no terminal row
+            // must retain its path lease: idle time is not proof of abort.
+            let journal = match self.storage.resolve_stream_by_id(&stream.pairing_id, &id) {
+                Ok(Some(journal)) => journal,
+                _ => continue,
             };
-            if cleanup.is_ok() {
-                if let Ok(mut paths) = self.active_write_paths.lock() {
-                    paths.remove(&write_path_key(&stream.space_id, &stream.path));
-                }
-                if stream.committed.is_none() {
-                    let _ = self.storage.finish_stream_operation(
+            if journal.phase == "OPEN" {
+                if self
+                    .storage
+                    .finish_stream_operation(
                         &id,
                         &stream.pairing_id,
                         "OPEN",
                         "EXPIRED_FENCED",
                         None,
-                    );
+                    )
+                    .is_err()
+                {
+                    continue;
                 }
-                if let Some(operation_id) = stream.operation_id.as_deref() {
+            } else if journal.phase != "COMMITTED"
+                && journal.phase != "ABORTED"
+                && journal.phase != "EXPIRED_FENCED"
+            {
+                continue;
+            }
+            if self.remove_current_write_stream(&id, &handle).ok() != Some(true) {
+                continue;
+            }
+            drop(active);
+            stream.file.take();
+            if journal.phase == "OPEN" || journal.phase == "EXPIRED_FENCED" {
+                let _ = self
+                    .storage
+                    .abort_stream_temp(&stream.space_id, &stream.temp_path);
+            }
+            stream.admission_lease.take();
+            if let Ok(mut paths) = self.active_write_paths.lock() {
+                release_write_path_if_owner(&mut paths, &stream.space_id, &stream.path, &id);
+            }
+            if let Some(operation_id) = stream.operation_id.as_deref() {
+                if journal.phase == "OPEN" || journal.phase == "EXPIRED_FENCED" {
                     self.fail_operation_code(
                         operation_id,
                         "STREAM_EXPIRED",
-                        "stream expired after confirmed idle cleanup".into(),
+                        "stream expired after durable idle fencing".into(),
                     );
                 }
             }
@@ -3110,8 +3992,38 @@ impl RuntimeState {
         Ok(())
     }
 
+    /// Status-only verification of a credential belonging to an active pairing
+    /// at the moment its original application was deleted. This is deliberately
+    /// separate from session authentication: the old pairing stays revoked.
+    fn authenticate_retained_proof(
+        &self,
+        proof: &HistoricalStatusProof,
+    ) -> Result<(String, String), ApiError> {
+        // The existing pairing credential is a random 256-bit hex secret.
+        if proof.pairing_credential.len() != 64
+            || !proof
+                .pairing_credential
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(ApiError::auth_invalid());
+        }
+        if proof.client_instance_id.is_empty()
+            || proof.client_instance_id.len() > 512
+            || proof.client_instance_id.contains('\0')
+        {
+            return Err(ApiError::auth_invalid());
+        }
+        self.check_pairing_rate(&proof.client_instance_id)?;
+        let hash = sha256_hex(proof.pairing_credential.as_bytes());
+        self.storage
+            .retained_status_owner(&proof.client_instance_id, &hash)
+            .map_err(|_| ApiError::auth_invalid())?
+            .ok_or_else(ApiError::auth_invalid)
+    }
+
     fn authenticate(&self, request: &HttpRequest) -> Result<SessionState, ApiError> {
-        self.prune_ephemeral();
+        self.prune_session_ephemeral();
         if self
             .global_maintenance
             .lock()
@@ -3219,27 +4131,63 @@ impl RuntimeState {
         to_path: Option<&str>,
         key: Option<&str>,
     ) {
-        let sequence = self.event_sequence.fetch_add(1, Ordering::SeqCst) + 1;
-        let event = RuntimeEventWire {
-            sequence,
+        // Sequence allocation and queue publication must be one critical section.
+        // Otherwise a later enqueue can be visible first and lastSeq will skip it.
+        let mut events = self
+            .events
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        events.push(
+            application_id,
             event_type,
-            space_id: space_id.map(str::to_owned),
-            path: path.map(str::to_owned),
-            from_path: from_path.map(str::to_owned),
-            to_path: to_path.map(str::to_owned),
-            key: key.map(str::to_owned),
-            at_ms: now_ms(),
-        };
-        if let Ok(mut events) = self.events.lock() {
-            events.push_back(BufferedEvent {
-                application_id: application_id.to_owned(),
-                event,
-            });
-            while events.len() > EVENT_BUFFER_CAPACITY {
-                events.pop_front();
-            }
-        }
+            space_id,
+            path,
+            from_path,
+            to_path,
+            key,
+        );
+        drop(events);
         self.event_notify.notify_waiters();
+    }
+
+    /// Emit an APPLIED mutation only once for a durable request identity.
+    /// Caller must inspect the Core terminal proof BEFORE invoking Core and
+    /// call here only after the mutation's durable success was confirmed.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_applied_mutation(
+        &self,
+        space_id: &str,
+        request_id: &str,
+        was_committed: bool,
+        application_id: &str,
+        event_type: EventKindWire,
+        path: Option<&str>,
+        from_path: Option<&str>,
+        to_path: Option<&str>,
+        key: Option<&str>,
+    ) {
+        if was_committed {
+            return;
+        }
+        let published = {
+            let mut events = self
+                .events
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            events.push_mutation(
+                space_id,
+                request_id,
+                application_id,
+                event_type,
+                path,
+                from_path,
+                to_path,
+                key,
+            )
+        };
+        if published {
+            self.event_notify.notify_waiters();
+        }
     }
 
     fn collect_events(
@@ -3251,50 +4199,7 @@ impl RuntimeState {
             self.authorize_space(session, space_id)?;
         }
         let events = self.events.lock().map_err(|_| ApiError::internal())?;
-        let oldest = events.front().map_or(
-            self.event_sequence.load(Ordering::SeqCst).saturating_add(1),
-            |item| item.event.sequence,
-        );
-        let overflow = input.after_sequence > 0 && input.after_sequence.saturating_add(1) < oldest;
-        let mut out = Vec::new();
-        for item in events.iter() {
-            if (item.application_id != "*" && item.application_id != session.application_id)
-                || item.event.sequence <= input.after_sequence
-            {
-                continue;
-            }
-            if let Some(space_id) = input.space_id.as_deref() {
-                if item.event.space_id.as_deref() != Some(space_id) {
-                    continue;
-                }
-            }
-            if let Some(prefix) = input.path_prefix.as_deref() {
-                let matches = item
-                    .event
-                    .path
-                    .as_deref()
-                    .is_some_and(|path| event_path_matches(path, prefix))
-                    || item
-                        .event
-                        .from_path
-                        .as_deref()
-                        .is_some_and(|path| event_path_matches(path, prefix))
-                    || item
-                        .event
-                        .to_path
-                        .as_deref()
-                        .is_some_and(|path| event_path_matches(path, prefix));
-                if !matches {
-                    continue;
-                }
-            }
-            out.push(item.event.clone());
-        }
-        Ok(EventPollResponse {
-            events: out,
-            latest_sequence: self.event_sequence.load(Ordering::SeqCst),
-            overflow,
-        })
+        Ok(events.collect(&session.application_id, input))
     }
 
     async fn poll_events(
@@ -3302,19 +4207,30 @@ impl RuntimeState {
         session: &SessionState,
         input: &EventPollRequest,
     ) -> Result<EventPollResponse, ApiError> {
-        // Register the waiter before the first collection so an event cannot slip
-        // between the empty check and Notify subscription.
-        let notified = self.event_notify.notified();
-        let initial = self.collect_events(session, input)?;
-        if initial.overflow || !initial.events.is_empty() || input.wait_ms.unwrap_or(0) == 0 {
-            return Ok(initial);
-        }
+        // Enable each Notify waiter before examining the queue. A wake-up
+        // for another owner is not an event for this session, so keep waiting
+        // until the original deadline rather than busy-polling other owners.
         let wait_ms = input
             .wait_ms
             .unwrap_or(EVENT_LONG_POLL_MAX_MS)
             .min(EVENT_LONG_POLL_MAX_MS);
-        let _ = timeout(Duration::from_millis(wait_ms), notified).await;
-        self.collect_events(session, input)
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
+        loop {
+            let notified = self.event_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let response = self.collect_events(session, input)?;
+            if response.overflow || !response.events.is_empty() || wait_ms == 0 {
+                return Ok(response);
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(response);
+            }
+            if timeout(remaining, notified).await.is_err() {
+                return self.collect_events(session, input);
+            }
+        }
     }
 }
 
@@ -3376,6 +4292,7 @@ struct WriteStreamState {
     last_activity_ms: i64,
     existed_before: bool,
     committed: Option<FileRecord>,
+    admission_lease: Option<AdmissionLease>,
     operation_id: Option<String>,
 }
 
@@ -3384,6 +4301,8 @@ struct WriteStreamState {
 struct StreamResolveRequest {
     space_id: String,
     request_id: String,
+    #[serde(default)]
+    history_proof: Option<HistoricalStatusProof>,
 }
 
 #[derive(Serialize)]
@@ -3449,6 +4368,20 @@ fn stream_outcome_wire(op: StreamOperationRecord, live: bool) -> StreamOutcomeWi
 }
 
 fn stream_operation_snapshot(stream_id: &str, stream: &WriteStreamState) -> StreamOperationRecord {
+    // Persist the entire begin intent, not merely (requestId, path). In particular
+    // changed ifMatch/metadata/declaredSize must not inherit a prior stream result.
+    let intent = serde_json::json!({
+        "kind": "stream-write-begin",
+        "pairingId": &stream.pairing_id,
+        "spaceId": &stream.space_id,
+        "path": &stream.path,
+        "chunkMethod": stream.chunk_method.as_str(),
+        "ifMatch": &stream.if_match,
+        "declaredSize": stream.declared_size,
+        "metadata": &stream.metadata,
+        "operationId": &stream.operation_id,
+    });
+    let request_fingerprint = sha256_hex(intent.to_string().as_bytes());
     StreamOperationRecord {
         pairing_id: stream.pairing_id.clone(),
         space_id: stream.space_id.clone(),
@@ -3457,6 +4390,7 @@ fn stream_operation_snapshot(stream_id: &str, stream: &WriteStreamState) -> Stre
         method: stream.chunk_method.as_str().into(),
         path: stream.path.clone(),
         declared_size: stream.declared_size,
+        request_fingerprint: Some(request_fingerprint),
         phase: if stream.committed.is_some() {
             "COMMITTED".into()
         } else {
@@ -3490,9 +4424,148 @@ struct BufferedEvent {
     event: RuntimeEventWire,
 }
 
+/// Owner-scoped overflow proof and ordered runtime event buffer. Retaining the
+/// highest discarded sequence for each owner is essential: eviction of an
+/// unrelated application's events cannot falsely signal loss to this client.
+#[derive(Default)]
+struct OwnerEventBuffer {
+    last_sequence: u64,
+    pending: VecDeque<BufferedEvent>,
+    dropped_through: HashMap<String, u64>,
+    // An in-process identity fence closes simultaneous replays that checked
+    // Core before the first caller committed. Cold-start replays are rejected
+    // by committed_space_request(), which consults durable terminal proof.
+    emitted_mutations: HashMap<(String, String), std::time::Instant>,
+}
+
+impl OwnerEventBuffer {
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &mut self,
+        application_id: &str,
+        event_type: EventKindWire,
+        space_id: Option<&str>,
+        path: Option<&str>,
+        from_path: Option<&str>,
+        to_path: Option<&str>,
+        key: Option<&str>,
+    ) {
+        self.last_sequence = self
+            .last_sequence
+            .checked_add(1)
+            .expect("runtime event sequence exhausted");
+        self.pending.push_back(BufferedEvent {
+            application_id: application_id.to_owned(),
+            event: RuntimeEventWire {
+                sequence: self.last_sequence,
+                event_type,
+                space_id: space_id.map(str::to_owned),
+                path: path.map(str::to_owned),
+                from_path: from_path.map(str::to_owned),
+                to_path: to_path.map(str::to_owned),
+                key: key.map(str::to_owned),
+                at_ms: now_ms(),
+            },
+        });
+        while self.pending.len() > EVENT_BUFFER_CAPACITY {
+            if let Some(removed) = self.pending.pop_front() {
+                self.dropped_through
+                    .entry(removed.application_id)
+                    .and_modify(|previous| *previous = (*previous).max(removed.event.sequence))
+                    .or_insert(removed.event.sequence);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_mutation(
+        &mut self,
+        space_id: &str,
+        request_id: &str,
+        application_id: &str,
+        event_type: EventKindWire,
+        path: Option<&str>,
+        from_path: Option<&str>,
+        to_path: Option<&str>,
+        key: Option<&str>,
+    ) -> bool {
+        // Keep the in-process concurrency fence longer than the seven-day
+        // durable replay window, but do not retain identities forever in a
+        // long-lived Desktop runtime. The authoritative persisted proof also
+        // prevents replay events after a process restart.
+        if self.emitted_mutations.len() >= 4096 {
+            self.emitted_mutations.retain(|_, first_seen| {
+                first_seen.elapsed() < Duration::from_secs(8 * 24 * 60 * 60)
+            });
+        }
+        let identity = (space_id.to_owned(), request_id.to_owned());
+        if self.emitted_mutations.contains_key(&identity) {
+            return false;
+        }
+        self.emitted_mutations
+            .insert(identity, std::time::Instant::now());
+        self.push(
+            application_id,
+            event_type,
+            Some(space_id),
+            path,
+            from_path,
+            to_path,
+            key,
+        );
+        true
+    }
+
+    fn collect(&self, application_id: &str, input: &EventPollRequest) -> EventPollResponse {
+        let lost_owner = self
+            .dropped_through
+            .get(application_id)
+            .copied()
+            .unwrap_or(0);
+        let lost_global = self.dropped_through.get("*").copied().unwrap_or(0);
+        let overflow =
+            input.after_sequence != 0 && lost_owner.max(lost_global) > input.after_sequence;
+        let events = self
+            .pending
+            .iter()
+            .filter(|item| {
+                (item.application_id == "*" || item.application_id == application_id)
+                    && item.event.sequence > input.after_sequence
+            })
+            .filter(|item| {
+                input
+                    .space_id
+                    .as_deref()
+                    .is_none_or(|space_id| item.event.space_id.as_deref() == Some(space_id))
+            })
+            .filter(|item| {
+                input.path_prefix.as_deref().is_none_or(|prefix| {
+                    [
+                        item.event.path.as_deref(),
+                        item.event.from_path.as_deref(),
+                        item.event.to_path.as_deref(),
+                    ]
+                    .iter()
+                    .flatten()
+                    .any(|path| event_path_matches(path, prefix))
+                })
+            })
+            .map(|item| item.event.clone())
+            .collect();
+        EventPollResponse {
+            events,
+            latest_sequence: self.last_sequence,
+            overflow,
+        }
+    }
+}
+
 struct LongOperationEntry {
     snapshot: LongOperationSnapshot,
     cancel: Arc<AtomicBool>,
+    // Bound once before the worker starts. An in-memory replay is not a durable
+    // result guarantee across Runtime restart (CP17 provides recovery/GC).
+    request_fingerprint: Option<String>,
     owner_application_id: Option<String>,
     desktop_dismissed: bool,
 }
@@ -3587,6 +4660,13 @@ fn storage_error_code(error: &StorageError) -> &'static str {
         StorageError::PathConflict(_) => "PATH_CONFLICT",
         StorageError::NotFound(_) => "NOT_FOUND",
         StorageError::Conflict(_) => "CONFLICT",
+        StorageError::StorageRootBusy => "STORAGE_ROOT_BUSY",
+        StorageError::RequestIdConflict => "REQUEST_ID_CONFLICT",
+        StorageError::RequestIdMigrationRequired => "REQUEST_ID_MIGRATION_REQUIRED",
+        StorageError::OutcomeUnknown => "OUTCOME_UNKNOWN",
+        StorageError::ResultExpired => "RESULT_EXPIRED",
+        StorageError::RequestClockSkew => "REQUEST_CLOCK_SKEW",
+        StorageError::RecoveryRequired => "RECOVERY_REQUIRED",
         StorageError::StorageUnavailable(_) => "STORAGE_UNAVAILABLE",
         StorageError::DiskSpaceLow(_) => "DISK_SPACE_LOW",
         StorageError::StorageCorrupt(_) | StorageError::SchemaUnsupported(_) => "STORAGE_CORRUPT",
@@ -3602,6 +4682,13 @@ fn storage_error_code(error: &StorageError) -> &'static str {
 
 fn native_export_error_code(error: &StorageError) -> &'static str {
     match error {
+        StorageError::StorageRootBusy => "STORAGE_ROOT_BUSY",
+        StorageError::RequestIdConflict => "REQUEST_ID_CONFLICT",
+        StorageError::RequestIdMigrationRequired => "REQUEST_ID_MIGRATION_REQUIRED",
+        StorageError::OutcomeUnknown => "OUTCOME_UNKNOWN",
+        StorageError::ResultExpired => "RESULT_EXPIRED",
+        StorageError::RequestClockSkew => "REQUEST_CLOCK_SKEW",
+        StorageError::RecoveryRequired => "RECOVERY_REQUIRED",
         StorageError::OperationCancelled => "EXPORT_CANCELLED",
         StorageError::ExportSourceChanged => "EXPORT_SOURCE_CHANGED",
         StorageError::PathInvalid(_)
@@ -3624,6 +4711,13 @@ fn native_export_error_code(error: &StorageError) -> &'static str {
 
 fn native_import_error_code(error: &StorageError) -> &'static str {
     match error {
+        StorageError::StorageRootBusy => "STORAGE_ROOT_BUSY",
+        StorageError::RequestIdConflict => "REQUEST_ID_CONFLICT",
+        StorageError::RequestIdMigrationRequired => "REQUEST_ID_MIGRATION_REQUIRED",
+        StorageError::OutcomeUnknown => "OUTCOME_UNKNOWN",
+        StorageError::ResultExpired => "RESULT_EXPIRED",
+        StorageError::RequestClockSkew => "REQUEST_CLOCK_SKEW",
+        StorageError::RecoveryRequired => "RECOVERY_REQUIRED",
         StorageError::OperationCancelled => "IMPORT_CANCELLED",
         StorageError::ExportSourceChanged => "STORAGE_UNAVAILABLE",
         StorageError::PathInvalid(_)
@@ -3680,6 +4774,39 @@ impl ApiError {
             StorageError::PathConflict(message) => Self::new(409, ErrorCode::PathConflict, message),
             StorageError::NotFound(message) => Self::new(404, ErrorCode::NotFound, message),
             StorageError::Conflict(message) => Self::new(409, ErrorCode::Conflict, message),
+            StorageError::StorageRootBusy => Self::new(
+                409,
+                ErrorCode::StorageRootBusy,
+                "storage root is already owned",
+            ),
+            StorageError::RequestIdConflict => Self::new(
+                409,
+                ErrorCode::RequestIdConflict,
+                "requestId was used for a different mutation",
+            ),
+            StorageError::RequestIdMigrationRequired => Self::new(
+                409,
+                ErrorCode::RequestIdMigrationRequired,
+                "v3 durable replay is not supported for this mutation class",
+            ),
+            StorageError::OutcomeUnknown => Self::new(
+                409,
+                ErrorCode::OutcomeUnknown,
+                "legacy receipt cannot prove this replay",
+            ),
+            StorageError::ResultExpired => {
+                Self::new(409, ErrorCode::ResultExpired, "replay result has expired")
+            }
+            StorageError::RequestClockSkew => Self::new(
+                409,
+                ErrorCode::RequestClockSkew,
+                "request identity time is outside allowed window",
+            ),
+            StorageError::RecoveryRequired => Self::new(
+                409,
+                ErrorCode::RecoveryRequired,
+                "scope has unresolved filesystem recovery",
+            ),
             StorageError::StorageUnavailable(message) => {
                 Self::new(503, ErrorCode::StorageUnavailable, message)
             }
@@ -3860,6 +4987,35 @@ async fn handle_request(
                     "identity challenge nonce must be 256-bit hex",
                 ));
             }
+            if input.history_only {
+                // Identity proof only: the verifier was archived from the
+                // original active pairing. This never issues a session.
+                let hash = state
+                    .storage
+                    .retained_challenge_hash(
+                        to_core_kind(input.application.kind),
+                        &input.application.external_id,
+                        &input.client_instance_id,
+                    )
+                    .map_err(ApiError::from_storage)?
+                    .ok_or_else(|| {
+                        ApiError::new(
+                            404,
+                            ErrorCode::PairingRuntimeNotFound,
+                            "no retained identity for original application/client",
+                        )
+                    })?;
+                let key = decode_hex_32(&hash).ok_or_else(ApiError::internal)?;
+                let mac = hmac_sha256_hex(
+                    &key,
+                    &[
+                        RUNTIME_IDENTITY_DOMAIN_SEPARATOR.as_bytes(),
+                        input.nonce.as_bytes(),
+                    ]
+                    .concat(),
+                );
+                return HttpResponse::json(200, &RuntimeIdentityChallengeResponse { mac });
+            }
             let application = state
                 .storage
                 .application_by_identity(
@@ -3914,7 +5070,7 @@ async fn handle_request(
                     "supportedChunkMethods must be a nonempty distinct set",
                 ));
             }
-            state.prune_ephemeral();
+            state.prune_session_ephemeral();
             let rate_key = format!(
                 "{:?}:{}:{}",
                 input.application.kind, input.application.external_id, input.client_instance_id
@@ -4059,7 +5215,7 @@ async fn handle_request(
                 .find_active_pairing_by_credential_hash(&input.client_instance_id, &credential_hash)
                 .map_err(ApiError::from_storage)?
                 .ok_or_else(ApiError::auth_invalid)?;
-            state.prune_ephemeral();
+            state.prune_session_ephemeral();
             let deleting = state
                 .deleting_applications
                 .lock()
@@ -4147,6 +5303,10 @@ async fn handle_request(
                         "tracked-export-prune".into(),
                         "directory-contents-export".into(),
                     ],
+                    // In a delivered build the one shared gate is OFF:
+                    // durable_replay: None, for all production sessions.
+                    // SDK retains the safe legacy/non-retrying mutation policy.
+                    durable_replay: negotiated_durable_replay(),
                 },
             )
         }
@@ -4159,12 +5319,13 @@ async fn handle_request(
             let storage_category = input.storage_category.map(to_core_storage_category);
             let space = state
                 .storage
-                .open_space_with_category(
+                .open_space_with_request(
                     &session.application_id,
                     &input.key,
                     storage_class,
                     storage_category,
                     input.display_name.as_deref(),
+                    &input.request_id,
                 )
                 .map_err(ApiError::from_storage)?;
             HttpResponse::json(200, &space_wire(space))
@@ -4198,6 +5359,25 @@ async fn handle_request(
                     ErrorCode::RequestInvalid,
                     "whole-space clear is only valid for cache or temporary spaces",
                 ));
+            }
+
+            // Before creating a new long-op worker or checking live stream
+            // reservations, return any authenticated committed replay. This
+            // also refuses an unresolved ADMITTED clear without a second run.
+            if let Some(prior) = state
+                .storage
+                .replayed_space_clear(&input.space_id, &input.request_id)
+                .map_err(ApiError::from_storage)?
+            {
+                return HttpResponse::json(
+                    200,
+                    &ClearSpaceResponse {
+                        space_id: prior.space_id,
+                        deleted_files: prior.deleted_files,
+                        deleted_kv_entries: prior.deleted_kv_entries,
+                        released_bytes: prior.released_bytes,
+                    },
+                );
             }
 
             let operation = if let Some(requested) = input.operation.as_ref() {
@@ -4262,12 +5442,14 @@ async fn handle_request(
 
             let storage = Arc::clone(&state.storage);
             let work_space_id = input.space_id.clone();
-            let result =
-                tokio::task::spawn_blocking(move || storage.clear_disposable_space(&work_space_id))
-                    .await;
+            let work_request_id = input.request_id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                storage.clear_disposable_space_with_request(&work_space_id, &work_request_id)
+            })
+            .await;
             state.unlock_space_exclusive(&input.space_id, &operation_id);
 
-            let report = match result {
+            let outcome = match result {
                 Ok(Ok(report)) => report,
                 Ok(Err(error)) => {
                     if let Some((snapshot, _)) = &operation {
@@ -4291,6 +5473,7 @@ async fn handle_request(
                 }
             };
 
+            let report = outcome.value;
             if let Some((snapshot, _)) = &operation {
                 state.update_operation_metrics(
                     &snapshot.id,
@@ -4302,15 +5485,17 @@ async fn handle_request(
                 );
                 state.complete_operation(&snapshot.id, "complete", None);
             }
-            state.emit_event(
-                &session.application_id,
-                EventKindWire::OverflowResyncRequired,
-                Some(&input.space_id),
-                None,
-                None,
-                None,
-                None,
-            );
+            if outcome.disposition == MutationDisposition::Applied {
+                state.emit_event(
+                    &session.application_id,
+                    EventKindWire::OverflowResyncRequired,
+                    Some(&input.space_id),
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+            }
             HttpResponse::json(
                 200,
                 &ClearSpaceResponse {
@@ -4345,7 +5530,7 @@ async fn handle_request(
             let space = state.authorize_space(&session, &input.space_id)?;
             let entry = state
                 .storage
-                .kv_set(
+                .kv_set_outcome(
                     &input.space_id,
                     &input.key,
                     &input.value,
@@ -4354,16 +5539,18 @@ async fn handle_request(
                     &input.request_id,
                 )
                 .map_err(ApiError::from_storage)?;
-            state.emit_event(
-                &space.owner_application_id,
-                EventKindWire::KvChanged,
-                Some(&input.space_id),
-                None,
-                None,
-                None,
-                Some(&input.key),
-            );
-            HttpResponse::json(200, &kv_wire(entry))
+            if entry.disposition == MutationDisposition::Applied {
+                state.emit_event(
+                    &space.owner_application_id,
+                    EventKindWire::KvChanged,
+                    Some(&input.space_id),
+                    None,
+                    None,
+                    None,
+                    Some(&input.key),
+                );
+            }
+            HttpResponse::json(200, &kv_wire(entry.value))
         }
         ("POST", "/v1/streams/write/capability") => {
             require_control_content_type(&request)?;
@@ -4427,7 +5614,7 @@ async fn handle_request(
                     .ensure_write_capacity(&input.space_id, declared_size)
                     .map_err(ApiError::from_storage)?;
             }
-            state.prune_ephemeral();
+            state.prune_session_ephemeral();
             {
                 let handles = state
                     .write_streams
@@ -4497,6 +5684,10 @@ async fn handle_request(
                     "requestId already exists; resolve the previous stream outcome",
                 ));
             }
+            let admission_lease = state
+                .storage
+                .try_admit_stream_path(&input.space_id, &input.path)
+                .map_err(ApiError::from_storage)?;
             let key = write_path_key(&input.space_id, &input.path);
             {
                 let mut paths = state
@@ -4547,11 +5738,18 @@ async fn handle_request(
                     return Err(ApiError::from_storage(error));
                 }
             };
-            if let Ok(mut paths) = state.active_write_paths.lock() {
-                paths.insert(key.clone(), stream_id.clone());
+            match state.active_write_paths.lock() {
+                Ok(mut paths) => {
+                    paths.insert(key.clone(), stream_id.clone());
+                }
+                Err(_) => {
+                    drop(file);
+                    let _ = state.storage.abort_stream_temp(&input.space_id, &temp_path);
+                    return Err(ApiError::internal());
+                }
             }
             let operation = if let Some(requested) = input.operation.as_ref() {
-                Some(state.begin_application_operation(
+                match state.begin_application_operation(
                     &session.application_id,
                     requested,
                     "write",
@@ -4559,7 +5757,17 @@ async fn handle_request(
                     true,
                     input.declared_size,
                     None,
-                )?)
+                ) {
+                    Ok(operation) => Some(operation),
+                    Err(error) => {
+                        drop(file);
+                        let _ = state.storage.abort_stream_temp(&input.space_id, &temp_path);
+                        if let Ok(mut paths) = state.active_write_paths.lock() {
+                            paths.remove(&key);
+                        }
+                        return Err(error);
+                    }
+                }
             } else {
                 None
             };
@@ -4589,6 +5797,7 @@ async fn handle_request(
                 last_activity_ms: now_ms(),
                 existed_before,
                 committed: None,
+                admission_lease: Some(admission_lease),
                 operation_id: operation.as_ref().map(|(snapshot, _)| snapshot.id.clone()),
             };
             if let Err(error) = state
@@ -4610,6 +5819,13 @@ async fn handle_request(
                 }
                 Err(_) => {
                     drop(stream);
+                    let _ = state.storage.finish_stream_operation(
+                        &stream_id,
+                        &session.pairing_id,
+                        "OPEN",
+                        "ABORTED",
+                        None,
+                    );
                     let _ = state
                         .storage
                         .abort_stream_temp(&cleanup_space_id, &cleanup_temp_path);
@@ -4742,6 +5958,10 @@ async fn handle_request(
             let path = input.path.clone();
             let recursive = input.recursive.unwrap_or(false);
             let if_match = input.if_match.clone();
+            let was_committed = state
+                .storage
+                .committed_space_request(&input.space_id, &input.request_id)
+                .map_err(ApiError::from_storage)?;
             let request_id = input.request_id.clone();
             let operation_id = operation.as_ref().map(|(snapshot, _)| snapshot.id.clone());
             let progress_state = Arc::clone(state);
@@ -4794,10 +6014,12 @@ async fn handle_request(
                     return Err(ApiError::from_storage(error));
                 }
             };
-            state.emit_event(
+            state.emit_applied_mutation(
+                &input.space_id,
+                &input.request_id,
+                was_committed,
                 &space.owner_application_id,
                 EventKindWire::FileDeleted,
-                Some(&input.space_id),
                 Some(&input.path),
                 None,
                 None,
@@ -4834,6 +6056,10 @@ async fn handle_request(
             let from = input.from.clone();
             let to = input.to.clone();
             let overwrite = input.overwrite.unwrap_or(false);
+            let was_committed = state
+                .storage
+                .committed_space_request(&input.space_id, &input.request_id)
+                .map_err(ApiError::from_storage)?;
             let request_id = input.request_id.clone();
             let operation_id = operation.as_ref().map(|(snapshot, _)| snapshot.id.clone());
             let cancel = operation.as_ref().map(|(_, cancel)| Arc::clone(cancel));
@@ -4891,10 +6117,12 @@ async fn handle_request(
                     return Err(ApiError::from_storage(error));
                 }
             };
-            state.emit_event(
+            state.emit_applied_mutation(
+                &input.space_id,
+                &input.request_id,
+                was_committed,
                 &space.owner_application_id,
                 EventKindWire::FileCreated,
-                Some(&input.space_id),
                 Some(&input.to),
                 None,
                 None,
@@ -4933,6 +6161,10 @@ async fn handle_request(
             let to = input.to.clone();
             let overwrite = input.overwrite.unwrap_or(false);
             let if_match = input.if_match.clone();
+            let was_committed = state
+                .storage
+                .committed_space_request(&input.space_id, &input.request_id)
+                .map_err(ApiError::from_storage)?;
             let request_id = input.request_id.clone();
             let operation_id = operation.as_ref().map(|(snapshot, _)| snapshot.id.clone());
             let cancel = operation.as_ref().map(|(_, cancel)| Arc::clone(cancel));
@@ -4991,10 +6223,12 @@ async fn handle_request(
                     return Err(ApiError::from_storage(error));
                 }
             };
-            state.emit_event(
+            state.emit_applied_mutation(
+                &input.space_id,
+                &input.request_id,
+                was_committed,
                 &space.owner_application_id,
                 EventKindWire::FileMoved,
-                Some(&input.space_id),
                 None,
                 Some(&input.from),
                 Some(&input.to),
@@ -5002,7 +6236,8 @@ async fn handle_request(
             );
             HttpResponse::json(200, &serde_json::json!({ "movedFiles": count }))
         }
-        ("POST", "/v1/batch") => {
+        ("POST", "/v1/batch") | ("POST", "/v1/batch/resume") => {
+            let resume_requested = request.path == "/v1/batch/resume";
             require_control_content_type(&request)?;
             let session = state.authenticate(&request)?;
             let input: BatchRequest = parse_json(&request.body)?;
@@ -5101,6 +6336,78 @@ async fn handle_request(
                 prepared_payloads.push(prepared);
             }
 
+            let fingerprint =
+                sha256_hex(&serde_json::to_vec(&input).map_err(|_| ApiError::internal())?);
+            let previous = state.replay_started_operation(
+                &session.application_id,
+                &input.operation.id,
+                "batch",
+                &fingerprint,
+            )?;
+            if !resume_requested {
+                if let Some(previous) = previous {
+                    if previous.status == LongOperationStatus::Completed {
+                        if let Some(result) = previous.result.as_ref() {
+                            return HttpResponse::json(200, result);
+                        }
+                    }
+                    return Err(ApiError::new(409,ErrorCode::OutcomeUnknown,
+                        "batch is not terminal; inspect the original operation status before resuming"));
+                }
+            } else {
+                let prior = previous.ok_or_else(|| {
+                    ApiError::new(
+                        404,
+                        ErrorCode::OperationNotFound,
+                        "no authenticated batch exists for these stable IDs",
+                    )
+                })?;
+                if prior.status != LongOperationStatus::Reconciling {
+                    if prior.status == LongOperationStatus::Completed {
+                        if let Some(result) = prior.result.as_ref() {
+                            return HttpResponse::json(200, result);
+                        }
+                    }
+                    return Err(ApiError::new(
+                        409,
+                        ErrorCode::OutcomeUnknown,
+                        "batch is not eligible for resume; inspect its current operation status",
+                    ));
+                }
+            }
+            let child_fingerprints = input
+                .operations
+                .iter()
+                .map(|item| {
+                    serde_json::to_vec(item)
+                        .map(|bytes| sha256_hex(&bytes))
+                        .map_err(|_| ApiError::internal())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            // Only metadata is used to bound the entire possible descendant
+            // tree. Core obtains the exclusive space lease before reading
+            // the file index or admitting the parent+escrow in SQLite.
+            let capacity_plan: Vec<BatchCapacityOperation> = input
+                .operations
+                .iter()
+                .map(|item| match item {
+                    BatchOperationWire::WriteFile { path, .. } => {
+                        BatchCapacityOperation::Write { path: path.clone() }
+                    }
+                    BatchOperationWire::Delete { path, .. } => {
+                        BatchCapacityOperation::Delete { path: path.clone() }
+                    }
+                    BatchOperationWire::Copy { from, to, .. } => BatchCapacityOperation::Copy {
+                        from: from.clone(),
+                        to: to.clone(),
+                    },
+                    BatchOperationWire::Move { from, to, .. } => BatchCapacityOperation::Move {
+                        from: from.clone(),
+                        to: to.clone(),
+                    },
+                    BatchOperationWire::KvSet { .. } => BatchCapacityOperation::Kv,
+                })
+                .collect();
             let total_items = input.operations.len() as u64;
             let bytes_total = (total_payload_bytes > 0).then_some(total_payload_bytes as u64);
             let (snapshot, cancel) = state.begin_application_operation(
@@ -5112,6 +6419,52 @@ async fn handle_request(
                 bytes_total,
                 Some(total_items),
             )?;
+            let _bulk = state.acquire_bulk(&session.pairing_id).await?;
+            if resume_requested {
+                state
+                    .storage
+                    .resume_application_batch(
+                        &session.application_id,
+                        &snapshot.id,
+                        &fingerprint,
+                        &input.space_id,
+                        &child_fingerprints,
+                    )
+                    .map_err(ApiError::from_storage)?;
+                let mut operations = state.operations.lock().map_err(|_| ApiError::internal())?;
+                let entry = operations
+                    .get_mut(&snapshot.id)
+                    .ok_or_else(ApiError::internal)?;
+                if entry.owner_application_id.as_deref() != Some(session.application_id.as_str())
+                    || entry.snapshot.kind != "batch"
+                {
+                    return Err(ApiError::new(
+                        409,
+                        ErrorCode::OperationIdConflict,
+                        "batch resume worker ownership changed",
+                    ));
+                }
+                entry.request_fingerprint = Some(fingerprint.clone());
+            } else if !state.claim_operation_worker(&snapshot.id, &fingerprint)? {
+                return HttpResponse::json(202, &snapshot);
+            }
+            // Acquire once on the async side (nonblocking) and retain the
+            // owned Core lease through the entire spawn_blocking worker.
+            // No child may re-enter public mutators or claim a second lease.
+            let batch_execution = match state.storage.begin_batch_execution(
+                &session.application_id,
+                &input.space_id,
+                &snapshot.id,
+                &fingerprint,
+                &child_fingerprints,
+                &capacity_plan,
+            ) {
+                Ok(execution) => execution,
+                Err(error) => {
+                    state.fail_operation_code(&snapshot.id, "OUTCOME_UNKNOWN", error.to_string());
+                    return Err(ApiError::from_storage(error));
+                }
+            };
             state.update_operation_metrics(
                 &snapshot.id,
                 "running",
@@ -5120,7 +6473,6 @@ async fn handle_request(
                 0,
                 bytes_total,
             );
-            let _bulk = state.acquire_bulk(&session.pairing_id).await?;
 
             let storage = Arc::clone(&state.storage);
             let state_for_work = Arc::clone(state);
@@ -5142,6 +6494,57 @@ async fn handle_request(
                         cancelled = true;
                         break;
                     }
+                    if resume_requested {
+                        if let Some(previous) =
+                            storage.prior_batch_result(&space_id, &operation_id, index)?
+                        {
+                            let saved: BatchItemResultWire = serde_json::from_value(previous)?;
+                            if !saved.ok || saved.index != index {
+                                return Err(StorageError::OutcomeUnknown);
+                            }
+                            if let Some(ref bytes) = payload {
+                                completed_bytes =
+                                    completed_bytes.saturating_add(bytes.len() as u64);
+                            }
+                            completed_items = completed_items.saturating_add(1);
+                            results.push(saved);
+                            state_for_work.update_operation_metrics(
+                                &operation_id,
+                                "running",
+                                completed_items,
+                                Some(total_items),
+                                completed_bytes,
+                                bytes_total,
+                            );
+                            continue;
+                        }
+                    }
+                    let (child_request_id, child_kind) = match &operation {
+                        BatchOperationWire::WriteFile { request_id, .. } => {
+                            (request_id.as_str(), "write-file")
+                        }
+                        BatchOperationWire::Delete { request_id, .. } => {
+                            (request_id.as_str(), "delete")
+                        }
+                        BatchOperationWire::Copy { request_id, .. } => {
+                            (request_id.as_str(), "copy")
+                        }
+                        BatchOperationWire::Move { request_id, .. } => {
+                            (request_id.as_str(), "move")
+                        }
+                        BatchOperationWire::KvSet { request_id, .. } => {
+                            (request_id.as_str(), "kv-set")
+                        }
+                    };
+                    let was_committed =
+                        storage.committed_space_request(&space_id, child_request_id)?;
+                    storage.mark_batch_item_running(
+                        &space_id,
+                        &operation_id,
+                        index,
+                        child_request_id,
+                        child_kind,
+                    )?;
                     let (operation_type, outcome) = match operation {
                         BatchOperationWire::WriteFile {
                             request_id,
@@ -5155,7 +6558,9 @@ async fn handle_request(
                                 storage.stat_file(&space_id, &path).ok().flatten().is_some();
                             let core_metadata = metadata.as_ref().map(to_core_file_metadata);
                             let outcome = storage
-                                .write_file_with_metadata(
+                                .execute_batch_write(
+                                    &batch_execution,
+                                    index,
                                     &space_id,
                                     &path,
                                     &bytes,
@@ -5164,14 +6569,16 @@ async fn handle_request(
                                     &request_id,
                                 )
                                 .map(|file| {
-                                    state_for_work.emit_event(
+                                    state_for_work.emit_applied_mutation(
+                                        &space_id,
+                                        &request_id,
+                                        was_committed,
                                         &owner_application_id,
                                         if existed {
                                             EventKindWire::FileChanged
                                         } else {
                                             EventKindWire::FileCreated
                                         },
-                                        Some(&space_id),
                                         Some(&path),
                                         None,
                                         None,
@@ -5197,7 +6604,9 @@ async fn handle_request(
                             if_match,
                         } => {
                             let outcome = storage
-                                .delete_path_with_progress(
+                                .execute_batch_delete(
+                                    &batch_execution,
+                                    index,
                                     &space_id,
                                     &path,
                                     recursive.unwrap_or(false),
@@ -5207,10 +6616,12 @@ async fn handle_request(
                                     |_, _| {},
                                 )
                                 .map(|count| {
-                                    state_for_work.emit_event(
+                                    state_for_work.emit_applied_mutation(
+                                        &space_id,
+                                        &request_id,
+                                        was_committed,
                                         &owner_application_id,
                                         EventKindWire::FileDeleted,
-                                        Some(&space_id),
                                         Some(&path),
                                         None,
                                         None,
@@ -5235,7 +6646,9 @@ async fn handle_request(
                             overwrite,
                         } => {
                             let outcome = storage
-                                .copy_path_with_progress(
+                                .execute_batch_copy(
+                                    &batch_execution,
+                                    index,
                                     &space_id,
                                     &from,
                                     &to,
@@ -5245,10 +6658,12 @@ async fn handle_request(
                                     |_, _| {},
                                 )
                                 .map(|count| {
-                                    state_for_work.emit_event(
+                                    state_for_work.emit_applied_mutation(
+                                        &space_id,
+                                        &request_id,
+                                        was_committed,
                                         &owner_application_id,
                                         EventKindWire::FileCreated,
-                                        Some(&space_id),
                                         Some(&to),
                                         None,
                                         None,
@@ -5274,7 +6689,9 @@ async fn handle_request(
                             if_match,
                         } => {
                             let outcome = storage
-                                .move_path_with_progress(
+                                .execute_batch_move(
+                                    &batch_execution,
+                                    index,
                                     &space_id,
                                     &from,
                                     &to,
@@ -5285,10 +6702,12 @@ async fn handle_request(
                                     |_, _| {},
                                 )
                                 .map(|count| {
-                                    state_for_work.emit_event(
+                                    state_for_work.emit_applied_mutation(
+                                        &space_id,
+                                        &request_id,
+                                        was_committed,
                                         &owner_application_id,
                                         EventKindWire::FileMoved,
-                                        Some(&space_id),
                                         None,
                                         Some(&from),
                                         Some(&to),
@@ -5314,7 +6733,9 @@ async fn handle_request(
                             if_match,
                         } => {
                             let outcome = storage
-                                .kv_set(
+                                .execute_batch_kv(
+                                    &batch_execution,
+                                    index,
                                     &space_id,
                                     &key,
                                     &value,
@@ -5323,21 +6744,23 @@ async fn handle_request(
                                     &request_id,
                                 )
                                 .map(|entry| {
-                                    state_for_work.emit_event(
-                                        &owner_application_id,
-                                        EventKindWire::KvChanged,
-                                        Some(&space_id),
-                                        None,
-                                        None,
-                                        None,
-                                        Some(&key),
-                                    );
+                                    if entry.disposition == MutationDisposition::Applied {
+                                        state_for_work.emit_event(
+                                            &owner_application_id,
+                                            EventKindWire::KvChanged,
+                                            Some(&space_id),
+                                            None,
+                                            None,
+                                            None,
+                                            Some(&key),
+                                        );
+                                    }
                                     BatchItemResultWire {
                                         index,
                                         operation_type: "kv-set".into(),
                                         ok: true,
                                         file: None,
-                                        kv: Some(kv_wire(entry)),
+                                        kv: Some(kv_wire(entry.value)),
                                         affected_files: None,
                                         error: None,
                                     }
@@ -5369,6 +6792,18 @@ async fn handle_request(
                             });
                         }
                     }
+                    // Persist each observed child result immediately. A crash
+                    // cannot turn an unrecorded remainder into a claimed rollback.
+                    if let Some(item) = results.last() {
+                        let json = serde_json::to_value(item)?;
+                        storage.record_batch_item(
+                            &space_id,
+                            &operation_id,
+                            index,
+                            item.ok,
+                            &json,
+                        )?;
+                    }
                     state_for_work.update_operation_metrics(
                         &operation_id,
                         "running",
@@ -5379,17 +6814,64 @@ async fn handle_request(
                     );
                 }
 
-                BatchResponse {
+                let report = BatchResponse {
                     results,
                     completed_items,
                     failed_items,
                     cancelled,
-                }
+                };
+                let json = serde_json::to_value(&report)?;
+                let settled = storage.finish_batch_items(
+                    &space_id,
+                    &operation_id,
+                    &json,
+                    cancelled || failed_items > 0,
+                )?;
+                Ok::<(BatchResponse, bool), StorageError>((report, settled))
             })
             .await
-            .map_err(|_| ApiError::internal())?;
+            .map_err(|_| {
+                ApiError::new(
+                    500,
+                    ErrorCode::OutcomeUnknown,
+                    "batch worker outcome is unknown",
+                )
+            })?
+            .map_err(|error| {
+                ApiError::new(
+                    500,
+                    ErrorCode::OutcomeUnknown,
+                    format!("batch result journal incomplete: {error}"),
+                )
+            })?;
 
-            if result.cancelled {
+            let (result, settled) = result;
+            if !settled {
+                // The child error/cancel is not evidence of rollback: retain
+                // a nonterminal parent and make its confirmed prefix visible.
+                state.update_operation(
+                    &snapshot.id,
+                    "reconciling",
+                    Some(result.completed_items),
+                    Some(total_items),
+                    LongOperationStatus::Reconciling,
+                    Some(LongOperationError {
+                        code: "OUTCOME_UNKNOWN".into(),
+                        message: "Some batch items require durable receipt reconciliation".into(),
+                    }),
+                    serde_json::to_value(&result).ok(),
+                );
+                state.persist_uncertain_long_job(&snapshot.id);
+                // Do not send a normal successful BatchResponse: that would
+                // make clients treat an unproven child as a definitive failure.
+                // The authenticated operation status exposes the confirmed
+                // prefix and unresolved children for reconciliation.
+                return Err(ApiError::new(
+                    409,
+                    ErrorCode::OutcomeUnknown,
+                    "batch has unresolved child outcomes; inspect operation status",
+                ));
+            } else if result.cancelled && result.completed_items == 0 {
                 state.cancelled_operation(&snapshot.id);
             } else {
                 state.update_operation_metrics(
@@ -5402,7 +6884,11 @@ async fn handle_request(
                 );
                 state.complete_operation(
                     &snapshot.id,
-                    "complete",
+                    if result.cancelled || result.failed_items > 0 {
+                        "partial"
+                    } else {
+                        "complete"
+                    },
                     serde_json::to_value(&result).ok(),
                 );
             }
@@ -5410,8 +6896,86 @@ async fn handle_request(
         }
         ("POST", "/v1/operations/status") => {
             require_control_content_type(&request)?;
-            let session = state.authenticate(&request)?;
             let input: OperationStatusRequest = parse_json(&request.body)?;
+            if let Some(scope) = input.receipt_scope.as_ref() {
+                // No ordinary receipt may be read using an unverified historical
+                // identity. A read-only archived proof never creates a session.
+                let kind = match scope.kind {
+                    vontaqfs_protocol::RetainedReceiptScopeKind::Space => "space",
+                    vontaqfs_protocol::RetainedReceiptScopeKind::Application => "application",
+                };
+                let result = if let Some(proof) = input.history_proof.as_ref() {
+                    // Revoked pairing proof is strictly archived-only: it must
+                    // never authorize a live receipt or a write-capable session.
+                    let (owner, _) = state.authenticate_retained_proof(proof)?;
+                    state
+                        .storage
+                        .retained_sql_receipt(&owner, kind, &scope.id, &input.operation_id)
+                } else {
+                    let session = state.authenticate(&request)?;
+                    // First consult live evidence, then historical evidence for
+                    // a space deleted by this still-authenticated application.
+                    let live = state
+                        .storage
+                        .live_sql_receipt(
+                            &session.application_id,
+                            kind,
+                            &scope.id,
+                            &input.operation_id,
+                        )
+                        .map_err(ApiError::from_storage)?;
+                    if live.is_some() {
+                        Ok(live)
+                    } else {
+                        state.storage.retained_sql_receipt(
+                            &session.application_id,
+                            kind,
+                            &scope.id,
+                            &input.operation_id,
+                        )
+                    }
+                }
+                .map_err(ApiError::from_storage)?
+                .ok_or_else(|| {
+                    ApiError::new(
+                        404,
+                        ErrorCode::OperationNotFound,
+                        "receipt not found for authenticated owner",
+                    )
+                })?;
+                // Deserialize into the public typed wire shape before returning.
+                let outcome: vontaqfs_protocol::RetainedReceiptOutcome =
+                    serde_json::from_value(result).map_err(|_| {
+                        ApiError::new(409, ErrorCode::OutcomeUnknown, "saved receipt is invalid")
+                    })?;
+                return HttpResponse::json(200, &outcome);
+            }
+            if let Some(proof) = input.history_proof.as_ref() {
+                // Restrict revoked credentials to an archived terminal status.
+                // No session or mutation privilege is issued.
+                let (owner, _) = state.authenticate_retained_proof(proof)?;
+                let value = state
+                    .storage
+                    .retained_terminal_operation(&owner, &input.operation_id)
+                    .map_err(ApiError::from_storage)?
+                    .ok_or_else(|| {
+                        ApiError::new(
+                            404,
+                            ErrorCode::OperationNotFound,
+                            "retained terminal result unavailable",
+                        )
+                    })?;
+                let snapshot: LongOperationSnapshot =
+                    serde_json::from_value(value).map_err(|_| {
+                        ApiError::new(
+                            409,
+                            ErrorCode::OutcomeUnknown,
+                            "retained outcome cannot be reconstructed",
+                        )
+                    })?;
+                return HttpResponse::json(200, &snapshot);
+            }
+            let session = state.authenticate(&request)?;
             let snapshot = state
                 .operation_status_for_application(&session.application_id, &input.operation_id)?;
             HttpResponse::json(200, &snapshot)
@@ -5473,12 +7037,40 @@ async fn handle_request(
             let session = state.authenticate(&request)?;
             let input: CreateDestinationGrantRequest = parse_json(&request.body)?;
             validate_request_id(&input.request_id)?;
+            let requested_capability = grant_capability_from_wire(input.capability);
+            let reuse = input.reuse_initial_if_same.unwrap_or(false);
+            // Durable admission must precede ALL external picker effects. A
+            // matching lost ACK never reopens the OS picker, nor creates a
+            // second grant. Unknown ADMITTED/RECONCILING fails closed.
+            match state
+                .storage
+                .admit_directory_grant_request(
+                    &session.application_id,
+                    &input.request_id,
+                    input.label.as_deref(),
+                    requested_capability,
+                    input.initial_destination_id.as_deref(),
+                    reuse,
+                )
+                .map_err(ApiError::from_storage)?
+            {
+                DestinationGrantAdmission::Replayed(grant) => {
+                    return HttpResponse::json(200, &destination_grant_wire(&grant))
+                }
+                DestinationGrantAdmission::UserCancelled => {
+                    return Err(ApiError::new(
+                        409,
+                        ErrorCode::UserCancelled,
+                        "directory selection was cancelled",
+                    ))
+                }
+                DestinationGrantAdmission::New => {}
+            }
             let application = state
                 .storage
                 .get_application(&session.application_id)
                 .map_err(ApiError::from_storage)?
                 .ok_or_else(ApiError::internal)?;
-            let requested_capability = grant_capability_from_wire(input.capability);
             let initial_grant = if let Some(id) = input.initial_destination_id.as_deref() {
                 state
                     .storage
@@ -5488,11 +7080,10 @@ async fn handle_request(
             } else {
                 None
             };
-            let initial_directory = initial_grant
+            let picker_initial_directory = initial_grant
                 .as_ref()
                 .and_then(|grant| std::fs::canonicalize(&grant.physical_path).ok())
                 .filter(|path| path.is_dir());
-            let picker_initial_directory = initial_directory.clone();
             let host = Arc::clone(&state.host_services);
             let app_name = application.display_name.clone();
             let capability_label = match input.capability {
@@ -5500,6 +7091,8 @@ async fn handle_request(
                 DirectoryGrantCapabilityWire::Write => "saved write destination",
                 DirectoryGrantCapabilityWire::ReadWrite => "saved read-write directory",
             };
+            // A picker error or worker panic leaves the admitted parent
+            // unresolved. Only an authoritative Ok(None) proves cancellation.
             let selected = tokio::task::spawn_blocking(move || {
                 host.choose_directory(
                     &app_name,
@@ -5510,47 +7103,30 @@ async fn handle_request(
             .await
             .map_err(|_| ApiError::internal())?
             .map_err(|message| ApiError::new(409, ErrorCode::DestinationGrantRequired, message))?;
-            let path = selected.ok_or_else(|| {
-                ApiError::new(
-                    409,
-                    ErrorCode::UserCancelled,
-                    "directory selection was cancelled",
-                )
-            })?;
-            if input.reuse_initial_if_same.unwrap_or(false) {
-                if let Some(initial) = initial_grant.as_ref() {
-                    if grant_capability_satisfies(initial.capability, requested_capability) {
-                        let selected_canonical = std::fs::canonicalize(&path).map_err(|error| {
-                            ApiError::new(409, ErrorCode::DestinationUnavailable, error.to_string())
-                        })?;
-                        let Some(initial_canonical) = initial_directory.as_ref() else {
-                            let grant = state
-                                .storage
-                                .create_directory_grant(
-                                    &session.application_id,
-                                    &path,
-                                    input.label.as_deref(),
-                                    requested_capability,
-                                )
-                                .map_err(ApiError::from_storage)?;
-                            return HttpResponse::json(200, &destination_grant_wire(&grant));
-                        };
-                        if selected_canonical == *initial_canonical {
-                            let _ = state
-                                .storage
-                                .touch_directory_grant(&session.application_id, &initial.id);
-                            return HttpResponse::json(200, &destination_grant_wire(initial));
-                        }
-                    }
+            let path = match selected {
+                Some(path) => path,
+                None => {
+                    state
+                        .storage
+                        .cancel_directory_grant_request(&session.application_id, &input.request_id)
+                        .map_err(ApiError::from_storage)?;
+                    return Err(ApiError::new(
+                        409,
+                        ErrorCode::UserCancelled,
+                        "directory selection was cancelled",
+                    ));
                 }
-            }
+            };
             let grant = state
                 .storage
-                .create_directory_grant(
+                .finish_directory_grant_request(
                     &session.application_id,
+                    &input.request_id,
                     &path,
                     input.label.as_deref(),
                     requested_capability,
+                    input.initial_destination_id.as_deref(),
+                    reuse,
                 )
                 .map_err(ApiError::from_storage)?;
             HttpResponse::json(200, &destination_grant_wire(&grant))
@@ -5575,7 +7151,11 @@ async fn handle_request(
             validate_request_id(&input.request_id)?;
             let revoked = state
                 .storage
-                .revoke_directory_grant(&session.application_id, &input.destination_id)
+                .revoke_directory_grant_with_request(
+                    &session.application_id,
+                    &input.destination_id,
+                    &input.request_id,
+                )
                 .map_err(ApiError::from_storage)?;
             HttpResponse::json(200, &serde_json::json!({"revoked":revoked}))
         }
@@ -5586,7 +7166,7 @@ async fn handle_request(
             validate_request_id(&input.request_id)?;
             let preset = state
                 .storage
-                .save_export_preset(
+                .save_export_preset_with_request(
                     &session.application_id,
                     input.id.as_deref(),
                     &input.name,
@@ -5595,6 +7175,7 @@ async fn handle_request(
                     export_conflict_from_wire(input.conflict),
                     &input.source_path,
                     input.archive_format.as_deref(),
+                    &input.request_id,
                 )
                 .map_err(ApiError::from_storage)?;
             HttpResponse::json(200, &export_preset_wire(&preset))
@@ -5619,15 +7200,52 @@ async fn handle_request(
             validate_request_id(&input.request_id)?;
             let deleted = state
                 .storage
-                .delete_export_preset(&session.application_id, &input.id)
+                .delete_export_preset_with_request(
+                    &session.application_id,
+                    &input.id,
+                    &input.request_id,
+                )
                 .map_err(ApiError::from_storage)?;
             HttpResponse::json(200, &serde_json::json!({"deleted":deleted}))
         }
-        ("POST", "/v1/exports/start") => {
+        ("POST", "/v1/exports/start") | ("POST", "/v1/exports/resume") => {
+            let resume_requested = request.path == "/v1/exports/resume";
             require_control_content_type(&request)?;
             let session = state.authenticate(&request)?;
             let input: StartNativeExportRequest = parse_json(&request.body)?;
             validate_request_id(&input.request_id)?;
+            validate_operation_id(&input.operation.id)?;
+            let fingerprint =
+                sha256_hex(&serde_json::to_vec(&input).map_err(|_| ApiError::internal())?);
+            let previous = state.replay_started_operation(
+                &session.application_id,
+                &input.operation.id,
+                "native-export",
+                &fingerprint,
+            )?;
+            if !resume_requested {
+                if let Some(previous) = previous {
+                    return HttpResponse::json(202, &previous);
+                }
+            } else {
+                let prior = previous.ok_or_else(|| {
+                    ApiError::new(
+                        404,
+                        ErrorCode::OperationNotFound,
+                        "no previous native export with this authenticated identity",
+                    )
+                })?;
+                if prior.status != LongOperationStatus::Reconciling {
+                    return HttpResponse::json(202, &prior);
+                }
+                if input.destination_id.is_none() {
+                    return Err(ApiError::new(
+                        409,
+                        ErrorCode::DestinationGrantRequired,
+                        "export resume requires the original authorized saved destination grant",
+                    ));
+                }
+            }
             validate_operation_id(&input.operation.id)?;
             state.authorize_space(&session, &input.space_id)?;
             let application = state
@@ -5729,9 +7347,15 @@ async fn handle_request(
                 (path, label, None)
             };
             let (destination_path, destination_label, grant_id) = destination_selection;
-            let destination_path = std::fs::canonicalize(&destination_path).map_err(|error| {
-                ApiError::new(409, ErrorCode::DestinationUnavailable, error.to_string())
-            })?;
+            // Do not canonicalize after selecting a directory: a swapped symlink
+            // must be rejected by NativeDirectory instead of followed here.
+            if !destination_path.is_absolute() {
+                return Err(ApiError::new(
+                    409,
+                    ErrorCode::DestinationUnavailable,
+                    "native destination must be absolute",
+                ));
+            }
             let mut destination_key = destination_path.to_string_lossy().to_string();
             if cfg!(windows) {
                 destination_key = destination_key.to_ascii_lowercase();
@@ -5753,6 +7377,56 @@ async fn handle_request(
                     return Err(error);
                 }
             };
+            if resume_requested {
+                state
+                    .storage
+                    .resume_application_native_export(
+                        &session.application_id,
+                        &snapshot.id,
+                        &fingerprint,
+                        &input.space_id,
+                        grant_id.as_deref().ok_or_else(|| {
+                            ApiError::new(
+                                409,
+                                ErrorCode::DestinationGrantRequired,
+                                "saved destination required for resume",
+                            )
+                        })?,
+                    )
+                    .map_err(ApiError::from_storage)?;
+                let mut operations = state.operations.lock().map_err(|_| ApiError::internal())?;
+                let entry = operations
+                    .get_mut(&snapshot.id)
+                    .ok_or_else(ApiError::internal)?;
+                if entry.owner_application_id.as_deref() != Some(session.application_id.as_str())
+                    || entry.snapshot.kind != "native-export"
+                {
+                    return Err(ApiError::new(
+                        409,
+                        ErrorCode::OperationIdConflict,
+                        "native export resume worker identity changed",
+                    ));
+                }
+                entry.request_fingerprint = Some(fingerprint.clone());
+            } else {
+                let claimed = state.claim_operation_worker(&snapshot.id, &fingerprint);
+                match claimed {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return HttpResponse::json(202, &snapshot);
+                    }
+                    Err(error) => return Err(error),
+                }
+                state
+                    .storage
+                    .bind_application_native_export(
+                        &session.application_id,
+                        &snapshot.id,
+                        &input.space_id,
+                        grant_id.as_deref(),
+                    )
+                    .map_err(ApiError::from_storage)?;
+            }
             let operation_id = snapshot.id.clone();
             let state2 = Arc::clone(state);
             let storage = Arc::clone(&state.storage);
@@ -5761,6 +7435,7 @@ async fn handle_request(
             let app_name = application.display_name.clone();
             let host = Arc::clone(&state.host_services);
             let source_paths = input.source_paths.clone();
+            let bound_grant_id = grant_id.clone();
             let mode = export_mode_from_wire(input.mode);
             let conflict = export_conflict_from_wire(input.conflict);
             let archive_name = input.archive_name.clone();
@@ -5770,35 +7445,75 @@ async fn handle_request(
                 let op_progress = operation_id.clone();
                 let worker_application_id = application_id.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    storage.native_export(
-                        &worker_application_id,
-                        &space_id,
-                        &source_paths,
-                        &destination_path,
-                        &destination_label,
-                        mode,
-                        conflict,
-                        archive_name.as_deref(),
-                        bookkeeping,
-                        prune,
-                        tracking_key.as_deref(),
-                        directory_layout,
-                        || cancel.load(Ordering::SeqCst),
-                        |items, total_items, bytes, total_bytes| {
-                            state_progress.update_operation_metrics(
-                                &op_progress,
-                                "exporting",
-                                items,
-                                total_items,
-                                bytes,
-                                total_bytes,
-                            )
-                        },
-                        |item| {
-                            host.confirm_export_replace(&app_name, item)
-                                .map_err(StorageError::RequestInvalid)
-                        },
-                    )
+                    if resume_requested {
+                        storage.native_export_bound_resume(
+                            &worker_application_id,
+                            &space_id,
+                            &source_paths,
+                            &destination_path,
+                            &destination_label,
+                            mode,
+                            conflict,
+                            archive_name.as_deref(),
+                            bookkeeping,
+                            prune,
+                            tracking_key.as_deref(),
+                            directory_layout,
+                            bound_grant_id.as_deref().ok_or_else(|| {
+                                StorageError::RequestInvalid(
+                                    "missing saved destination for export resume".into(),
+                                )
+                            })?,
+                            op_progress.as_str(),
+                            || cancel.load(Ordering::SeqCst),
+                            |items, total_items, bytes, total_bytes| {
+                                state_progress.update_operation_metrics(
+                                    &op_progress,
+                                    "exporting",
+                                    items,
+                                    total_items,
+                                    bytes,
+                                    total_bytes,
+                                )
+                            },
+                            |item| {
+                                host.confirm_export_replace(&app_name, item)
+                                    .map_err(StorageError::RequestInvalid)
+                            },
+                        )
+                    } else {
+                        storage.native_export_bound_with_operation(
+                            &worker_application_id,
+                            &space_id,
+                            &source_paths,
+                            &destination_path,
+                            &destination_label,
+                            mode,
+                            conflict,
+                            archive_name.as_deref(),
+                            bookkeeping,
+                            prune,
+                            tracking_key.as_deref(),
+                            directory_layout,
+                            bound_grant_id.as_deref(),
+                            op_progress.as_str(),
+                            || cancel.load(Ordering::SeqCst),
+                            |items, total_items, bytes, total_bytes| {
+                                state_progress.update_operation_metrics(
+                                    &op_progress,
+                                    "exporting",
+                                    items,
+                                    total_items,
+                                    bytes,
+                                    total_bytes,
+                                )
+                            },
+                            |item| {
+                                host.confirm_export_replace(&app_name, item)
+                                    .map_err(StorageError::RequestInvalid)
+                            },
+                        )
+                    }
                 })
                 .await;
                 match result {
@@ -5827,12 +7542,47 @@ async fn handle_request(
             });
             HttpResponse::json(202, &snapshot)
         }
-        ("POST", "/v1/imports/start") => {
+        ("POST", "/v1/imports/start") | ("POST", "/v1/imports/resume") => {
+            let resume_requested = request.path == "/v1/imports/resume";
             require_control_content_type(&request)?;
             let session = state.authenticate(&request)?;
             let input: StartNativeImportRequest = parse_json(&request.body)?;
             validate_request_id(&input.request_id)?;
+            validate_operation_id(&input.operation.id)?;
+            let fingerprint =
+                sha256_hex(&serde_json::to_vec(&input).map_err(|_| ApiError::internal())?);
             state.authorize_space(&session, &input.space_id)?;
+            let previous = state.replay_started_operation(
+                &session.application_id,
+                &input.operation.id,
+                "native-import",
+                &fingerprint,
+            )?;
+            if !resume_requested {
+                if let Some(previous) = previous {
+                    return HttpResponse::json(202, &previous);
+                }
+            } else {
+                let prior = previous.ok_or_else(|| {
+                    ApiError::new(
+                        404,
+                        ErrorCode::OperationNotFound,
+                        "no previous native import with this authenticated identity",
+                    )
+                })?;
+                if prior.status != LongOperationStatus::Reconciling {
+                    return HttpResponse::json(202, &prior);
+                }
+                // One-off picker sources are not a persistent grant; a new
+                // picker result cannot silently authorize an old import plan.
+                if input.source_id.is_none() {
+                    return Err(ApiError::new(
+                        409,
+                        ErrorCode::DestinationGrantRequired,
+                        "resume requires the original authorized saved source grant",
+                    ));
+                }
+            }
             let application = state
                 .storage
                 .get_application(&session.application_id)
@@ -5938,6 +7688,30 @@ async fn handle_request(
                 None,
                 None,
             )?;
+            if resume_requested {
+                state.claim_native_import_resume_worker(
+                    &session.application_id,
+                    &snapshot.id,
+                    &fingerprint,
+                    &input.space_id,
+                    &input.request_id,
+                )?;
+            } else if !state.claim_operation_worker(&snapshot.id, &fingerprint)? {
+                return HttpResponse::json(202, &snapshot);
+            }
+            if !resume_requested {
+                state
+                    .storage
+                    .bind_application_native_import(
+                        &session.application_id,
+                        &snapshot.id,
+                        &input.space_id,
+                        &input.request_id,
+                    )
+                    .map_err(ApiError::from_storage)?;
+            }
+            // Previous parent/child evidence remains untouched on resumed work.
+            /* already bound on the original admission */
             let operation_id = snapshot.id.clone();
             let state2 = Arc::clone(state);
             let storage = Arc::clone(&state.storage);
@@ -5952,7 +7726,7 @@ async fn handle_request(
                 let state_progress = Arc::clone(&state2);
                 let op_progress = operation_id.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    storage.native_import(
+                    storage.native_import_with_resume(
                         &space_id,
                         &selected_sources,
                         &source_label,
@@ -5960,6 +7734,7 @@ async fn handle_request(
                         &target_path,
                         conflict,
                         &request_id,
+                        resume_requested,
                         || cancel.load(Ordering::SeqCst),
                         |items, total_items, bytes, total_bytes| {
                             state_progress.update_operation_metrics(
@@ -6010,6 +7785,24 @@ async fn handle_request(
             validate_request_id(&input.request_id)?;
             state.authorize_space(&session, &input.space_id)?;
             validate_operation_id(&input.operation.id)?;
+            // Bind the durable worker to the complete semantic start request;
+            // never spawn a second worker after a lost start ACK.
+            let fingerprint = sha256_hex(
+                &serde_json::to_vec(&serde_json::json!({
+                    "kind": "snapshot-create", "owner": session.application_id,
+                    "requestId": input.request_id, "spaceId": input.space_id,
+                    "label": input.label, "operation": input.operation,
+                }))
+                .map_err(|_| ApiError::internal())?,
+            );
+            if let Some(previous) = state.replay_started_operation(
+                &session.application_id,
+                &input.operation.id,
+                "snapshot-create",
+                &fingerprint,
+            )? {
+                return HttpResponse::json(202, &previous);
+            }
             if state.has_active_stream_for_space(&input.space_id) {
                 return Err(ApiError::new(
                     409,
@@ -6035,6 +7828,19 @@ async fn handle_request(
                     return Err(error);
                 }
             };
+            // Admission is persisted before any worker can run. A duplicate
+            // ID either returns the existing operation or remains reconciling.
+            match state.claim_operation_worker(&snapshot.id, &fingerprint) {
+                Ok(true) => {}
+                Ok(false) => {
+                    state.unlock_space_exclusive(&input.space_id, &snapshot.id);
+                    return HttpResponse::json(202, &snapshot);
+                }
+                Err(error) => {
+                    state.unlock_space_exclusive(&input.space_id, &snapshot.id);
+                    return Err(error);
+                }
+            }
             let operation_id = snapshot.id.clone();
             let space_id = input.space_id.clone();
             let label = input.label.clone();
@@ -6105,6 +7911,22 @@ async fn handle_request(
             validate_request_id(&input.request_id)?;
             let space = state.authorize_space(&session, &input.space_id)?;
             validate_operation_id(&input.operation.id)?;
+            let fingerprint = sha256_hex(
+                &serde_json::to_vec(&serde_json::json!({
+                    "kind": "snapshot-restore", "owner": session.application_id,
+                    "requestId": input.request_id, "spaceId": input.space_id,
+                    "snapshotId": input.snapshot_id, "operation": input.operation,
+                }))
+                .map_err(|_| ApiError::internal())?,
+            );
+            if let Some(previous) = state.replay_started_operation(
+                &session.application_id,
+                &input.operation.id,
+                "snapshot-restore",
+                &fingerprint,
+            )? {
+                return HttpResponse::json(202, &previous);
+            }
             if state
                 .storage
                 .get_snapshot(&input.space_id, &input.snapshot_id)
@@ -6144,6 +7966,19 @@ async fn handle_request(
                     return Err(error);
                 }
             };
+            // Admission is persisted before any worker can run. A duplicate
+            // ID either returns the existing operation or remains reconciling.
+            match state.claim_operation_worker(&snapshot.id, &fingerprint) {
+                Ok(true) => {}
+                Ok(false) => {
+                    state.unlock_space_exclusive(&input.space_id, &snapshot.id);
+                    return HttpResponse::json(202, &snapshot);
+                }
+                Err(error) => {
+                    state.unlock_space_exclusive(&input.space_id, &snapshot.id);
+                    return Err(error);
+                }
+            }
             let operation_id = snapshot.id.clone();
             let space_id = input.space_id.clone();
             let snapshot_id = input.snapshot_id.clone();
@@ -6220,7 +8055,11 @@ async fn handle_request(
             }
             let deleted = state
                 .storage
-                .delete_snapshot(&input.space_id, &input.snapshot_id)
+                .delete_snapshot_with_request(
+                    &input.space_id,
+                    &input.snapshot_id,
+                    &input.request_id,
+                )
                 .map_err(ApiError::from_storage)?;
             if !deleted {
                 return Err(ApiError::new(
@@ -6583,6 +8422,10 @@ async fn handle_request(
                 }
             }
             let metadata = input.metadata.as_ref().map(to_core_file_metadata);
+            let was_committed = state
+                .storage
+                .committed_space_request(&input.space_id, &input.request_id)
+                .map_err(ApiError::from_storage)?;
             let result = match state.storage.write_file_with_metadata(
                 &input.space_id,
                 &input.path,
@@ -6619,14 +8462,16 @@ async fn handle_request(
                     ),
                 );
             }
-            state.emit_event(
+            state.emit_applied_mutation(
+                &input.space_id,
+                &input.request_id,
+                was_committed,
                 &space.owner_application_id,
                 if existed {
                     EventKindWire::FileChanged
                 } else {
                     EventKindWire::FileCreated
                 },
-                Some(&input.space_id),
                 Some(&input.path),
                 None,
                 None,
@@ -6646,7 +8491,6 @@ async fn handle_write_stream_route(
     state: &Arc<RuntimeState>,
     request: HttpRequest,
 ) -> Result<HttpResponse, ApiError> {
-    let session = state.authenticate(&request)?;
     let tail = request
         .path
         .strip_prefix("/v1/streams/write/")
@@ -6655,18 +8499,84 @@ async fn handle_write_stream_route(
     if request.method == "POST" && parts.len() == 1 && parts[0] == "resolve" {
         require_control_content_type(&request)?;
         let input: StreamResolveRequest = parse_json(&request.body)?;
-        state.authorize_space(&session, &input.space_id)?;
-        let op = state
-            .storage
-            .resolve_stream_operation(&session.pairing_id, &input.space_id, &input.request_id)
-            .map_err(ApiError::from_storage)?
-            .ok_or_else(|| {
-                ApiError::new(
+        let op = if let Some(proof) = input.history_proof.as_ref() {
+            // Archived proof can only access a terminal outcome from the
+            // exact original pairing; it never authorizes another route.
+            let (owner, pairing_id) = state.authenticate_retained_proof(proof)?;
+            let outcome = state
+                .storage
+                .retained_terminal_stream_for_proof(&pairing_id, &input.space_id, &input.request_id)
+                .map_err(ApiError::from_storage)?;
+            if let Some(ref record) = outcome {
+                if !state
+                    .storage
+                    .retained_stream_owner_matches(
+                        &owner,
+                        &pairing_id,
+                        &record.space_id,
+                        &record.request_id,
+                    )
+                    .map_err(ApiError::from_storage)?
+                {
+                    return Err(ApiError::auth_invalid());
+                }
+            }
+            outcome
+        } else {
+            let session = state.authenticate(&request)?;
+            if state
+                .storage
+                .get_space(&input.space_id)
+                .map_err(ApiError::from_storage)?
+                .is_some()
+            {
+                state.authorize_space(&session, &input.space_id)?;
+            } else if !state
+                .storage
+                .retained_stream_owned_by(
+                    &session.application_id,
+                    &session.pairing_id,
+                    &input.space_id,
+                    &input.request_id,
+                )
+                .map_err(ApiError::from_storage)?
+            {
+                return Err(ApiError::new(
                     404,
                     ErrorCode::StreamNotFound,
-                    "no authoritative outcome for requestId",
-                )
-            })?;
+                    "stream outcome not found for authenticated owner",
+                ));
+            }
+            state
+                .storage
+                .resolve_stream_operation(&session.pairing_id, &input.space_id, &input.request_id)
+                .map_err(ApiError::from_storage)?
+        }
+        .ok_or_else(|| {
+            ApiError::new(
+                404,
+                ErrorCode::StreamNotFound,
+                "no authoritative outcome for requestId",
+            )
+        })?;
+        if matches!(
+            op.phase.as_str(),
+            "COMMITTED" | "ABORTED" | "EXPIRED_FENCED"
+        ) {
+            // The database has proven the terminal outcome. Removing the live
+            // registry handle releases its admission lease once any in-flight
+            // handler drops its own Arc; no SQLite guard is retained here.
+            state
+                .write_streams
+                .lock()
+                .map_err(|_| ApiError::internal())?
+                .remove(&op.stream_id);
+            let mut paths = state
+                .active_write_paths
+                .lock()
+                .map_err(|_| ApiError::internal())?;
+            release_write_path_if_owner(&mut paths, &op.space_id, &op.path, &op.stream_id);
+        }
         let live = state
             .write_streams
             .lock()
@@ -6674,6 +8584,7 @@ async fn handle_write_stream_route(
             .contains_key(&op.stream_id);
         return HttpResponse::json(200, &stream_outcome_wire(op, live));
     }
+    let session = state.authenticate(&request)?;
     if request.method == "GET" && parts.len() == 2 && parts[1] == "status" {
         let op = state
             .storage
@@ -6686,7 +8597,44 @@ async fn handle_write_stream_route(
                     "no authoritative outcome for streamId",
                 )
             })?;
-        state.authorize_space(&session, &op.space_id)?;
+        if state
+            .storage
+            .get_space(&op.space_id)
+            .map_err(ApiError::from_storage)?
+            .is_some()
+        {
+            state.authorize_space(&session, &op.space_id)?;
+        } else if !state
+            .storage
+            .retained_stream_owned_by(
+                &session.application_id,
+                &session.pairing_id,
+                &op.space_id,
+                &op.request_id,
+            )
+            .map_err(ApiError::from_storage)?
+        {
+            return Err(ApiError::new(
+                404,
+                ErrorCode::StreamNotFound,
+                "stream outcome not found for authenticated owner",
+            ));
+        }
+        if matches!(
+            op.phase.as_str(),
+            "COMMITTED" | "ABORTED" | "EXPIRED_FENCED"
+        ) {
+            state
+                .write_streams
+                .lock()
+                .map_err(|_| ApiError::internal())?
+                .remove(&op.stream_id);
+            let mut paths = state
+                .active_write_paths
+                .lock()
+                .map_err(|_| ApiError::internal())?;
+            release_write_path_if_owner(&mut paths, &op.space_id, &op.path, &op.stream_id);
+        }
         let live = state
             .write_streams
             .lock()
@@ -6869,7 +8817,16 @@ async fn handle_write_stream_route(
         let state = Arc::clone(state);
         tokio::task::spawn_blocking(move || {
             let stream_id = stream_id.as_str();
-            let (application_id, space_id, path, existed_before, result, operation_id) = {
+            let (
+                application_id,
+                space_id,
+                path,
+                existed_before,
+                result,
+                operation_id,
+                request_id,
+                was_committed,
+            ) = {
                 let stream_handle = state.write_stream_handle(stream_id)?;
                 let mut stream = stream_handle.lock().map_err(|_| ApiError::internal())?;
                 if !state.is_current_write_stream(stream_id, &stream_handle)? {
@@ -6897,6 +8854,16 @@ async fn handle_write_stream_route(
                     }
                 }
                 if let Some(result) = stream.committed.clone() {
+                    // A second commit with a different checksum is not an
+                    // identical retry, even when this stream handle is live.
+                    let committed_sha = format!("{:x}", stream.hasher.clone().finalize());
+                    if !committed_sha.eq_ignore_ascii_case(&input.sha256) {
+                        return Err(ApiError::new(
+                            409,
+                            ErrorCode::Conflict,
+                            "stream commit checksum differs from the committed request",
+                        ));
+                    }
                     return HttpResponse::json(200, &file_wire(result));
                 }
                 if stream
@@ -6925,6 +8892,10 @@ async fn handle_write_stream_route(
                         ApiError::new(503, ErrorCode::StorageUnavailable, "failed to sync stream")
                     })?;
                 }
+                let was_committed = state
+                    .storage
+                    .committed_space_request(&stream.space_id, &stream.request_id)
+                    .map_err(ApiError::from_storage)?;
                 state
                     .storage
                     .finish_stream_operation(
@@ -6937,7 +8908,7 @@ async fn handle_write_stream_route(
                     .map_err(ApiError::from_storage)?;
                 let result = state
                     .storage
-                    .commit_stream_file_with_metadata(
+                    .commit_stream_file_with_metadata_using_lease(
                         &stream.space_id,
                         &stream.path,
                         &stream.temp_path,
@@ -6946,19 +8917,31 @@ async fn handle_write_stream_route(
                         stream.if_match.as_deref(),
                         stream.metadata.as_ref(),
                         &stream.request_id,
+                        stream.admission_lease.as_ref().ok_or_else(|| {
+                            ApiError::new(409, ErrorCode::Conflict, "stream lease missing")
+                        })?,
                     )
                     .map_err(ApiError::from_storage)?;
-                stream.committed = Some(result.clone());
-                state
-                    .storage
-                    .finish_stream_operation(
+                if let Err(error) = state.storage.finish_stream_operation(
+                    stream_id,
+                    &session.pairing_id,
+                    "COMMITTING",
+                    "COMMITTED",
+                    Some(&result),
+                ) {
+                    // Core receipt may already be committed. Do not acknowledge success
+                    // until a durable stream terminal row has been confirmed.
+                    let _ = state.storage.finish_stream_operation(
                         stream_id,
                         &session.pairing_id,
                         "COMMITTING",
-                        "COMMITTED",
-                        Some(&result),
-                    )
-                    .map_err(ApiError::from_storage)?;
+                        "RECONCILING",
+                        None,
+                    );
+                    return Err(ApiError::from_storage(error));
+                }
+                stream.committed = Some(result.clone());
+                stream.admission_lease.take();
                 stream.last_activity_ms = now_ms();
                 (
                     stream.application_id.clone(),
@@ -6967,10 +8950,12 @@ async fn handle_write_stream_route(
                     stream.existed_before,
                     result,
                     stream.operation_id.clone(),
+                    stream.request_id.clone(),
+                    was_committed,
                 )
             };
             if let Ok(mut paths) = state.active_write_paths.lock() {
-                paths.remove(&write_path_key(&space_id, &path));
+                release_write_path_if_owner(&mut paths, &space_id, &path, stream_id);
             }
             if let Some(operation_id) = operation_id.as_deref() {
                 state.complete_operation(
@@ -6982,14 +8967,16 @@ async fn handle_write_stream_route(
                     ),
                 );
             }
-            state.emit_event(
+            state.emit_applied_mutation(
+                &space_id,
+                &request_id,
+                was_committed,
                 &application_id,
                 if existed_before {
                     EventKindWire::FileChanged
                 } else {
                     EventKindWire::FileCreated
                 },
-                Some(&space_id),
                 Some(&path),
                 None,
                 None,
@@ -7028,15 +9015,34 @@ async fn handle_write_stream_route(
                     "already committed; cancellation cannot undo saved data",
                 ));
             }
-            // Fence the handle before removing it from the map. A caller that
-            // looked up the Arc earlier will recheck membership and cannot ACK.
-            if !state.remove_current_write_stream(stream_id, &stream_handle)? {
+            // A lost commit ACK can leave this in-memory handle looking open
+            // after Core has already committed. Resolve the authoritative
+            // journal before touching the temporary file on abort.
+            let durable = state
+                .storage
+                .resolve_stream_by_id(&session.pairing_id, stream_id)
+                .map_err(ApiError::from_storage)?
+                .ok_or_else(|| {
+                    ApiError::new(
+                        409,
+                        ErrorCode::Conflict,
+                        "stream outcome missing; resolve by requestId",
+                    )
+                })?;
+            if durable.phase != "OPEN" {
                 return Err(ApiError::new(
-                    404,
-                    ErrorCode::StreamNotFound,
-                    "write stream not found; resolve by requestId",
+                    409,
+                    ErrorCode::Conflict,
+                    "stream commit or recovery already started; resolve by requestId",
                 ));
             }
+            // Persist the abort fence BEFORE destroying temp bytes. A crash
+            // during cleanup is recoverable as ABORTED after startup quarantine;
+            // it can never be mistaken for an OPEN upload or a committed file.
+            state
+                .storage
+                .finish_stream_operation(stream_id, &session.pairing_id, "OPEN", "ABORTING", None)
+                .map_err(ApiError::from_storage)?;
             stream.file.take();
             state
                 .storage
@@ -7044,10 +9050,24 @@ async fn handle_write_stream_route(
                 .map_err(ApiError::from_storage)?;
             state
                 .storage
-                .finish_stream_operation(stream_id, &session.pairing_id, "OPEN", "ABORTED", None)
+                .finish_stream_operation(
+                    stream_id,
+                    &session.pairing_id,
+                    "ABORTING",
+                    "ABORTED",
+                    None,
+                )
                 .map_err(ApiError::from_storage)?;
+            if !state.remove_current_write_stream(stream_id, &stream_handle)? {
+                return Err(ApiError::new(
+                    404,
+                    ErrorCode::StreamNotFound,
+                    "write stream no longer active; resolve by requestId",
+                ));
+            }
+            stream.admission_lease.take();
             if let Ok(mut paths) = state.active_write_paths.lock() {
-                paths.remove(&write_path_key(&stream.space_id, &stream.path));
+                release_write_path_if_owner(&mut paths, &stream.space_id, &stream.path, stream_id);
             }
             if let Some(operation_id) = stream.operation_id.as_deref() {
                 state.cancelled_operation(operation_id);
@@ -7357,16 +9377,6 @@ fn directory_layout_from_wire(value: DirectoryExportLayoutWire) -> DirectoryExpo
         DirectoryExportLayoutWire::Contents => DirectoryExportLayout::Contents,
     }
 }
-fn grant_capability_satisfies(
-    existing: DirectoryGrantCapability,
-    requested: DirectoryGrantCapability,
-) -> bool {
-    match requested {
-        DirectoryGrantCapability::Read => existing.can_read(),
-        DirectoryGrantCapability::Write => existing.can_write(),
-        DirectoryGrantCapability::ReadWrite => existing.can_read() && existing.can_write(),
-    }
-}
 fn export_conflict_wire(value: ExportConflictPolicy) -> ExportConflictPolicyWire {
     match value {
         ExportConflictPolicy::Replace => ExportConflictPolicyWire::Replace,
@@ -7430,6 +9440,23 @@ fn operation_display_label(kind: &str, application_name: &str) -> String {
 
 fn write_path_key(space_id: &str, path: &str) -> String {
     format!("{space_id}\0{path}")
+}
+
+/// A historical terminal lookup must not unlock a newer write to the same
+/// logical path. Callers hold the active_write_paths mutex while invoking this.
+fn release_write_path_if_owner(
+    paths: &mut HashMap<String, String>,
+    space_id: &str,
+    path: &str,
+    stream_id: &str,
+) -> bool {
+    let key = write_path_key(space_id, path);
+    if paths.get(&key).is_some_and(|owner| owner == stream_id) {
+        paths.remove(&key);
+        true
+    } else {
+        false
+    }
 }
 
 fn event_path_matches(path: &str, prefix: &str) -> bool {
@@ -8018,6 +10045,19 @@ fn validate_client_instance_id(value: &str) -> Result<(), ApiError> {
 }
 
 fn validate_request_id(value: &str) -> Result<(), ApiError> {
+    if value.starts_with("request-v3-") {
+        if !v3_admission_enabled() {
+            return Err(ApiError::new(
+                409,
+                ErrorCode::RequestIdMigrationRequired,
+                "request-v3 requires a Runtime session with durableReplay capability",
+            ));
+        }
+        if !validate_v3_id_shape(value, "request-v3-") {
+            return Err(ApiError::bad_request("request-v3 format is invalid"));
+        }
+        return Ok(());
+    }
     if value.is_empty()
         || value.len() > 256
         || !value
@@ -8030,6 +10070,19 @@ fn validate_request_id(value: &str) -> Result<(), ApiError> {
 }
 
 fn validate_operation_id(value: &str) -> Result<(), ApiError> {
+    if value.starts_with("operation-v3-") {
+        if !v3_admission_enabled() {
+            return Err(ApiError::new(
+                409,
+                ErrorCode::RequestIdMigrationRequired,
+                "operation-v3 requires a Runtime session with durableReplay capability",
+            ));
+        }
+        if !validate_v3_id_shape(value, "operation-v3-") {
+            return Err(ApiError::bad_request("operation-v3 format is invalid"));
+        }
+        return Ok(());
+    }
     if value.len() < 16
         || value.len() > 128
         || !value
@@ -8436,6 +10489,34 @@ mod tests {
     }
 
     #[test]
+    fn versioned_replay_ids_require_negotiated_runtime_support() {
+        assert!(validate_request_id("old-opaque-request-123").is_ok());
+        assert!(validate_operation_id("old-opaque-operation-123").is_ok());
+        let request =
+            validate_request_id("request-v3-1771414800000-0123456789abcdef0123456789abcdef");
+        let operation =
+            validate_operation_id("operation-v3-1771414800000-0123456789abcdef0123456789abcdef");
+        if v3_admission_enabled() {
+            assert!(request.is_ok());
+            assert!(operation.is_ok());
+            let advertised = negotiated_durable_replay().unwrap();
+            assert_eq!(advertised.identity_version, 3);
+            assert_eq!(advertised.min_replay_window_ms, 604_800_000);
+            assert!(validate_request_id("request-v3-bad").is_err());
+        } else {
+            assert_eq!(
+                request.unwrap_err().code,
+                ErrorCode::RequestIdMigrationRequired
+            );
+            assert_eq!(
+                operation.unwrap_err().code,
+                ErrorCode::RequestIdMigrationRequired
+            );
+            assert!(negotiated_durable_replay().is_none());
+        }
+    }
+
+    #[test]
     fn desktop_deletion_works_from_thread_without_entered_tokio_context() {
         // Tauri invokes synchronous commands on a thread with no entered Tokio reactor.
         // The executor captured when the RuntimeServer was bound must be used instead.
@@ -8529,6 +10610,7 @@ mod tests {
             last_activity_ms: now_ms(),
             existed_before: false,
             committed: None,
+            admission_lease: None,
             operation_id: None,
         }
     }
@@ -9059,6 +11141,7 @@ mod tests {
             },
             client_instance_id: "instance-a".into(),
             nonce: "b".repeat(64),
+            history_only: false,
         })
         .unwrap();
         let challenge_response = handle_request(
@@ -9321,18 +11404,73 @@ mod tests {
             .operation_status_for_application("application-b", &snapshot.id)
             .unwrap_err();
         assert_eq!(foreign.code, ErrorCode::OperationNotOwned);
-        let cancelling = state
+        // This worker exists only in memory; C-03 forbids a successful
+        // cancellation ACK before a corresponding durable admission.
+        let error = state
             .cancel_application_operation("application-a", &snapshot.id)
-            .unwrap();
-        assert_eq!(cancelling.status, LongOperationStatus::Cancelling);
-        assert!(cancel.load(Ordering::SeqCst));
-        state.cancelled_operation(&snapshot.id);
-        let cancelled = state
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::OperationNotFound);
+        assert!(!cancel.load(Ordering::SeqCst));
+        let still_running = state
             .operation_status_for_application("application-a", &snapshot.id)
             .unwrap();
-        assert_eq!(cancelled.status, LongOperationStatus::Cancelled);
-        assert_eq!(cancelled.bytes_completed, Some(5));
-        assert_eq!(cancelled.bytes_total, Some(10));
+        assert_eq!(still_running.status, LongOperationStatus::Running);
+        assert_eq!(still_running.bytes_completed, Some(5));
+        assert_eq!(still_running.bytes_total, Some(10));
+    }
+
+    #[test]
+    fn cp14_cancel_persists_claimed_operation_before_signalling_worker() {
+        let state = test_state();
+        let app = state
+            .storage
+            .register_application(
+                ApplicationKind::FigmaPlugin,
+                "plugin.cancel-proof",
+                "Cancel Proof",
+            )
+            .unwrap();
+        let request = OperationRequestWire {
+            id: "operation-cancel-runtime-0001".into(),
+            presentation: OperationPresentationWire::Client,
+        };
+        let (snapshot, cancel) = state
+            .begin_application_operation(
+                &app.id,
+                &request,
+                "native-export",
+                "writing",
+                true,
+                None,
+                Some(1),
+            )
+            .unwrap();
+        state
+            .claim_operation_worker(&snapshot.id, "fp-cancel")
+            .unwrap();
+        assert!(!cancel.load(Ordering::SeqCst));
+        let status = state
+            .cancel_application_operation(&app.id, &snapshot.id)
+            .unwrap();
+        assert_eq!(status.status, LongOperationStatus::Cancelling);
+        assert!(cancel.load(Ordering::SeqCst));
+        let (_, _, phase, proof) = state
+            .storage
+            .application_long_job(&app.id, &snapshot.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(phase, "CANCEL_REQUESTED");
+        assert!(proof.unwrap().get("_cancelRequestedAtMs").is_some());
+        state.cancelled_operation(&snapshot.id);
+        // A native-export worker can have applied external writes: cancellation
+        // is not automatically a terminal ABORTED receipt.
+        let (_, _, phase, proof) = state
+            .storage
+            .application_long_job(&app.id, &snapshot.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(phase, "RECONCILING");
+        assert!(proof.unwrap().get("_cancelRequestedAtMs").is_some());
     }
 
     #[test]
@@ -9418,8 +11556,61 @@ mod tests {
         assert_eq!(state.lifecycle_status(), RuntimeLifecycleStatus::Draining);
         assert!(state.shutdown_requested.load(Ordering::SeqCst));
         let events = state.events.lock().unwrap();
-        assert!(events.iter().any(|item| item.application_id == "*"
+        assert!(events.pending.iter().any(|item| item.application_id == "*"
             && item.event.event_type == EventKindWire::RuntimeShuttingDown));
+    }
+
+    #[test]
+    fn cp18_authentication_does_not_prune_live_stream_journals() {
+        let source = include_str!("lib.rs");
+        let auth = source
+            .split("    fn authenticate(&self, request:")
+            .nth(1)
+            .unwrap()
+            .split("    fn authorize_space(")
+            .next()
+            .unwrap();
+        assert!(auth.contains("self.prune_session_ephemeral()"));
+        assert!(!auth.contains("self.prune_ephemeral()"));
+        assert!(!auth.contains("resolve_stream_by_id"));
+    }
+
+    #[test]
+    fn cp18_draining_rejects_new_worker_admission_and_keeps_inflight_boundary() {
+        let state = test_state();
+        let (snapshot, _) = state
+            .begin_operation("backup-space", "preparing", true)
+            .unwrap();
+        assert!(!state.shutdown_drain_complete());
+        state.begin_shutdown();
+        assert!(state
+            .begin_operation("backup-space", "preparing", true)
+            .is_err());
+        assert_eq!(state.lifecycle_status(), RuntimeLifecycleStatus::Draining);
+        state.complete_operation(&snapshot.id, "complete", None);
+        assert!(state.shutdown_drain_complete());
+        assert_eq!(state.lifecycle_status(), RuntimeLifecycleStatus::Draining);
+    }
+
+    #[test]
+    fn terminal_stream_status_cannot_release_another_stream_path_lease() {
+        let mut paths = HashMap::new();
+        let path = write_path_key("space-one", "/file.txt");
+        paths.insert(path.clone(), "new-stream".to_owned());
+        assert!(!release_write_path_if_owner(
+            &mut paths,
+            "space-one",
+            "/file.txt",
+            "old-stream"
+        ));
+        assert_eq!(paths.get(&path).map(String::as_str), Some("new-stream"));
+        assert!(release_write_path_if_owner(
+            &mut paths,
+            "space-one",
+            "/file.txt",
+            "new-stream"
+        ));
+        assert!(!paths.contains_key(&path));
     }
 
     #[test]
@@ -9429,6 +11620,234 @@ mod tests {
         assert!(!public_source.contains("/v1/admin"));
         assert!(!public_source.contains("/v1/pairings/approve"));
         assert!(!public_source.contains("/v1/pairings/revoke"));
+    }
+
+    fn poll_since(sequence: u64) -> EventPollRequest {
+        EventPollRequest {
+            after_sequence: sequence,
+            space_id: None,
+            path_prefix: None,
+            wait_ms: Some(0),
+        }
+    }
+
+    #[test]
+    fn cp16_publish_sequence_and_cursor_share_one_queue_lock() {
+        let state = test_state();
+        let mut threads = Vec::new();
+        for thread_id in 0..6 {
+            let state = Arc::clone(&state);
+            threads.push(std::thread::spawn(move || {
+                for index in 0..200 {
+                    state.emit_event(
+                        "owner-one",
+                        EventKindWire::FileChanged,
+                        Some("space-one"),
+                        Some(&format!("/file-{thread_id}-{index}")),
+                        None,
+                        None,
+                        None,
+                    );
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let session = SessionState {
+            pairing_id: "pair".into(),
+            application_id: "owner-one".into(),
+            expires_at_ms: now_ms() + 10_000,
+        };
+        let response = state.collect_events(&session, &poll_since(0)).unwrap();
+        assert_eq!(response.events.len(), 1200);
+        assert_eq!(response.latest_sequence, 1200);
+        for (idx, event) in response.events.iter().enumerate() {
+            assert_eq!(event.sequence, idx as u64 + 1);
+        }
+        let next = state.collect_events(&session, &poll_since(1200)).unwrap();
+        assert!(next.events.is_empty());
+        assert_eq!(next.latest_sequence, 1200);
+    }
+
+    #[test]
+    fn cp16_owner_overflow_does_not_inherit_other_owner_evictions() {
+        let mut events = OwnerEventBuffer::default();
+        events.push(
+            "owner-a",
+            EventKindWire::KvChanged,
+            Some("space-a"),
+            None,
+            None,
+            None,
+            Some("key"),
+        );
+        // Other owners can overflow the shared queue without dropping an A
+        // event newer than its acknowledged cursor.
+        for _ in 0..EVENT_BUFFER_CAPACITY + 2 {
+            events.push(
+                "owner-b",
+                EventKindWire::KvChanged,
+                Some("space-b"),
+                None,
+                None,
+                None,
+                Some("key"),
+            );
+        }
+        let a = events.collect("owner-a", &poll_since(1));
+        let b = events.collect("owner-b", &poll_since(1));
+        assert!(!a.overflow);
+        assert!(b.overflow);
+        assert!(a.events.is_empty());
+        // Missing the original owner event is not silently hidden.
+        assert!(events.collect("owner-a", &poll_since(0)).events.is_empty());
+        assert_eq!(events.dropped_through.get("owner-a"), Some(&1));
+        events.push(
+            "*",
+            EventKindWire::RuntimeShuttingDown,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let global = events.collect("owner-a", &poll_since(events.last_sequence - 1));
+        assert_eq!(global.events.len(), 1);
+        assert_eq!(
+            global.events[0].event_type,
+            EventKindWire::RuntimeShuttingDown
+        );
+    }
+
+    #[test]
+    fn cp16_replay_proof_and_in_process_identity_allow_one_event() {
+        let state = test_state();
+        let app = state
+            .storage
+            .register_application(ApplicationKind::FigmaPlugin, "cp16.events", "Event Tests")
+            .unwrap();
+        let space = state
+            .storage
+            .open_space(&app.id, "files", StorageClass::Persistent, None)
+            .unwrap();
+        let request_id = "cp16-written-once-id";
+        assert!(!state
+            .storage
+            .committed_space_request(&space.id, request_id)
+            .unwrap());
+        state
+            .storage
+            .write_file(&space.id, "/once.txt", b"stored", None, request_id)
+            .unwrap();
+        assert!(state
+            .storage
+            .committed_space_request(&space.id, request_id)
+            .unwrap());
+        state.emit_applied_mutation(
+            &space.id,
+            request_id,
+            false,
+            &app.id,
+            EventKindWire::FileCreated,
+            Some("/once.txt"),
+            None,
+            None,
+            None,
+        );
+        state
+            .storage
+            .write_file(&space.id, "/once.txt", b"stored", None, request_id)
+            .unwrap();
+        state.emit_applied_mutation(
+            &space.id,
+            request_id,
+            true,
+            &app.id,
+            EventKindWire::FileCreated,
+            Some("/once.txt"),
+            None,
+            None,
+            None,
+        );
+        // Two requests can consult Core before either commits. The queue's
+        // identity fence must prevent a second APPLIED notification.
+        state.emit_applied_mutation(
+            &space.id,
+            request_id,
+            false,
+            &app.id,
+            EventKindWire::FileCreated,
+            Some("/once.txt"),
+            None,
+            None,
+            None,
+        );
+        let session = SessionState {
+            pairing_id: "pair".into(),
+            application_id: app.id.clone(),
+            expires_at_ms: now_ms() + 10_000,
+        };
+        assert_eq!(
+            state
+                .collect_events(&session, &poll_since(0))
+                .unwrap()
+                .events
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cp16_long_poll_does_not_return_empty_on_foreign_owner_wake() {
+        let state = test_state();
+        let session = SessionState {
+            pairing_id: "pair".into(),
+            application_id: "owner-a".into(),
+            expires_at_ms: now_ms() + 10_000,
+        };
+        let pending_state = Arc::clone(&state);
+        let poll = tokio::spawn(async move {
+            pending_state
+                .poll_events(
+                    &session,
+                    &EventPollRequest {
+                        after_sequence: 0,
+                        space_id: None,
+                        path_prefix: None,
+                        wait_ms: Some(1500),
+                    },
+                )
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+        state.emit_event(
+            "owner-b",
+            EventKindWire::KvChanged,
+            Some("space-b"),
+            None,
+            None,
+            None,
+            Some("key"),
+        );
+        tokio::task::yield_now().await;
+        state.emit_event(
+            "owner-a",
+            EventKindWire::FileCreated,
+            Some("space-a"),
+            Some("/created"),
+            None,
+            None,
+            None,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(1), poll)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(result.events[0].sequence, 2);
+        assert_eq!(result.latest_sequence, 2);
     }
 
     #[test]

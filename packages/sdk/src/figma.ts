@@ -154,7 +154,7 @@ export function createFigmaConnectOptions(
 }
 
 /**
- * Creates the Figma-main side of the supported VontaqFS host bridge.
+ * Creates the Figma-main side of the supported VontaqFS host transport adapter.
  * The adapter is intentionally composable: callers retain ownership of figma.ui.onmessage.
  */
 export function createFigmaMainHostAdapter(options: FigmaMainHostAdapterOptions): FigmaMainHostAdapter {

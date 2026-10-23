@@ -163,13 +163,12 @@ test('revoked pairing is surfaced without silently deleting the trusted credenti
   assert.equal(await store.get('vontaqfs.pairing-credential.v1'), CREDENTIAL);
 });
 
-test('idempotent mutation retry reuses exactly the same request envelope', async () => {
+test('uncertain SQL mutation is not blindly retried before durable status is available', async () => {
   const runtime = new FakeRuntime();
   const fs = await VontaqFS.connect(options(runtime));
   runtime.failKvSetTransportOnce = true;
-  await fs.kv.set('retry', { ok: true });
-  assert.equal(runtime.failedKvSetBodies.length, 2);
-  assert.equal(runtime.failedKvSetBodies[0], runtime.failedKvSetBodies[1]);
+  await assert.rejects(() => fs.kv.set('retry', { ok: true }), error => error instanceof VontaqFSError && error.code === 'OUTCOME_UNKNOWN');
+  assert.equal(runtime.failedKvSetBodies.length, 1);
   assert.match(JSON.parse(runtime.failedKvSetBodies[0]).requestId, /^request-[0-9a-f]{32}$/);
 });
 
@@ -319,4 +318,40 @@ test('first pairing fails closed when multiple compatible Runtime candidates are
     stateStore: store, transport: runtime, requestTimeoutMs: 1000, retryCount: 0,
   }), errorValue => errorValue instanceof VontaqFSError && errorValue.code === 'RUNTIME_IDENTITY_AMBIGUOUS');
   assert.deepEqual(runtime.pairRequestPorts, []);
+});
+
+test('malformed HTTP 200 mutation response is typed PROTOCOL uncertainty, not retried', async () => {
+  const runtime = new FakeRuntime();
+  const original = runtime.request.bind(runtime);
+  let attempts = 0;
+  runtime.request = async request => {
+    if (new URL(request.url).pathname === '/v1/kv/set') {
+      attempts += 1;
+      return { status: 200, body: '{invalid' };
+    }
+    return original(request);
+  };
+  const fs = await VontaqFS.connect(options(runtime));
+  await assert.rejects(() => fs.kv.set('malformed', { a: 1 }), err => err instanceof VontaqFSError && err.code === 'OUTCOME_UNKNOWN');
+  assert.equal(attempts, 1);
+});
+
+test('versioned request/operation IDs appear only when Runtime advertises durable replay', async () => {
+  const runtime = new FakeRuntime();
+  const original = runtime.request.bind(runtime);
+  runtime.request = async request => {
+    const path = new URL(request.url).pathname;
+    if (path === '/v1/sessions') {
+      const originalReply = await original(request);
+      return ok({ ...JSON.parse(originalReply.body), durableReplay: {
+        identityVersion: 3, serverTimeMs: Date.now(), minReplayWindowMs: 7 * 86400_000, maxFutureSkewMs: 60_000,
+      } });
+    }
+    return original(request);
+  };
+  const fs = await VontaqFS.connect(options(runtime));
+  await fs.kv.set('v3', true);
+  const call = runtime.calls.find(item => new URL(item.url).pathname === '/v1/kv/set');
+  const body = JSON.parse(call.body);
+  assert.match(body.requestId, /^request-v3-\d{13}-[0-9a-f]{32}$/);
 });
