@@ -715,10 +715,13 @@ mod tests {
     use std::{fs, os::unix::fs::symlink, path::PathBuf};
 
     fn sandbox(label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "vontaq-native-dir-{label}-{}",
-            uuid::Uuid::new_v4()
-        ));
+        // macOS temp_dir() commonly starts with /var, a symlink to /private/var.
+        // Keep production O_NOFOLLOW unchanged: create test roots under the
+        // resolved physical directory instead of traversing that symlink.
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("vontaq-native-dir-{label}-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&path).unwrap();
         path
     }

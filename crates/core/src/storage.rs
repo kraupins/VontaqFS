@@ -723,10 +723,18 @@ impl StorageEngine {
         let fields = evidence
             .as_object_mut()
             .ok_or(StorageError::RecoveryRequired)?;
+        // Registry v3 does not permit CANCEL_REQUESTED in its phase CHECK.
+        // Persist the cancellation intent as nonterminal evidence instead of
+        // altering the on-disk schema. A restart promotes RUNNING to
+        // RECONCILING while preserving this marker; only the worker may
+        // report a terminal outcome. Repeated requests are idempotent.
+        if fields.contains_key("_cancelRequestedAtMs") {
+            return Ok(());
+        }
         let now = now_ms();
         fields.insert("_cancelRequestedAtMs".into(), json!(now));
         let changed = tx.execute(
-            "UPDATE durable_operations SET phase='CANCEL_REQUESTED',result_json=?1,updated_at_ms=?2 WHERE scope_kind='application' AND scope_id=?3 AND request_id=?4 AND owner_application_id=?3 AND request_fingerprint=?5 AND phase IN ('ADMITTED','RUNNING')",
+            "UPDATE durable_operations SET result_json=?1,updated_at_ms=?2 WHERE scope_kind='application' AND scope_id=?3 AND request_id=?4 AND owner_application_id=?3 AND request_fingerprint=?5 AND phase IN ('ADMITTED','RUNNING')",
             params![serde_json::to_string(&evidence)?,now,owner,operation_id,fingerprint],
         )?;
         if changed != 1 {
@@ -4520,9 +4528,13 @@ impl StorageEngine {
         }
         // The registry record is the expected content identity. Hash exactly the
         // bytes returned; never do a second disk pass that could see other content.
-        let expected = self
-            .stat_file(space_id, logical.as_str())?
-            .ok_or_else(|| StorageError::NotFound(logical.as_str().into()))?;
+        let expected = self.stat_file(space_id, logical.as_str())?;
+        if expected.is_none() && self.get_space(space_id)?.is_some() {
+            // A missing registry entry is not a normal file miss when the
+            // whole space data root has disappeared or become unsafe.
+            self.space_data_root(space_id)?;
+        }
+        let expected = expected.ok_or_else(|| StorageError::NotFound(logical.as_str().into()))?;
         let data_root = self.space_data_root(space_id)?;
         let target = data_root.join(logical.relative());
         ensure_no_symlink_escape(&data_root, &target)?;
@@ -16738,7 +16750,12 @@ mod tests {
     use super::*;
 
     fn temp_root(label: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("vontaqfs-{label}-{}", Uuid::new_v4()));
+        // Use a physical root on macOS (/var is normally a symlink). Native
+        // destination tests must never bypass production O_NOFOLLOW checks.
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("vontaqfs-{label}-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         root
     }
@@ -17897,7 +17914,12 @@ mod tests {
             .retained_stream_owned_by(&app.id, &pairing.id, &doomed.id, "request-one")
             .unwrap());
         assert!(!engine
-            .retained_stream_owned_by("other-app", &pairing.id, &doomed.id, "request-one")
+            .retained_stream_owned_by(
+                &Uuid::new_v4().to_string(),
+                &pairing.id,
+                &doomed.id,
+                "request-one",
+            )
             .unwrap());
         drop(engine);
         StorageEngine::open(&root).unwrap();
@@ -17923,7 +17945,7 @@ mod tests {
             .unwrap()
             .is_some());
         assert!(engine
-            .retained_space_receipt("different-owner", &space.id, "history-id")
+            .retained_space_receipt(&Uuid::new_v4().to_string(), &space.id, "history-id")
             .unwrap()
             .is_none());
         drop(engine);
@@ -18446,11 +18468,21 @@ mod tests {
             assert_eq!(stored["result"]["version"], 1);
             assert_eq!(stored["requestFingerprint"].as_str().unwrap().len(), 64);
             assert!(engine
-                .live_sql_receipt("wrong-owner", "space", &space.id, "live-receipt-1")
+                .live_sql_receipt(
+                    &Uuid::new_v4().to_string(),
+                    "space",
+                    &space.id,
+                    "live-receipt-1",
+                )
                 .unwrap()
                 .is_none());
             assert!(engine
-                .live_sql_receipt(&app.id, "space", "wrong-space", "live-receipt-1")
+                .live_sql_receipt(
+                    &app.id,
+                    "space",
+                    &Uuid::new_v4().to_string(),
+                    "live-receipt-1",
+                )
                 .unwrap()
                 .is_none());
             assert!(matches!(
@@ -19304,6 +19336,10 @@ mod tests {
                 .unwrap();
             (app.id, space.id)
         };
+        // Exercise the manifest-only branch. A valid registry backup takes
+        // priority over a manifest rebuild and may predate this fixture.
+        fs::remove_dir_all(root.join("runtime/registry-backups")).unwrap();
+        fs::create_dir_all(root.join("runtime/registry-backups")).unwrap();
         for suffix in ["", "-wal", "-shm"] {
             let _ = fs::remove_file(format!(
                 "{}{}",
@@ -19344,7 +19380,9 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        // Fail closed means no rewrite: the unsupported on-disk version
+        // must remain unchanged for a compatible future client.
+        assert_eq!(version, 4);
         let corrupt_copies = fs::read_dir(root.join("runtime"))
             .unwrap()
             .filter_map(Result::ok)
