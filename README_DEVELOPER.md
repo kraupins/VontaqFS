@@ -48,6 +48,8 @@ try {
 }
 ```
 
+**Timeouts and transport errors.** `discoveryTimeoutMs` bounds discovery of the local Runtime; when `requestTimeoutMs` is omitted, operational requests do not get a default hard wall-clock timeout. Specify `requestTimeoutMs` only if the host intentionally needs a hard timeout; a lost acknowledgement must be reconciled before retrying a mutation. Handle `RUNTIME_DISCONNECTED` (a previously connected Runtime is no longer reachable) separately from `TRANSPORT_ERROR` (a transport request failed).
+
 **Secure integration requirements.** Use a persistent, private `ClientStateStore` supplied by the host, a stable application identity and a cryptographically secure random source. Do not print credentials or use a shared state store across unrelated apps. For hosts without global `fetch`/`crypto`, provide a supported transport/random adapter rather than using an insecure polyfill. Development-only `developmentEndpoint` is not a production configuration.
 
 ### 2 · Pairing, authorization and identity
@@ -84,6 +86,8 @@ await fs.files.delete('/archive', { recursive: true });
 await fs.kv.set('ui:layout', { columns: 3 });
 const record = await fs.kv.get<{ columns: number }>('ui:layout');
 ```
+
+The public `FileAPI` interface types `fs.files`, and the `KeyValueAPI` interface types `fs.kv` (**Key/value API**). They operate only within the caller's authorized space.
 
 `fs.files.readMany(paths)` is for bounded reads of **known small paths**, not a general recursive listing; use ordinary reads or a stream for oversized items. For optimistic concurrency, use file `ifMatch` and KV `ifVersion` / `ifMatch` rather than silently overwriting changed content.
 
@@ -175,7 +179,7 @@ await fs.exportPresets.delete(preset.id);
 await fs.destinations.revoke(destination.id);
 ```
 
-For one-off native import, the application can call `space['import']({ mode: 'file' })` and let Runtime open the picker. Saved-source imports require a read-capable grant and **relative** `sourcePaths`. `resumeExport` and `resumeImport` are explicit confirmed continuation paths, not blind retry helpers. Handle conflict policies and partial outcomes honestly.
+For one-off native import, the application can call `space["import"]({ mode: 'file' })` and let Runtime open the picker. Saved-source imports require a read-capable grant and **relative** `sourcePaths`. `resumeExport` and `resumeImport` are explicit confirmed continuation paths, not blind retry helpers. Handle conflict policies and partial outcomes honestly.
 
 ### 7 · Snapshots, events, progress and cancellation
 
@@ -208,7 +212,7 @@ A portable backup or snapshot restore is a **data** operation; it does not autom
 
 ### 9 · Supported host entry points and structure
 
-`@vontaq/fs` exports the host-neutral SDK. `@vontaq/fs/figma` contains the optional Figma main/UI transport adapter. Follow its documented lifecycle for a Figma plugin; do not substitute a host-global `fetch` in a context where it is unavailable.
+`@vontaq/fs` exports the host-neutral SDK. `@vontaq/fs/figma` contains the optional Figma main/UI transport adapter. In the Figma main context use `createFigmaMainHostAdapter({ postMessage })`, pass its `transport` and `secureRandom` to the connection and forward VontaqFS UI messages to `adapter.handleUiMessage(message)`; preserve the plugin's other messages. In the Figma UI context call `handleVontaqFSFigmaUiMessage(message, { postMessage })` and continue ordinary UI dispatch if it returns `false`. Do not expose pairing secrets in UI messages. Follow its documented lifecycle for a Figma plugin; do not substitute a host-global `fetch` in a context where it is unavailable.
 
 Project layout:
 
@@ -246,7 +250,7 @@ On Windows, validate Desktop/Tauri and the real native directory picker, lifecyc
 
 ### 2 · Работа с файлами и KV
 
-`fs.files` и краткие методы `fs.readText`, `fs.writeText`, `fs.readJSON`, `fs.writeJSON`, `fs.readFile`, `fs.writeFile` работают с **логическими путями** `/folder/file.ext`. Эти пути не являются абсолютными путями Windows. Через `fs.files` также доступны `stat`, `exists`, `readMany`, `copy`, `move`, `delete`, `createReader` и `createWriter`.
+Публичные интерфейсы `FileAPI` и `KeyValueAPI` описывают файловый и KV-доступ. `fs.files` и краткие методы `fs.readText`, `fs.writeText`, `fs.readJSON`, `fs.writeJSON`, `fs.readFile`, `fs.writeFile` работают с **логическими путями** `/folder/file.ext`. Эти пути не являются абсолютными путями Windows. Через `fs.files` также доступны `stat`, `exists`, `readMany`, `copy`, `move`, `delete`, `createReader` и `createWriter`.
 
 `fs.kv.get()`/`set()` хранят JSON-совместимые значения. Для безопасного конкурентного обновления используйте файловый `ifMatch` или KV `ifVersion`/`ifMatch`.
 

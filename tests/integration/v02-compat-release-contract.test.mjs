@@ -11,7 +11,7 @@ async function sha256(url) {
   return createHash('sha256').update(await readFile(url)).digest('hex');
 }
 
-test('0.2.5 runtime/desktop and unchanged 0.2.4 SDK share protocol v1 with private registry schema v2', async () => {
+test('0.2.6 runtime/desktop and SDK 0.2.5 share protocol v1 and portable format v1 with private registry v3', async () => {
   const packageJson = JSON.parse(await read('package.json'));
   const sdk = JSON.parse(await read('packages/sdk/package.json'));
   const desktop = JSON.parse(await read('apps/desktop/package.json'));
@@ -19,15 +19,15 @@ test('0.2.5 runtime/desktop and unchanged 0.2.4 SDK share protocol v1 with priva
   const cargo = await read('Cargo.toml');
   const protocol = await read('crates/protocol/src/lib.rs');
   const storage = await read('crates/core/src/storage.rs');
-  assert.equal(packageJson.version, '0.2.5');
-  assert.equal(sdk.version, '0.2.4');
+  assert.equal(packageJson.version, '0.2.6');
+  assert.equal(sdk.version, '0.2.5');
   assert.equal(desktop.version, packageJson.version);
   assert.equal(tauri.version, packageJson.version);
   const workspacePackage = cargo.match(/\[workspace\.package\]([\s\S]*?)(?:\n\[|$)/)?.[1] ?? '';
   assert.match(workspacePackage, new RegExp(`^version\\s*=\\s*\"${packageJson.version.replaceAll('.', '\\.') }\"\\s*$`, 'm'));
   assert.match(protocol, /PROTOCOL_(?:MIN|MAX)[^\n]*1/);
-  // Registry schema advances independently of portable Storage Format v1 for trusted policy migration.
-  assert.match(storage, /const SCHEMA_VERSION: i64 = 2;/);
+  // Private Registry v3 advances independently; the portable Storage Format remains v1.
+  assert.match(storage, /const SCHEMA_VERSION: i64 = 3;/);
   assert.match(storage, /const SPACE_FORMAT_VERSION: u32 = 1;/);
 });
 
