@@ -11459,9 +11459,10 @@ mod tests {
             .application_long_job(&app.id, &snapshot.id)
             .unwrap()
             .unwrap();
-        // Registry v3 keeps the nonterminal RUNNING phase while persisting
-        // cancellation intent as durable evidence for restart reconciliation.
-        assert_eq!(phase, "RUNNING");
+        // Worker identity has been durably ADMITTED, but execution has not
+        // advanced its receipt to RUNNING. Cancellation preserves that phase
+        // and records intent for restart reconciliation instead.
+        assert_eq!(phase, "ADMITTED");
         assert!(proof.unwrap().get("_cancelRequestedAtMs").is_some());
         state.cancelled_operation(&snapshot.id);
         // A native-export worker can have applied external writes: cancellation
@@ -11511,6 +11512,11 @@ mod tests {
         assert_eq!(rows[0].label, "Saving local data for Operations Plugin");
         assert_eq!(rows[0].operation.bytes_completed, Some(5));
         assert!(!handle.dismiss_desktop_operation(&snapshot.id).unwrap());
+        // A public application operation must have a durable claim before its
+        // terminal receipt can be persisted and dismissed by Desktop.
+        assert!(state
+            .claim_operation_worker(&snapshot.id, "fp-desktop-window")
+            .unwrap());
         state.fail_operation_code(&snapshot.id, "TEST_FAILURE", "sanitized failure".into());
         assert_eq!(handle.desktop_operations().unwrap().len(), 1);
         assert!(handle.dismiss_desktop_operation(&snapshot.id).unwrap());

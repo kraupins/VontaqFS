@@ -688,6 +688,9 @@ impl NativeDirectory {
         }
         drop(moved);
         drop(candidate);
+        // Windows cannot remove a nonempty quarantine while our original
+        // marker HANDLE still keeps its entry alive (delete-pending).
+        drop(marker);
         if !verified {
             self.recover_prune_for(path)?;
             return Ok(false);
@@ -843,10 +846,13 @@ mod tests {
     fn replaced_root_identity_rejected() {
         let root = sandbox();
         let observed = fs::metadata(&root).unwrap();
+        // Pin the original directory HANDLE first: creation timestamps of
+        // two rapidly created Windows directories may be identical. The
+        // held file ID must still detect a path replacement reliably.
+        let dir = NativeDirectory::open(&root).unwrap();
         let moved = root.with_extension("moved");
         fs::rename(&root, &moved).unwrap();
         fs::create_dir(&root).unwrap();
-        let dir = NativeDirectory::open(&root).unwrap();
         assert!(dir.ensure_root_identity(&observed).is_err());
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(moved);
