@@ -5,7 +5,7 @@
 
 [**Русский**](#русский) · [**English**](#english) · [Developer guide](README_DEVELOPER.md) · [Wiki](https://github.com/kraupins/VontaqFS/wiki) · [Releases](https://github.com/kraupins/VontaqFS/releases)
 
-> **VontaqFS Desktop 0.2.6** · **TypeScript SDK `@vontaq/fs` 0.2.5** · Windows desktop · Local-first storage  
+> **VontaqFS Desktop 0.2.7** · **TypeScript SDK `@vontaq/fs` 0.2.5** · Windows desktop · Local-first storage  
 > HTTP protocol v1 · Portable storage format v1 · Private registry v3
 
 ---

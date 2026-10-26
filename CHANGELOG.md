@@ -4,15 +4,9 @@ All notable public changes to VontaqFS are documented here.
 
 ## [0.2.7] - 2026-10-26
 
-### Changed
+### Fixed
 
-- Desktop/Runtime: improved reliability of managed-storage export flows and their handling in the desktop application. This release includes the latest internal Desktop Runtime fixes.
-- Desktop: prepared the patch release for the standard GitHub Actions release workflow and tag `v0.2.7`.
-
-### Compatibility
-
-- Desktop/Runtime-only release: public `@vontaq/fs` remains at `0.2.5`, without republishing.
-- Public protocol v1 and portable storage format v1 are unchanged; no new data format migration is introduced by this version bump.
+- Desktop/Runtime: improved data export reliability from managed storage.
 
 ## [0.2.6] - 2026-10-22
 
