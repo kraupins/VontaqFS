@@ -687,36 +687,47 @@ pub struct FsMoveRequest {
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum BatchOperationWire {
     WriteFile {
+        #[serde(alias = "requestId")]
         request_id: String,
         path: String,
+        #[serde(alias = "dataBase64")]
         data_base64: String,
+        #[serde(alias = "ifMatch")]
         if_match: Option<String>,
         metadata: Option<FileMetadataWire>,
     },
     Delete {
+        #[serde(alias = "requestId")]
         request_id: String,
         path: String,
         recursive: Option<bool>,
+        #[serde(alias = "ifMatch")]
         if_match: Option<String>,
     },
     Copy {
+        #[serde(alias = "requestId")]
         request_id: String,
         from: String,
         to: String,
         overwrite: Option<bool>,
     },
     Move {
+        #[serde(alias = "requestId")]
         request_id: String,
         from: String,
         to: String,
         overwrite: Option<bool>,
+        #[serde(alias = "ifMatch")]
         if_match: Option<String>,
     },
     KvSet {
+        #[serde(alias = "requestId")]
         request_id: String,
         key: String,
         value: Value,
+        #[serde(alias = "ifVersion")]
         if_version: Option<u64>,
+        #[serde(alias = "ifMatch")]
         if_match: Option<String>,
     },
 }
@@ -1190,6 +1201,76 @@ mod tests {
     fn error_codes_use_stable_wire_names() {
         let encoded = serde_json::to_string(&ErrorCode::AuthInvalid).unwrap();
         assert_eq!(encoded, "\"AUTH_INVALID\"");
+    }
+
+    #[test]
+    fn batch_sdk_camel_case_fields_round_trip_and_legacy_snake_case_still_read() {
+        // The public SDK sends camelCase inside tagged operations. The enum's
+        // rename_all changes variant names only, not their field names.
+        let requests = [
+            serde_json::json!({
+                "type": "write-file", "requestId": "req-1", "path": "/x",
+                "dataBase64": "YQ==", "ifMatch": null, "metadata": null
+            }),
+            serde_json::json!({
+                "type": "delete", "requestId": "req-2", "path": "/x",
+                "recursive": false, "ifMatch": null
+            }),
+            serde_json::json!({
+                "type": "copy", "requestId": "req-3", "from": "/x",
+                "to": "/y", "overwrite": false
+            }),
+            serde_json::json!({
+                "type": "move", "requestId": "req-4", "from": "/x",
+                "to": "/y", "overwrite": false, "ifMatch": null
+            }),
+            serde_json::json!({
+                "type": "kv-set", "requestId": "req-5", "key": "k",
+                "value": {"n": 1}, "ifVersion": 2, "ifMatch": null
+            }),
+        ];
+        for value in requests {
+            let parsed: BatchOperationWire = serde_json::from_value(value).unwrap();
+            let canonical = serde_json::to_value(&parsed).unwrap();
+            // Existing durable child fingerprints hash serde's snake_case bytes.
+            // Aliases accept the public SDK without changing that saved shape.
+            assert!(canonical.get("request_id").is_some());
+            assert!(canonical.get("requestId").is_none());
+            let replayed: BatchOperationWire = serde_json::from_value(canonical).unwrap();
+            assert_eq!(parsed, replayed);
+        }
+
+        // Pre-existing snake_case wire payloads remain readable, without
+        // weakening type validation or making fields optional.
+        let legacy: BatchOperationWire = serde_json::from_value(serde_json::json!({
+            "type": "write-file", "request_id": "req-6", "path": "/legacy",
+            "data_base64": "Yg==", "if_match": null, "metadata": null
+        }))
+        .unwrap();
+        let encoded = serde_json::to_value(legacy).unwrap();
+        assert_eq!(encoded["request_id"], "req-6");
+        assert_eq!(encoded["data_base64"], "Yg==");
+        assert!(encoded.get("requestId").is_none());
+        assert!(encoded.get("dataBase64").is_none());
+
+        let legacy_kv: BatchOperationWire = serde_json::from_value(serde_json::json!({
+            "type": "kv-set", "request_id": "req-7", "key": "k", "value": 1,
+            "if_version": 3, "if_match": null
+        }))
+        .unwrap();
+        assert_eq!(serde_json::to_value(legacy_kv).unwrap()["if_version"], 3);
+
+        // Parse the complete request envelope as sent by writeTree().
+        let full: BatchRequest = serde_json::from_value(serde_json::json!({
+            "spaceId": "space-1",
+            "operations": [{
+                "type": "write-file", "requestId": "req-1", "path": "/x",
+                "dataBase64": "YQ==", "ifMatch": null, "metadata": null
+            }],
+            "operation": {"id": "operation-1", "presentation": "client"}
+        }))
+        .unwrap();
+        assert_eq!(full.operations.len(), 1);
     }
 
     #[test]

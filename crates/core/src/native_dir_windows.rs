@@ -243,6 +243,40 @@ fn nt_open(
     create: bool,
     write: bool,
 ) -> StorageResult<File> {
+    let access = FILE_READ_ATTRIBUTES
+        | SYNCHRONIZE
+        | DELETE
+        | (if directory { FILE_TRAVERSE } else { 0 })
+        | (if write {
+            FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES
+        } else {
+            FILE_READ_DATA
+        });
+    nt_open_with_access(parent, name, directory, create, access)
+}
+
+// Issuing a grant only needs to verify a selected directory's path and file ID.
+// Do not demand DELETE or LIST_DIRECTORY on every ancestor: a valid selected
+// user folder can sit beneath a protected parent that denies those privileges.
+// This still opens each component without following reparse points, and still
+// compares the held root's identity against the selected path.
+fn open_traversal_directory(parent: &File, name: &[u16]) -> StorageResult<File> {
+    nt_open_with_access(
+        parent,
+        name,
+        true,
+        false,
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE | FILE_TRAVERSE,
+    )
+}
+
+fn nt_open_with_access(
+    parent: &File,
+    name: &[u16],
+    directory: bool,
+    create: bool,
+    access: u32,
+) -> StorageResult<File> {
     let mut wide = name.to_vec();
     let mut unicode = UnicodeString {
         length: (wide.len() * 2) as u16,
@@ -262,15 +296,6 @@ fn nt_open(
         information: 0,
     };
     let mut handle = ptr::null_mut();
-    let access = FILE_READ_ATTRIBUTES
-        | SYNCHRONIZE
-        | DELETE
-        | (if directory { FILE_TRAVERSE } else { 0 })
-        | (if write {
-            FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES
-        } else {
-            FILE_READ_DATA
-        });
     let options = FILE_OPEN_REPARSE_POINT
         | FILE_SYNCHRONOUS_IO_NONALERT
         | if directory {
@@ -486,7 +511,7 @@ impl NativeDirectory {
             let Component::Normal(name) = part else {
                 return Err(invalid());
             };
-            dir = open_directory(&dir, &validate(name)?, false)?;
+            dir = open_traversal_directory(&dir, &validate(name)?)?;
         }
         // Reject filesystem types without durable handles and file IDs.
         id_info(&dir)?;

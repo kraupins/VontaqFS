@@ -1,0 +1,191 @@
+--- a/apps/desktop/package.json
++++ b/apps/desktop/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "@vontaqfs/desktop",
+-  "version": "0.2.6",
++  "version": "0.2.7",
+   "private": true,
+   "type": "module",
+   "scripts": {
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4308,7 +4308,7 @@
+ 
+ [[package]]
+ name = "vontaqfs-core"
+-version = "0.2.6"
++version = "0.2.7"
+ dependencies = [
+  "icu_normalizer",
+  "libc",
+@@ -4324,7 +4324,7 @@
+ 
+ [[package]]
+ name = "vontaqfs-desktop"
+-version = "0.2.6"
++version = "0.2.7"
+ dependencies = [
+  "serde",
+  "serde_json",
+@@ -4338,7 +4338,7 @@
+ 
+ [[package]]
+ name = "vontaqfs-protocol"
+-version = "0.2.6"
++version = "0.2.7"
+ dependencies = [
+  "serde",
+  "serde_json",
+@@ -4346,7 +4346,7 @@
+ 
+ [[package]]
+ name = "vontaqfs-runtime"
+-version = "0.2.6"
++version = "0.2.7"
+ dependencies = [
+  "serde",
+  "serde_json",
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -3,7 +3,7 @@
+ resolver = "2"
+ 
+ [workspace.package]
+-version = "0.2.6"
++version = "0.2.7"
+ edition = "2021"
+ license = "LicenseRef-VontaqFS-Source-Available-1.0"
+ rust-version = "1.82"
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,18 @@
+ # Changelog
+ 
+ All notable public changes to VontaqFS are documented here.
++
++## [0.2.7] - 2026-10-26
++
++### Changed
++
++- Desktop/Runtime: improved reliability of managed-storage export flows and their handling in the desktop application. This release includes the latest internal Desktop Runtime fixes.
++- Desktop: prepared the patch release for the standard GitHub Actions release workflow and tag `v0.2.7`.
++
++### Compatibility
++
++- Desktop/Runtime-only release: public `@vontaq/fs` remains at `0.2.5`, without republishing.
++- Public protocol v1 and portable storage format v1 are unchanged; no new data format migration is introduced by this version bump.
+ 
+ ## [0.2.6] - 2026-10-22
+ 
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1,12 +1,12 @@
+ {
+   "name": "vontaqfs",
+-  "version": "0.2.6",
++  "version": "0.2.7",
+   "lockfileVersion": 3,
+   "requires": true,
+   "packages": {
+     "": {
+       "name": "vontaqfs",
+-      "version": "0.2.6",
++      "version": "0.2.7",
+       "workspaces": [
+         "apps/desktop",
+         "packages/sdk"
+@@ -20,7 +20,7 @@
+     },
+     "apps/desktop": {
+       "name": "@vontaqfs/desktop",
+-      "version": "0.2.6",
++      "version": "0.2.7",
+       "dependencies": {
+         "@tauri-apps/api": "^2.0.0",
+         "react": "^19.0.0",
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "vontaqfs",
+-  "version": "0.2.6",
++  "version": "0.2.7",
+   "private": true,
+   "type": "module",
+   "workspaces": [
+--- a/src-tauri/tauri.conf.json
++++ b/src-tauri/tauri.conf.json
+@@ -1,7 +1,7 @@
+ {
+   "$schema": "https://schema.tauri.app/config/2",
+   "productName": "VontaqFS",
+-  "version": "0.2.6",
++  "version": "0.2.7",
+   "identifier": "fs.vontaq.desktop",
+   "build": {
+     "beforeDevCommand": "npm run dev",
+--- a/tests/integration/v02-compat-release-contract.test.mjs
++++ b/tests/integration/v02-compat-release-contract.test.mjs
+@@ -11,7 +11,7 @@
+   return createHash('sha256').update(await readFile(url)).digest('hex');
+ }
+ 
+-test('0.2.6 runtime/desktop and SDK 0.2.5 share protocol v1 and portable format v1 with private registry v3', async () => {
++test('0.2.7 runtime/desktop and SDK 0.2.5 share protocol v1 and portable format v1 with private registry v3', async () => {
+   const packageJson = JSON.parse(await read('package.json'));
+   const sdk = JSON.parse(await read('packages/sdk/package.json'));
+   const desktop = JSON.parse(await read('apps/desktop/package.json'));
+@@ -19,7 +19,7 @@
+   const cargo = await read('Cargo.toml');
+   const protocol = await read('crates/protocol/src/lib.rs');
+   const storage = await read('crates/core/src/storage.rs');
+-  assert.equal(packageJson.version, '0.2.6');
++  assert.equal(packageJson.version, '0.2.7');
+   assert.equal(sdk.version, '0.2.5');
+   assert.equal(desktop.version, packageJson.version);
+   assert.equal(tauri.version, packageJson.version);
+--- a/tests/integration/v022-runtime-only-release.test.mjs
++++ b/tests/integration/v022-runtime-only-release.test.mjs
+@@ -17,8 +17,8 @@
+   cwd: root, env: {...process.env, ...env}, encoding: 'utf8',
+ });
+ 
+-test('Runtime/Desktop 0.2.6 and SDK 0.2.5 match package and lock metadata', () => {
+-  assert.equal(pkg.version, '0.2.6');
++test('Runtime/Desktop 0.2.7 and SDK 0.2.5 match package and lock metadata', () => {
++  assert.equal(pkg.version, '0.2.7');
+   assert.equal(sdk.version, '0.2.5');
+   assert.equal(lock.packages[''].version, pkg.version);
+   assert.equal(lock.packages['apps/desktop'].version, pkg.version);
+@@ -26,7 +26,7 @@
+   assert.equal(JSON.parse(read('apps/desktop/package.json')).version, pkg.version);
+   assert.equal(JSON.parse(read('src-tauri/tauri.conf.json')).version, pkg.version);
+   for (const crate of ['vontaqfs-core', 'vontaqfs-protocol', 'vontaqfs-runtime', 'vontaqfs-desktop']) {
+-    assert.match(read('Cargo.lock'), new RegExp(`name = "${crate}"\\nversion = "0\\.2\\.6"`));
++    assert.match(read('Cargo.lock'), new RegExp(`name = "${crate}"\\nversion = "0\\.2\\.7"`));
+   }
+ });
+ 
+@@ -50,7 +50,7 @@
+   assert.match(publishSection, /steps\.sdk_release\.outputs\.publish == 'true' && steps\.npm_state\.outputs\.already_published != 'true'/);
+ });
+ 
+-test('current v0.2.6 Desktop/Runtime-only release never republishes SDK 0.2.5', () => {
++test('current v0.2.7 Desktop/Runtime-only release never republishes SDK 0.2.5', () => {
+   for (const publishNpm of ['true', 'false']) {
+     const result = sdkPublishEligibility({
+       runtimeVersion: pkg.version, sdkVersion: sdk.version, releaseTag: `v${pkg.version}`, publishNpm,
+--- a/tests/package-f-cp30-integration-source.test.py
++++ b/tests/package-f-cp30-integration-source.test.py
+@@ -23,8 +23,8 @@
+ bridge_lock = json.loads(source(bridge / 'package-lock.json'))
+ tauri_conf = json.loads(source(vfs / 'src-tauri/tauri.conf.json'))
+ cargo = source(vfs / 'Cargo.toml')
+-check('release-candidate versions', root_pkg['version']=='0.2.6' and sdk_pkg['version']=='0.2.5' and bridge_pkg['version']=='0.9.6' and tauri_conf['version']=='0.2.6' and re.search(r'^version = "0\.2\.6"$',cargo,re.M) is not None)
+-check('root/Bridge lock versions',root_lock['packages']['']['version']=='0.2.6' and bridge_lock['packages']['']['version']=='0.9.6' and bridge_lock['packages']['']['dependencies']['@vontaq/fs']=='0.2.5')
++check('release-candidate versions', root_pkg['version']=='0.2.7' and sdk_pkg['version']=='0.2.5' and bridge_pkg['version']=='0.9.6' and tauri_conf['version']=='0.2.7' and re.search(r'^version = "0\.2\.7"$',cargo,re.M) is not None)
++check('root/Bridge lock versions',root_lock['packages']['']['version']=='0.2.7' and bridge_lock['packages']['']['version']=='0.9.6' and bridge_lock['packages']['']['dependencies']['@vontaq/fs']=='0.2.5')
+ check('SDK public entrypoints', all(e in sdk_pkg['exports'] for e in ('.','./figma')) and all((vfs/'packages/sdk'/sdk_pkg['exports'][key]['import']).exists() for key in ('.','./figma')))
+ adapter=source(bridge/'src/plugin/vontaqFsAdapter.ts')
+ check('Bridge imports only public SDK entrypoints', "from '@vontaq/fs'" in adapter and "from '@vontaq/fs/figma'" in adapter and 'packages/sdk/src/' not in adapter)

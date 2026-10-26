@@ -2602,6 +2602,28 @@ impl RuntimeState {
         }
     }
 
+    /// Record a non-sensitive failure category for native destination creation.
+    /// The public API remains fail-closed; no paths, SQL text, request bodies,
+    /// application identifiers, tokens, or OS error messages enter runtime.log.
+    fn destination_create_error(&self, stage: &'static str, error: StorageError) -> ApiError {
+        let category = match &error {
+            StorageError::Sqlite(source) => match source.sqlite_error() {
+                Some(sqlite) => format!("SQLITE_{:?}_{}", sqlite.code, sqlite.extended_code),
+                None => "SQLITE_OTHER".to_owned(),
+            },
+            StorageError::Io(source) => format!(
+                "IO_{:?}_{}",
+                source.kind(),
+                source.raw_os_error().unwrap_or_default()
+            ),
+            StorageError::Json(_) => "JSON".to_owned(),
+            StorageError::Internal(_) => "INTERNAL".to_owned(),
+            other => storage_error_code(other).to_owned(),
+        };
+        self.audit_log(stage, &category);
+        ApiError::from_storage(error)
+    }
+
     fn read_recent_logs(&self, limit: usize) -> Vec<String> {
         let Ok(text) = std::fs::read_to_string(&self.log_path) else {
             return Vec::new();
@@ -7052,7 +7074,7 @@ async fn handle_request(
                     input.initial_destination_id.as_deref(),
                     reuse,
                 )
-                .map_err(ApiError::from_storage)?
+                .map_err(|error| state.destination_create_error("destination-admit", error))?
             {
                 DestinationGrantAdmission::Replayed(grant) => {
                     return HttpResponse::json(200, &destination_grant_wire(&grant))
@@ -7069,13 +7091,18 @@ async fn handle_request(
             let application = state
                 .storage
                 .get_application(&session.application_id)
-                .map_err(ApiError::from_storage)?
-                .ok_or_else(ApiError::internal)?;
+                .map_err(|error| state.destination_create_error("destination-application", error))?
+                .ok_or_else(|| {
+                    state.audit_log("destination-application", "APPLICATION_MISSING");
+                    ApiError::internal()
+                })?;
             let initial_grant = if let Some(id) = input.initial_destination_id.as_deref() {
                 state
                     .storage
                     .get_directory_grant(&session.application_id, id)
-                    .map_err(ApiError::from_storage)?
+                    .map_err(|error| {
+                        state.destination_create_error("destination-previous-grant", error)
+                    })?
                     .filter(|grant| grant.revoked_at_ms.is_none())
             } else {
                 None
@@ -7101,7 +7128,10 @@ async fn handle_request(
                 )
             })
             .await
-            .map_err(|_| ApiError::internal())?
+            .map_err(|_| {
+                state.audit_log("destination-picker", "WORKER_JOIN_FAILED");
+                ApiError::internal()
+            })?
             .map_err(|message| ApiError::new(409, ErrorCode::DestinationGrantRequired, message))?;
             let path = match selected {
                 Some(path) => path,
@@ -7109,7 +7139,9 @@ async fn handle_request(
                     state
                         .storage
                         .cancel_directory_grant_request(&session.application_id, &input.request_id)
-                        .map_err(ApiError::from_storage)?;
+                        .map_err(|error| {
+                            state.destination_create_error("destination-cancel", error)
+                        })?;
                     return Err(ApiError::new(
                         409,
                         ErrorCode::UserCancelled,
@@ -7128,7 +7160,7 @@ async fn handle_request(
                     input.initial_destination_id.as_deref(),
                     reuse,
                 )
-                .map_err(ApiError::from_storage)?;
+                .map_err(|error| state.destination_create_error("destination-finish", error))?;
             HttpResponse::json(200, &destination_grant_wire(&grant))
         }
         ("POST", "/v1/destinations/list") => {
