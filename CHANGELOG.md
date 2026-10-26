@@ -4,9 +4,15 @@ All notable public changes to VontaqFS are documented here.
 
 ## [0.2.7] - 2026-10-26
 
+### Added
+
+### Changed
+
 ### Fixed
 
 - Desktop/Runtime: improved data export reliability from managed storage.
+
+### Compatibility
 
 ## [0.2.6] - 2026-10-22
 
